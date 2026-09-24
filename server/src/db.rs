@@ -1,0 +1,56 @@
+use std::path::Path;
+
+use rusqlite::{params, Connection};
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS recordings (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    started_ms INTEGER,
+    status TEXT NOT NULL DEFAULT 'receiving',
+    vault_path TEXT,
+    finished INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS file_progress (
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    file TEXT NOT NULL,
+    done_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (recording, file)
+);
+CREATE TABLE IF NOT EXISTS clusters (
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    label TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    PRIMARY KEY (recording, label)
+);
+";
+
+pub fn open(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(SCHEMA)?;
+    Ok(conn)
+}
+
+pub fn ensure_recording(conn: &Connection, id: &str, source: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO recordings (id, source) VALUES (?1, ?2)",
+        params![id, source],
+    )?;
+    Ok(())
+}
+
+pub fn set_started(conn: &Connection, id: &str, started_ms: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recordings SET started_ms = ?2 WHERE id = ?1",
+        params![id, started_ms],
+    )?;
+    Ok(())
+}
+
+/// Returns false when the recording doesn't exist.
+pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    Ok(conn.execute(
+        "UPDATE recordings SET finished = 1 WHERE id = ?1",
+        params![id],
+    )? == 1)
+}
