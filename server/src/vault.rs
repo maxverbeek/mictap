@@ -155,8 +155,11 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
         return Ok(());
     }
     let segs = crate::merge::merged(&db, id)?;
-    let pending: Option<i64> = db.query_row(
-        "SELECT MIN(offset_ms + start_ms) FROM windows WHERE recording = ?1 AND NOT done",
+    // Where the earliest untranscribed window starts, else where the last transcribed one ends.
+    let transcribed_ms: i64 = db.query_row(
+        "SELECT COALESCE(MIN(CASE WHEN NOT done THEN offset_ms + start_ms END),
+                         MAX(offset_ms + end_ms), 0)
+         FROM windows WHERE recording = ?1",
         [id],
         |r| r.get(0),
     )?;
@@ -190,7 +193,7 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
     };
     let done_ms = match shown {
         "done" => total_ms,
-        _ => pending.unwrap_or(total_ms),
+        _ => transcribed_ms,
     };
     let key = match shown {
         "transcribing" => format!("transcribing {done_ms}/{total_ms} {}", segs.len()),
@@ -223,14 +226,13 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
             key,
         )
     };
-    let status = if shown == "done" {
-        "done"
-    } else {
-        status.as_str()
-    };
+    // The lock was released for the file IO, so the status read above may be stale: only
+    // 'done' is written back, never the old value.
+    let done = (shown == "done").then_some("done");
     app.db.lock().await.execute(
-        "UPDATE recordings SET vault_path = ?2, written = ?3, status = ?4 WHERE id = ?1",
-        params![id, name, key, status],
+        "UPDATE recordings SET vault_path = ?2, written = ?3, status = COALESCE(?4, status)
+         WHERE id = ?1",
+        params![id, name, key, done],
     )?;
     Ok(())
 }
@@ -435,7 +437,7 @@ mod tests {
             .unwrap();
         sync(&app, "r1").await.unwrap();
         let text = read(&app, "Kickoff.md");
-        assert!(text.contains("progress: 4/4 min\n"), "{text}");
+        assert!(text.contains("progress: 3/4 min\n"), "{text}");
         assert!(text.contains("Laatste punt."), "{text}");
         assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 1);
 
