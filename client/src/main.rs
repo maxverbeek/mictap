@@ -36,6 +36,10 @@ enum Cmd {
     Status,
     /// List audio sources
     Sources,
+    /// Send an existing audio or video file to the server for transcription
+    Upload {
+        file: std::path::PathBuf,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -47,6 +51,10 @@ async fn main() -> Result<()> {
         Cmd::Discard => Req::Discard { id: None },
         Cmd::Status => Req::Status,
         Cmd::Sources => Req::Sources,
+        Cmd::Upload { file } => {
+            println!("{}", upload::whole(&upload::server(), &file).await?);
+            return Ok(());
+        }
     };
     let mut stream = UnixStream::connect(daemon::socket_path()).await?;
     stream

@@ -33,8 +33,31 @@ struct Size {
     size: u64,
 }
 
+pub fn server() -> String {
+    std::env::var("MICTAP_SERVER").unwrap_or_else(|_| "http://homeserver:8765".into())
+}
+
+/// Posts a whole audio or video file; returns the server's reply (`{"id": ...}`).
+pub async fn whole(server: &str, path: &Path) -> Result<String> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("file name is not UTF-8")?;
+    let f = tokio::fs::File::open(path)
+        .await
+        .with_context(|| path.display().to_string())?;
+    let mtime_ms = f.metadata().await?.modified()?.duration_since(UNIX_EPOCH)?.as_millis();
+    let res = reqwest::Client::new()
+        .post(format!("{server}/recordings"))
+        .query(&[("filename", name), ("mtime_ms", &mtime_ms.to_string())])
+        .body(f)
+        .send()
+        .await?;
+    Ok(check(res).await?.text().await?)
+}
+
 pub async fn run(root: PathBuf) {
-    let server = std::env::var("MICTAP_SERVER").unwrap_or_else(|_| "http://homeserver:8765".into());
+    let server = server();
     let mut up = Uploader::new(server, root);
     let mut wait = TICK;
     loop {
@@ -309,6 +332,40 @@ mod tests {
                     .is_some_and(|m| m.windows(15).any(|w| w == b"\"finished\":true"))
         );
         assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn whole_file_posts_name_mtime_and_body() {
+        type Got = Arc<Mutex<Option<(HashMap<String, String>, Vec<u8>)>>>;
+        let got: Got = Default::default();
+        let app = Router::new()
+            .route(
+                "/recordings",
+                post(
+                    |State(g): State<Got>, Query(q): Query<HashMap<String, String>>, body: Bytes| async move {
+                        *g.lock().unwrap() = Some((q, body.to_vec()));
+                        (StatusCode::CREATED, Json(json!({"id": "up-1"})))
+                    },
+                ),
+            )
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(got.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("Meet 2026_08_11 14_59 CEST.mp4");
+        append(&path, 3_000_000, 7);
+        assert_eq!(whole(&url, &path).await.unwrap(), r#"{"id":"up-1"}"#);
+        let (q, body) = got.lock().unwrap().take().unwrap();
+        assert_eq!(q["filename"], "Meet 2026_08_11 14_59 CEST.mp4");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            q["mtime_ms"],
+            mtime.duration_since(UNIX_EPOCH).unwrap().as_millis().to_string()
+        );
+        assert!(body == std::fs::read(&path).unwrap());
     }
 
     #[tokio::test]
