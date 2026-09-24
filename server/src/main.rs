@@ -1,6 +1,7 @@
 mod api;
 mod db;
 mod diarize;
+mod merge;
 mod transcribe;
 mod windows;
 
