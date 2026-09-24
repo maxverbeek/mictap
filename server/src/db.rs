@@ -13,7 +13,9 @@ CREATE TABLE IF NOT EXISTS recordings (
     lang TEXT,
     error TEXT,
     -- What the vault file last showed; 'done', 'failed' and 'gone' are final.
-    written TEXT
+    written TEXT,
+    -- The speakers map (label -> name, JSON) last applied to the vault file's lines.
+    speakers TEXT
 );
 CREATE TABLE IF NOT EXISTS file_progress (
     recording TEXT NOT NULL REFERENCES recordings(id),

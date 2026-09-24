@@ -34,7 +34,7 @@ fn hms(ms: i64) -> String {
 }
 
 /// `room/S2` sorts as (false, 2): room before remote, then by number.
-fn label_order(label: &str) -> (bool, u32) {
+pub(crate) fn label_order(label: &str) -> (bool, u32) {
     let (track, n) = label.split_once("/S").unwrap_or((label, ""));
     (track != "room", n.parse().unwrap_or(u32::MAX))
 }
@@ -113,7 +113,13 @@ fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::Result<Optio
 
 /// Writes `content` to a temp file in `vault`, then renames it over `target`, or links it to
 /// the first free `<base>.md`, `<base> 2.md`, ... Returns the file name.
-fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, content: &str) -> Result<String> {
+pub(crate) fn put(
+    vault: &Path,
+    id: &str,
+    target: Option<&Path>,
+    base: &str,
+    content: &str,
+) -> Result<String> {
     let tmp = vault.join(format!(".mictap-{id}.tmp"));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(content.as_bytes())?;
