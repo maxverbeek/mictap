@@ -155,10 +155,7 @@ pub async fn step(app: &App) -> Result<bool> {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{id}: transcribing window {wid}: {e:#}");
-            db.execute(
-                "UPDATE recordings SET status = 'failed' WHERE id = ?1",
-                [&id],
-            )?;
+            crate::db::fail(&db, &id, &format!("transcribing: {e:#}"))?;
             return Ok(true);
         }
     };

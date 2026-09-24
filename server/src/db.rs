@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS recordings (
     status TEXT NOT NULL DEFAULT 'receiving',
     vault_path TEXT,
     finished INTEGER NOT NULL DEFAULT 0,
-    lang TEXT
+    lang TEXT,
+    error TEXT,
+    -- What the vault file last showed; 'done', 'failed' and 'gone' are final.
+    written TEXT
 );
 CREATE TABLE IF NOT EXISTS file_progress (
     recording TEXT NOT NULL REFERENCES recordings(id),
@@ -78,4 +81,12 @@ pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
         "UPDATE recordings SET finished = 1 WHERE id = ?1",
         params![id],
     )? == 1)
+}
+
+pub fn fail(conn: &Connection, id: &str, error: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE recordings SET status = 'failed', error = ?2 WHERE id = ?1",
+        params![id, error],
+    )?;
+    Ok(())
 }

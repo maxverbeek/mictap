@@ -99,10 +99,6 @@ pub fn merge(mut segs: Vec<Segment>, threshold: f64) -> Vec<Segment> {
 }
 
 /// The recording's segments, merged with `MICTAP_ECHO_JACCARD` (default 0.6).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the vault writer (C6) calls it")
-)]
 pub fn merged(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Segment>> {
     let threshold = std::env::var("MICTAP_ECHO_JACCARD")
         .ok()

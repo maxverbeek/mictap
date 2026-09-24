@@ -151,21 +151,22 @@ pub async fn run(app: Arc<App>) {
             eprintln!("windows: {e}");
             vec![]
         }) {
-            let status = match advance(&app, &id, finished).await {
-                Ok(()) if finished => "windowed",
+            let res = match advance(&app, &id, finished).await {
+                Ok(()) if finished => app.db.lock().await.execute(
+                    "UPDATE recordings SET status = 'windowed' WHERE id = ?1",
+                    [&id],
+                ),
                 Ok(()) => continue,
                 Err(e) => {
                     eprintln!("{id}: windowing: {e:#}");
                     if !finished {
                         continue;
                     }
-                    "failed"
+                    crate::db::fail(&*app.db.lock().await, &id, &format!("windowing: {e:#}"))
+                        .map(|()| 0)
                 }
             };
-            if let Err(e) = app.db.lock().await.execute(
-                "UPDATE recordings SET status = ?2 WHERE id = ?1",
-                params![id, status],
-            ) {
+            if let Err(e) = res {
                 eprintln!("{id}: {e}");
             }
         }

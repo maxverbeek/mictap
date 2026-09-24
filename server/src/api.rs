@@ -23,7 +23,7 @@ pub struct App {
     dir: PathBuf,
     // ponytail: one lock for the db and all file appends; per-recording locks if uploads contend.
     pub(crate) db: Mutex<Connection>,
-    tz: TimeZone,
+    pub(crate) tz: TimeZone,
     pub(crate) vault: PathBuf,
 }
 

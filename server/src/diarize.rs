@@ -288,17 +288,19 @@ pub async fn step(app: &App) -> Result<bool> {
     let Some(id) = next else {
         return Ok(false);
     };
-    let status = match label(app, &id).await {
-        Ok(()) => "diarized",
+    let db = || app.db.lock();
+    match label(app, &id).await {
+        Ok(()) => {
+            db().await.execute(
+                "UPDATE recordings SET status = 'diarized' WHERE id = ?1",
+                [&id],
+            )?;
+        }
         Err(e) => {
             eprintln!("{id}: diarizing: {e:#}");
-            "failed"
+            crate::db::fail(&*db().await, &id, &format!("diarizing: {e:#}"))?;
         }
-    };
-    app.db.lock().await.execute(
-        "UPDATE recordings SET status = ?2 WHERE id = ?1",
-        params![id, status],
-    )?;
+    }
     Ok(true)
 }
 

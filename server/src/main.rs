@@ -3,6 +3,7 @@ mod db;
 mod diarize;
 mod merge;
 mod transcribe;
+mod vault;
 mod windows;
 
 use std::{path::PathBuf, sync::Arc};
@@ -17,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(windows::run(app.clone()));
     tokio::spawn(transcribe::run(app.clone()));
     tokio::spawn(diarize::run(app.clone()));
+    tokio::spawn(vault::run(app.clone()));
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
