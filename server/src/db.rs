@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS recordings (
     -- What the vault file last showed; 'done', 'failed' and 'gone' are final.
     written TEXT,
     -- The speakers map (label -> name, JSON) last applied to the vault file's lines.
-    speakers TEXT
+    speakers TEXT,
+    -- audio.ogg: NULL until mixed down, then 'ready', 'failed' or 'expired'.
+    audio TEXT
 );
 CREATE TABLE IF NOT EXISTS file_progress (
     recording TEXT NOT NULL REFERENCES recordings(id),

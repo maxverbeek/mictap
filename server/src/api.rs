@@ -14,10 +14,12 @@ use axum::{
 };
 use futures_util::StreamExt;
 use jiff::{civil::DateTime, tz::TimeZone, Timestamp};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 
 pub struct App {
     dir: PathBuf,
@@ -57,6 +59,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/recordings/{id}/meta", put(put_meta))
         .route("/recordings/{id}/finish", post(finish))
+        .route("/r/{id}/audio.ogg", get(audio))
         .route("/upload", get(|| async { Html(UPLOAD_FORM) }))
         .with_state(app)
 }
@@ -69,6 +72,39 @@ const UPLOAD_FORM: &str = r#"<!doctype html>
 <button>Upload</button>
 </form>
 "#;
+
+const EXPIRED: &str = r#"<!doctype html>
+<meta charset="utf-8">
+<title>mictap: audio expired</title>
+<p>This recording's audio was deleted after 30 days. The transcript stays.</p>
+"#;
+
+async fn audio(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    req: Request,
+) -> Result<Response> {
+    let state: Option<String> = if valid_name(&id) {
+        app.db
+            .lock()
+            .await
+            .query_row("SELECT audio FROM recordings WHERE id = ?1", [&id], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten()
+    } else {
+        None
+    };
+    Ok(match state.as_deref() {
+        Some("ready") => ServeFile::new(app.recording_dir(&id).join("audio.ogg"))
+            .oneshot(req)
+            .await?
+            .map(Body::new),
+        Some("expired") => (StatusCode::GONE, Html(EXPIRED)).into_response(),
+        _ => (StatusCode::NOT_FOUND, "no audio").into_response(),
+    })
+}
 
 struct Error(StatusCode, String);
 
@@ -94,6 +130,7 @@ pub(crate) fn valid_name(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         && s != "meta.json"
+        && s != "audio.ogg"
 }
 
 fn check_name(s: &str) -> Result<()> {
@@ -344,7 +381,6 @@ mod tests {
     use super::*;
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use tower::ServiceExt;
 
     fn app() -> (tempfile::TempDir, Arc<App>) {
         let tmp = tempfile::tempdir().unwrap();
@@ -481,6 +517,52 @@ mod tests {
         let data =
             std::fs::read(tmp.path().join("recordings").join(id).join("upload.ogg")).unwrap();
         assert_eq!(data, b"OGGDATA");
+    }
+
+    #[tokio::test]
+    async fn serves_audio_ranges_and_expired() {
+        let (tmp, app) = app();
+        let dir = tmp.path().join("recordings/r1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("audio.ogg"), b"OggS0123456789").unwrap();
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                "INSERT INTO recordings (id, source, audio) VALUES
+                   ('r1', 'laptop', 'ready'), ('r2', 'laptop', 'expired'), ('r3', 'laptop', NULL);",
+            )
+            .unwrap();
+        let get = |uri: &str, range: Option<&str>| {
+            let mut req = Request::builder().uri(uri);
+            if let Some(r) = range {
+                req = req.header(header::RANGE, r);
+            }
+            router(app.clone()).oneshot(req.body(Body::empty()).unwrap())
+        };
+
+        let res = get("/r/r1/audio.ogg", Some("bytes=4-7")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "audio/ogg");
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"0123");
+
+        let res = get("/r/r1/audio.ogg", None).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = get("/r/r2/audio.ogg", None).await.unwrap();
+        assert_eq!(res.status(), StatusCode::GONE);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("deleted after 30 days"));
+
+        for uri in [
+            "/r/r3/audio.ogg",
+            "/r/nope/audio.ogg",
+            "/r/..%2Fr1/audio.ogg",
+        ] {
+            let res = get(uri, None).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[test]

@@ -54,15 +54,15 @@ pub fn cut(speech: &[(i64, i64)], audio_ms: i64, finished: bool) -> (Vec<Window>
 }
 
 #[derive(Deserialize)]
-struct Meta {
-    segments: Vec<Segment>,
+pub(crate) struct Meta {
+    pub segments: Vec<Segment>,
 }
 
 #[derive(Deserialize)]
-struct Segment {
-    file: String,
+pub(crate) struct Segment {
+    pub file: String,
     key: String,
-    offset_ms: i64,
+    pub offset_ms: i64,
 }
 
 /// Emits the newly closed windows of every file of `id` and stores how far each file got.

@@ -70,7 +70,7 @@ fn assign(turns: &[Turn], s: i64, e: i64) -> Option<usize> {
 }
 
 /// ffmpeg filter placing each input at its offset on one timeline.
-fn mix_filter(offsets_ms: &[i64]) -> String {
+pub(crate) fn mix_filter(offsets_ms: &[i64]) -> String {
     let mut f = String::new();
     for (i, off) in offsets_ms.iter().enumerate() {
         f += &format!("[{i}:a]adelay={off}:all=1[a{i}];");

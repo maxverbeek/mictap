@@ -1,4 +1,5 @@
 mod api;
+mod audio;
 mod db;
 mod diarize;
 mod merge;
@@ -21,6 +22,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(diarize::run(app.clone()));
     tokio::spawn(vault::run(app.clone()));
     tokio::spawn(speakers::run(app.clone()));
+    tokio::spawn(audio::run(app.clone()));
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
