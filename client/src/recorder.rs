@@ -57,7 +57,11 @@ impl Recorder {
         let stale: Vec<String> = self
             .running
             .iter()
-            .filter(|(k, (i, _))| !want.iter().any(|t| &t.key == *k && t.target == self.segments[*i].target))
+            .filter(|(k, (i, _))| {
+                !want
+                    .iter()
+                    .any(|t| &t.key == *k && t.target == self.segments[*i].target)
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for k in &stale {
@@ -84,7 +88,17 @@ impl Recorder {
     fn spawn(&mut self, t: &Track) -> Result<()> {
         let file = format!("{:02}-{}.oga", self.segments.len(), t.key);
         let child = Command::new("pw-record")
-            .args(["--target", &t.target, "--channels", "1", "--container", "oga", "--format", "opus", "-P"])
+            .args([
+                "--target",
+                &t.target,
+                "--channels",
+                "1",
+                "--container",
+                "oga",
+                "--format",
+                "opus",
+                "-P",
+            ])
             // dont-reconnect: when an app stream goes away, don't let the session
             // manager relink the recorder to the default mic.
             .arg(format!("{{ node.name = mictap-{} node.dont-reconnect = true }}", t.key))
@@ -105,7 +119,9 @@ impl Recorder {
     }
 
     async fn stop(&mut self, key: &str) {
-        let Some((i, mut child)) = self.running.remove(key) else { return };
+        let Some((i, mut child)) = self.running.remove(key) else {
+            return;
+        };
         // SIGINT lets pw-record flush the last Ogg page.
         if let Some(pid) = child.id() {
             unsafe { libc::kill(pid as i32, libc::SIGINT) };

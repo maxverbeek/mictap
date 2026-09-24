@@ -146,7 +146,17 @@ fn notify(id: String, app: Option<&str>, tx: mpsc::Sender<Msg>) {
     let body = format!("{} opened the mic", app.unwrap_or("A meeting app"));
     tokio::spawn(async move {
         let out = tokio::process::Command::new("notify-send")
-            .args(["-a", "mictap", "-t", "60000", "-A", "discard=Discard", "-w", "Recording", &body])
+            .args([
+                "-a",
+                "mictap",
+                "-t",
+                "60000",
+                "-A",
+                "discard=Discard",
+                "-w",
+                "Recording",
+                &body,
+            ])
             .output()
             .await;
         if out.is_ok_and(|o| o.stdout.starts_with(b"discard")) {
@@ -158,7 +168,9 @@ fn notify(id: String, app: Option<&str>, tx: mpsc::Sender<Msg>) {
 
 async fn serve(listener: UnixListener, tx: mpsc::Sender<Msg>, status: watch::Receiver<String>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
         let (tx, mut status) = (tx.clone(), status.clone());
         tokio::spawn(async move {
             let (r, mut w) = stream.into_split();
@@ -169,7 +181,9 @@ async fn serve(listener: UnixListener, tx: mpsc::Sender<Msg>, status: watch::Rec
             let req: Req = match serde_json::from_str(&line) {
                 Ok(req) => req,
                 Err(e) => {
-                    let _ = w.write_all(format!("{}\n", json!({"error": e.to_string()})).as_bytes()).await;
+                    let _ = w
+                        .write_all(format!("{}\n", json!({"error": e.to_string()})).as_bytes())
+                        .await;
                     return;
                 }
             };

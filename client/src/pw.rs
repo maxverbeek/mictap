@@ -82,26 +82,43 @@ fn allowed(n: &Node) -> bool {
 
 impl Graph {
     pub fn meeting(&self) -> Option<Meeting> {
-        let n = self.nodes.iter().find(|n| n.class == "Stream/Input/Audio" && allowed(n))?;
+        let n = self
+            .nodes
+            .iter()
+            .find(|n| n.class == "Stream/Input/Audio" && allowed(n))?;
         let source = self
             .links
             .iter()
             .filter(|(_, input)| *input == n.id)
             .find_map(|(output, _)| self.nodes.iter().find(|s| s.id == *output))
             .map(|s| s.name.clone());
-        Some(Meeting { stream: n.id, app: n.app.clone(), binary: n.binary.clone(), source })
+        Some(Meeting {
+            stream: n.id,
+            app: n.app.clone(),
+            binary: n.binary.clone(),
+            source,
+        })
     }
 
     pub fn playbacks(&self, m: &Meeting) -> Vec<&Node> {
         self.nodes
             .iter()
             .filter(|n| n.class == "Stream/Output/Audio")
-            .filter(|n| if m.binary.is_empty() { n.app == m.app } else { n.binary == m.binary })
+            .filter(|n| {
+                if m.binary.is_empty() {
+                    n.app == m.app
+                } else {
+                    n.binary == m.binary
+                }
+            })
             .collect()
     }
 
     pub fn sources(&self) -> Vec<&Node> {
-        self.nodes.iter().filter(|n| n.class.starts_with("Audio/Source")).collect()
+        self.nodes
+            .iter()
+            .filter(|n| n.class.starts_with("Audio/Source"))
+            .collect()
     }
 }
 
@@ -126,10 +143,16 @@ mod tests {
     fn finds_allowlisted_capture_its_source_and_playback() {
         let g = parse(DUMP).unwrap();
         let m = g.meeting().unwrap();
-        assert_eq!((m.stream, m.app.as_str(), m.source.as_deref()), (98, "Zen", Some("headset")));
+        assert_eq!(
+            (m.stream, m.app.as_str(), m.source.as_deref()),
+            (98, "Zen", Some("headset"))
+        );
         assert_eq!(g.playbacks(&m).iter().map(|n| n.serial).collect::<Vec<_>>(), [427]);
         assert_eq!(g.default_source.as_deref(), Some("mic1"));
-        assert_eq!(g.sources().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["mic1", "headset"]);
+        assert_eq!(
+            g.sources().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+            ["mic1", "headset"]
+        );
     }
 
     #[test]

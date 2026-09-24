@@ -32,7 +32,13 @@ pub struct Session {
 
 impl Session {
     fn new(mode: Mode, source: Option<String>) -> Self {
-        Self { mode, source, app: None, lost_at: None, tracks: vec![] }
+        Self {
+            mode,
+            source,
+            app: None,
+            lost_at: None,
+            tracks: vec![],
+        }
     }
 }
 
@@ -99,7 +105,13 @@ impl Machine {
             .or_else(|| meeting.as_ref()?.source.clone())
             .or(mic)
             .or_else(|| g.default_source.clone());
-        let mut tracks: Vec<Track> = source.map(|target| Track { key: "mic".into(), target }).into_iter().collect();
+        let mut tracks: Vec<Track> = source
+            .map(|target| Track {
+                key: "mic".into(),
+                target,
+            })
+            .into_iter()
+            .collect();
         if let Some(m) = &meeting {
             tracks.extend(g.playbacks(m).into_iter().map(|n| Track {
                 key: format!("app-{}", n.serial),
@@ -129,7 +141,11 @@ mod tests {
     }
 
     fn quiet() -> Graph {
-        Graph { nodes: vec![node(1, "Audio/Source", "mic1", "")], links: vec![], default_source: Some("mic1".into()) }
+        Graph {
+            nodes: vec![node(1, "Audio/Source", "mic1", "")],
+            links: vec![],
+            default_source: Some("mic1".into()),
+        }
     }
 
     fn meeting(source: &str) -> Graph {

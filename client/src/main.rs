@@ -48,7 +48,9 @@ async fn main() -> Result<()> {
         Cmd::Sources => Req::Sources,
     };
     let mut stream = UnixStream::connect(daemon::socket_path()).await?;
-    stream.write_all(format!("{}\n", serde_json::to_string(&req)?).as_bytes()).await?;
+    stream
+        .write_all(format!("{}\n", serde_json::to_string(&req)?).as_bytes())
+        .await?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line).await?;
     print!("{line}");
