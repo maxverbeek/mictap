@@ -44,7 +44,7 @@ async fn mixdown(app: &App, id: &str) -> Result<()> {
     let out = cmd
         .arg("-filter_complex")
         .arg(crate::diarize::mix_filter(&offsets))
-        .args(["-ac", "1", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg"])
+        .args(["-vn", "-ac", "1", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg"])
         .arg(&tmp)
         .output()
         .await
@@ -277,5 +277,41 @@ mod tests {
             .unwrap();
         assert!((104.0..=106.0).contains(&secs), "{secs}");
         assert!(!dir.join(".audio.ogg").exists());
+    }
+
+    /// Needs ffmpeg (with libopus) and ffprobe on PATH.
+    #[tokio::test]
+    #[ignore]
+    async fn mixdown_drops_video() {
+        let (_tmp, app) = app().await;
+        let dir = app.recording_dir("v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:duration=3"])
+            .args(["-f", "lavfi", "-i", "sine=duration=3", "-shortest"])
+            .arg(dir.join("upload.mp4"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"segments":[{"file":"upload.mp4","key":"upload","offset_ms":0}]}"#,
+        )
+        .unwrap();
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                "INSERT INTO recordings (id, source, status, finished) VALUES ('v1', 'upload', 'windowed', 1);
+                 INSERT INTO file_progress (recording, file, done_ms, complete) VALUES ('v1', 'upload.mp4', 3000, 1);",
+            )
+            .unwrap();
+        assert!(step(&app).await.unwrap());
+        let out = std::process::Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0"])
+            .arg(dir.join("audio.ogg"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), "audio");
     }
 }
