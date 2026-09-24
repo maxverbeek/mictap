@@ -2,7 +2,6 @@ mod daemon;
 mod machine;
 mod pw;
 mod recorder;
-mod upload;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -12,6 +11,7 @@ use tokio::{
 };
 
 use daemon::Req;
+use mictap::upload;
 
 #[derive(Parser)]
 #[command(version, about = "Meeting recorder")]

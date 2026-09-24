@@ -53,7 +53,7 @@ pub async fn run() -> Result<()> {
         eprintln!("closing orphaned recordings: {e:#}");
     }
     tokio::spawn(serve(listener, tx.clone(), status_rx));
-    tokio::spawn(crate::upload::run(spool()));
+    tokio::spawn(mictap::upload::run(spool()));
 
     let mut machine = Machine::default();
     let mut rec: Option<Recorder> = None;
