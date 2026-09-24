@@ -85,11 +85,9 @@ impl Machine {
                 s.lost_at = None;
                 s.app = Some(m.app.clone());
             }
-            None if s.mode == Mode::Auto => {
-                if now.duration_since(*s.lost_at.get_or_insert(now)) >= GRACE {
-                    self.session = None;
-                    return None;
-                }
+            None if s.mode == Mode::Auto && now.duration_since(*s.lost_at.get_or_insert(now)) >= GRACE => {
+                self.session = None;
+                return None;
             }
             None => {}
         }
