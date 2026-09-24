@@ -136,6 +136,9 @@ pub(crate) fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, con
     Ok(res?)
 }
 
+/// Missed syncs (5 s apart) before a transcript that vanished from the folder is given up.
+const GONE_AFTER: u32 = 60;
+
 /// Brings the vault file of `id` up to date with the database.
 pub async fn sync(app: &App, id: &str) -> Result<()> {
     let db = app.db.lock().await;
@@ -216,8 +219,18 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
     };
     let target = locate(&app.vault, id, cached.as_deref())?;
     let (name, key) = if target.is_none() && cached.is_some() {
-        eprintln!("{id}: transcript moved out of the vault folder, no longer writing it");
-        (cached, "gone".to_string())
+        // A rename synced as delete plus upload leaves a gap: only a long absence counts.
+        let misses = 1 + written
+            .as_deref()
+            .and_then(|w| w.strip_prefix("missing "))
+            .and_then(|n| n.parse::<u32>().ok())
+            .unwrap_or(0);
+        if misses < GONE_AFTER {
+            (cached, format!("missing {misses}"))
+        } else {
+            eprintln!("{id}: transcript moved out of the vault folder, no longer writing it");
+            (cached, "gone".to_string())
+        }
     } else {
         let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
         let content = render(&header, &segs);
@@ -225,7 +238,7 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
     };
     // The lock was released for the file IO, so the status read above may be stale: only
     // 'done' is written back, never the old value.
-    let done = (shown == "done").then_some("done");
+    let done = (shown == "done" && !key.starts_with("missing")).then_some("done");
     app.db.lock().await.execute(
         "UPDATE recordings SET vault_path = ?2, written = ?3, status = COALESCE(?4, status)
          WHERE id = ?1",
@@ -453,7 +466,9 @@ mod tests {
     #[tokio::test]
     async fn failed_gets_an_error_line() {
         let (_tmp, app) = setup().await;
-        crate::db::fail(&*app.db.lock().await, "r1", "transcribing: whisper-cli: boom").unwrap();
+        for _ in 0..3 {
+            crate::db::fail(&*app.db.lock().await, "r1", "transcribing: whisper-cli: boom").unwrap();
+        }
         sync(&app, "r1").await.unwrap();
         let text = read(&app, "2026-09-26 1600 Meeting.md");
         assert!(
@@ -475,14 +490,39 @@ mod tests {
         )
         .unwrap();
         app.db.lock().await.execute("UPDATE windows SET done = 1", []).unwrap();
+        let written = || async {
+            app.db
+                .lock()
+                .await
+                .query_row("SELECT written FROM recordings", [], |r| r.get::<_, String>(0))
+                .unwrap()
+        };
         sync(&app, "r1").await.unwrap();
+        assert_eq!(written().await, "missing 1");
+
+        // Back under a new name (a rename synced as delete plus upload): writing resumes.
+        std::fs::rename(tmp.path().join("elsewhere.md"), app.vault.join("Kickoff.md")).unwrap();
+        sync(&app, "r1").await.unwrap();
+        assert!(read(&app, "Kickoff.md").contains("status: transcribing"));
+        assert!(written().await.starts_with("transcribing"));
+
+        std::fs::rename(app.vault.join("Kickoff.md"), tmp.path().join("elsewhere.md")).unwrap();
+        app.db
+            .lock()
+            .await
+            .execute("UPDATE recordings SET status = 'diarized', finished = 1", [])
+            .unwrap();
+        for _ in 0..GONE_AFTER {
+            sync(&app, "r1").await.unwrap();
+        }
         assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
-        let written: String = app
+        assert_eq!(written().await, "gone");
+        let status: String = app
             .db
             .lock()
             .await
-            .query_row("SELECT written FROM recordings", [], |r| r.get(0))
+            .query_row("SELECT status FROM recordings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(written, "gone");
+        assert_eq!(status, "done");
     }
 }

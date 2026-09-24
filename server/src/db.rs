@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     finished INTEGER NOT NULL DEFAULT 0,
     lang TEXT,
     error TEXT,
+    -- Failed attempts at the current step; see fail().
+    attempts INTEGER NOT NULL DEFAULT 0,
     -- What the vault file last showed; 'done', 'failed' and 'gone' are final.
     written TEXT,
     -- The speakers map (label -> name, JSON) last applied to the vault file's lines.
@@ -24,6 +26,8 @@ CREATE TABLE IF NOT EXISTS file_progress (
     file TEXT NOT NULL,
     done_ms INTEGER NOT NULL DEFAULT 0,
     complete INTEGER NOT NULL DEFAULT 0,
+    -- The file's size when done_ms was stored.
+    bytes INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (recording, file)
 );
 -- start_ms/end_ms are within the file; offset_ms is the file's start in the recording.
@@ -84,10 +88,38 @@ pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("UPDATE recordings SET finished = 1 WHERE id = ?1", params![id])? == 1)
 }
 
-pub fn fail(conn: &Connection, id: &str, error: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "UPDATE recordings SET status = 'failed', error = ?2 WHERE id = ?1",
-        params![id, error],
-    )?;
-    Ok(())
+const ATTEMPTS: i64 = 3;
+
+/// Counts a failed attempt at the current step; the third in a row fails the recording.
+/// Returns true when it did. Workers reset `attempts` when a step succeeds.
+pub fn fail(conn: &Connection, id: &str, error: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "UPDATE recordings SET attempts = attempts + 1, error = ?2,
+         status = CASE WHEN attempts + 1 >= ?3 THEN 'failed' ELSE status END
+         WHERE id = ?1 RETURNING status = 'failed'",
+        params![id, error, ATTEMPTS],
+        |r| r.get(0),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fails_on_the_third_attempt() {
+        let conn = super::open(std::path::Path::new(":memory:")).unwrap();
+        super::ensure_recording(&conn, "r1", "laptop").unwrap();
+        assert!(!super::fail(&conn, "r1", "a").unwrap());
+        assert!(!super::fail(&conn, "r1", "b").unwrap());
+        let status: String = conn
+            .query_row("SELECT status FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "receiving");
+        assert!(super::fail(&conn, "r1", "c").unwrap());
+        let row: (String, String) = conn
+            .query_row("SELECT status, error FROM recordings", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("failed".into(), "c".into()));
+    }
 }

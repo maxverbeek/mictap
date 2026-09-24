@@ -1,4 +1,9 @@
-use std::{io::Read, path::Path, sync::Arc, time::Duration};
+use std::{
+    io::Read,
+    path::Path,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
@@ -9,6 +14,7 @@ use crate::api::{valid_name, App};
 
 const MAX_MS: i64 = 30_000;
 const TAIL_MS: i64 = 2_000;
+const IDLE: Duration = Duration::from_secs(7 * 86_400);
 
 #[derive(Debug, PartialEq)]
 pub struct Window {
@@ -76,25 +82,26 @@ pub async fn advance(app: &App, id: &str, finished: bool) -> Result<()> {
         if !valid_name(&seg.file) {
             bail!("bad file name in meta.json: {}", seg.file);
         }
-        let progress: Option<(i64, bool)> = app
+        let progress: Option<(i64, bool, u64)> = app
             .db
             .lock()
             .await
             .query_row(
-                "SELECT done_ms, complete FROM file_progress WHERE recording = ?1 AND file = ?2",
+                "SELECT done_ms, complete, bytes FROM file_progress WHERE recording = ?1 AND file = ?2",
                 params![id, seg.file],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let (done_ms, complete) = progress.unwrap_or((0, false));
-        if complete {
+        let (done_ms, complete, bytes) = progress.unwrap_or((0, false, 0));
+        let path = dir.join(&seg.file);
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+        if complete || (size == bytes && !finished) {
             continue;
         }
-        let path = dir.join(&seg.file);
         let audio_ms = match decode(&path, done_ms, None, &wav).await {
             Ok(ms) => ms,
             // Not a single Ogg page yet (or an empty segment).
-            Err(_) if done_ms == 0 && std::fs::metadata(&path).map_or(0, |m| m.len()) < 4096 => 0,
+            Err(_) if done_ms == 0 && size < 4096 => 0,
             Err(e) => return Err(e),
         };
         let speech = if audio_ms > 0 {
@@ -123,45 +130,66 @@ pub async fn advance(app: &App, id: &str, finished: bool) -> Result<()> {
             )?;
         }
         tx.execute(
-            "INSERT INTO file_progress (recording, file, done_ms, complete) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT DO UPDATE SET done_ms = excluded.done_ms, complete = excluded.complete",
-            params![id, seg.file, done_ms + resume, finished],
+            "INSERT INTO file_progress (recording, file, done_ms, complete, bytes) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT DO UPDATE SET done_ms = excluded.done_ms, complete = excluded.complete,
+             bytes = excluded.bytes",
+            params![id, seg.file, done_ms + resume, finished, size],
         )?;
         tx.commit()?;
     }
     Ok(())
 }
 
-/// Advances every recording still receiving; a finished one moves on to `windowed`.
+/// Advances every recording still receiving; a finished one moves on to `windowed`. One
+/// that got no upload for `IDLE` at `now` (a client that crashed or discarded mid-upload)
+/// is finished with what arrived.
+pub async fn tick(app: &App, now: SystemTime) -> Result<()> {
+    let recordings: Vec<(String, bool)> = app
+        .db
+        .lock()
+        .await
+        .prepare("SELECT id, finished FROM recordings WHERE status = 'receiving'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, mut finished) in recordings {
+        if !finished && last_upload(&app.recording_dir(&id)).is_none_or(|t| t + IDLE < now) {
+            eprintln!("{id}: no upload for {} days, finishing", IDLE.as_secs() / 86_400);
+            finished = crate::db::finish(&*app.db.lock().await, &id)?;
+        }
+        match advance(app, &id, finished).await {
+            Ok(()) if finished => {
+                app.db.lock().await.execute(
+                    "UPDATE recordings SET status = 'windowed', attempts = 0
+                     WHERE id = ?1 AND status = 'receiving'",
+                    [&id],
+                )?;
+            }
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("{id}: windowing: {e:#}");
+                if finished {
+                    crate::db::fail(&*app.db.lock().await, &id, &format!("windowing: {e:#}"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The newest mtime in `dir`, which only uploads write to while a recording is receiving.
+fn last_upload(dir: &Path) -> Option<SystemTime> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .chain(std::fs::metadata(dir).and_then(|m| m.modified()).ok())
+        .max()
+}
+
 pub async fn run(app: Arc<App>) {
     loop {
-        let recordings: rusqlite::Result<Vec<(String, bool)>> = {
-            let db = app.db.lock().await;
-            db.prepare("SELECT id, finished FROM recordings WHERE status = 'receiving'")
-                .and_then(|mut st| st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
-        };
-        for (id, finished) in recordings.unwrap_or_else(|e| {
-            eprintln!("windows: {e}");
-            vec![]
-        }) {
-            let res = match advance(&app, &id, finished).await {
-                Ok(()) if finished => app
-                    .db
-                    .lock()
-                    .await
-                    .execute("UPDATE recordings SET status = 'windowed' WHERE id = ?1", [&id]),
-                Ok(()) => continue,
-                Err(e) => {
-                    eprintln!("{id}: windowing: {e:#}");
-                    if !finished {
-                        continue;
-                    }
-                    crate::db::fail(&*app.db.lock().await, &id, &format!("windowing: {e:#}")).map(|()| 0)
-                }
-            };
-            if let Err(e) = res {
-                eprintln!("{id}: {e}");
-            }
+        if let Err(e) = tick(&app, SystemTime::now()).await {
+            eprintln!("windows: {e:#}");
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
@@ -280,6 +308,67 @@ mod tests {
                    Speech segment 1: start = 144.00, end = 6000.00\n";
         assert_eq!(parse_vad(out, 59_990), vec![(0, 890), (1_440, 59_990)]);
         assert_eq!(parse_vad("\nDetected 0 speech segments:\n", 1_000), vec![]);
+    }
+
+    #[tokio::test]
+    async fn finishes_idle_recordings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = App::open(tmp.path().to_path_buf()).unwrap();
+        let now = SystemTime::now();
+        for id in ["idle", "live"] {
+            crate::db::ensure_recording(&*app.db.lock().await, id, "laptop").unwrap();
+            let dir = app.recording_dir(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("meta.json"), r#"{"segments":[]}"#).unwrap();
+        }
+        let dir = app.recording_dir("idle");
+        let old = now - IDLE - Duration::from_secs(60);
+        for p in [dir.join("meta.json"), dir.clone()] {
+            std::fs::File::open(p).unwrap().set_modified(old).unwrap();
+        }
+        tick(&app, now).await.unwrap();
+        let rows: Vec<(String, String, bool)> = app
+            .db
+            .lock()
+            .await
+            .prepare("SELECT id, status, finished FROM recordings ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("idle".into(), "windowed".into(), true),
+                ("live".into(), "receiving".into(), false)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_files_that_did_not_grow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = App::open(tmp.path().to_path_buf()).unwrap();
+        let dir = app.recording_dir("r1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"segments":[{"file":"00-mic.oga","key":"mic","offset_ms":0}]}"#,
+        )
+        .unwrap();
+        // Not decodable: advance would fail if it spawned ffmpeg.
+        std::fs::write(dir.join("00-mic.oga"), vec![0u8; 8192]).unwrap();
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                "INSERT INTO recordings (id, source) VALUES ('r1', 'laptop');
+                 INSERT INTO file_progress (recording, file, done_ms, bytes) VALUES ('r1', '00-mic.oga', 5000, 8192);",
+            )
+            .unwrap();
+        advance(&app, "r1", false).await.unwrap();
+        assert!(advance(&app, "r1", true).await.is_err());
     }
 
     /// Needs ffmpeg and whisper-vad-speech-segments on PATH and MICTAP_VAD_MODEL.

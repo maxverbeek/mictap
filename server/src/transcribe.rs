@@ -95,7 +95,8 @@ async fn transcribe(wav: &Path, len_ms: i64, current: &str, prompt: &str) -> Res
     Ok((segs, current.to_string()))
 }
 
-/// Transcribes the oldest pending window. Returns false when there is none.
+/// Transcribes the oldest pending window. Returns false when there is none, or when it
+/// failed and will be retried after a pause.
 pub async fn step(app: &App) -> Result<bool> {
     let next = app
         .db
@@ -139,8 +140,8 @@ pub async fn step(app: &App) -> Result<bool> {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{id}: transcribing window {wid}: {e:#}");
-            crate::db::fail(&db, &id, &format!("transcribing: {e:#}"))?;
-            return Ok(true);
+            // Not final: the window stays pending and is retried after the worker's pause.
+            return Ok(crate::db::fail(&db, &id, &format!("transcribing: {e:#}"))?);
         }
     };
     let tx = db.transaction()?;
@@ -153,7 +154,10 @@ pub async fn step(app: &App) -> Result<bool> {
         )?;
     }
     tx.execute("UPDATE windows SET done = 1 WHERE id = ?1", [wid])?;
-    tx.execute("UPDATE recordings SET lang = ?2 WHERE id = ?1", params![id, lang])?;
+    tx.execute(
+        "UPDATE recordings SET lang = ?2, attempts = 0 WHERE id = ?1",
+        params![id, lang],
+    )?;
     tx.commit()?;
     Ok(true)
 }

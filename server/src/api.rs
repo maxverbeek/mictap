@@ -180,7 +180,11 @@ async fn put_meta(State(app): State<Arc<App>>, Path(id): Path<String>, body: Byt
 
 async fn finish(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
     check_name(&id)?;
-    if crate::db::finish(&*app.db.lock().await, &id)? {
+    let db = app.db.lock().await;
+    if !app.recording_dir(&id).join("meta.json").exists() {
+        return Err(Error(StatusCode::CONFLICT, format!("no meta.json for {id} yet")));
+    }
+    if crate::db::finish(&db, &id)? {
         Ok(StatusCode::OK)
     } else {
         Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")))
@@ -411,8 +415,11 @@ mod tests {
     #[tokio::test]
     async fn meta_and_finish() {
         let (tmp, app) = app();
+        // Files, then meta, then finish: finishing without meta.json is refused.
+        let (s, _) = send(&app, "PUT", "/recordings/r1/files/00-mic.oga?offset=0", b"x").await;
+        assert_eq!(s, StatusCode::OK);
         let (s, _) = send(&app, "POST", "/recordings/r1/finish", b"").await;
-        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(s, StatusCode::CONFLICT);
 
         let meta = br#"{"id":"r1","started_ms":1727179202000,"app":"Zen","segments":[]}"#;
         let (s, _) = send(&app, "PUT", "/recordings/r1/meta", meta).await;

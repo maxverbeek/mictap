@@ -247,7 +247,8 @@ fn cluster_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Ve
 }
 
 /// Diarizes the oldest windowed recording whose windows are all transcribed: labels its
-/// segments `track/S<n>` and stores each cluster's embedding. Returns false when there is none.
+/// segments `track/S<n>` and stores each cluster's embedding. Returns false when there is none,
+/// or when it failed and will be retried after a pause.
 pub async fn step(app: &App) -> Result<bool> {
     let next: Option<String> = app
         .db
@@ -267,15 +268,17 @@ pub async fn step(app: &App) -> Result<bool> {
     let db = || app.db.lock();
     match label(app, &id).await {
         Ok(()) => {
-            db().await
-                .execute("UPDATE recordings SET status = 'diarized' WHERE id = ?1", [&id])?;
+            db().await.execute(
+                "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
+                [&id],
+            )?;
+            Ok(true)
         }
         Err(e) => {
             eprintln!("{id}: diarizing: {e:#}");
-            crate::db::fail(&*db().await, &id, &format!("diarizing: {e:#}"))?;
+            Ok(crate::db::fail(&*db().await, &id, &format!("diarizing: {e:#}"))?)
         }
     }
-    Ok(true)
 }
 
 async fn label(app: &App, id: &str) -> Result<()> {
