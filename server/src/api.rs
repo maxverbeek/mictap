@@ -48,7 +48,10 @@ pub fn router(app: Arc<App>) -> Router {
             "/recordings",
             post(upload).layer(DefaultBodyLimit::disable()),
         )
-        .route("/recordings/{id}/files/{name}", put(put_file))
+        .route(
+            "/recordings/{id}/files/{name}",
+            put(put_file).layer(DefaultBodyLimit::max(16 << 20)),
+        )
         .route("/recordings/{id}/meta", put(put_meta))
         .route("/recordings/{id}/finish", post(finish))
         .route("/upload", get(|| async { Html(UPLOAD_FORM) }))
