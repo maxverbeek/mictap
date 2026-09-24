@@ -22,7 +22,7 @@ use tokio::{io::AsyncWriteExt, sync::Mutex};
 pub struct App {
     dir: PathBuf,
     // ponytail: one lock for the db and all file appends; per-recording locks if uploads contend.
-    db: Mutex<Connection>,
+    pub(crate) db: Mutex<Connection>,
     tz: TimeZone,
 }
 
@@ -37,7 +37,7 @@ impl App {
         })
     }
 
-    fn recording_dir(&self, id: &str) -> PathBuf {
+    pub(crate) fn recording_dir(&self, id: &str) -> PathBuf {
         self.dir.join("recordings").join(id)
     }
 }
@@ -83,14 +83,18 @@ impl<E: std::fmt::Display> From<E> for Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-fn check_name(s: &str) -> Result<()> {
-    let ok = !s.is_empty()
+/// Safe as a single path component under a recording dir.
+pub(crate) fn valid_name(s: &str) -> bool {
+    !s.is_empty()
         && s.len() <= 128
         && s.as_bytes()[0].is_ascii_alphanumeric()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        && s != "meta.json";
-    if ok {
+        && s != "meta.json"
+}
+
+fn check_name(s: &str) -> Result<()> {
+    if valid_name(s) {
         Ok(())
     } else {
         Err(Error(StatusCode::BAD_REQUEST, format!("bad name: {s}")))

@@ -15,7 +15,18 @@ CREATE TABLE IF NOT EXISTS file_progress (
     recording TEXT NOT NULL REFERENCES recordings(id),
     file TEXT NOT NULL,
     done_ms INTEGER NOT NULL DEFAULT 0,
+    complete INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (recording, file)
+);
+-- start_ms/end_ms are within the file; offset_ms is the file's start in the recording.
+CREATE TABLE IF NOT EXISTS windows (
+    id INTEGER PRIMARY KEY,
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    file TEXT NOT NULL,
+    track TEXT NOT NULL,
+    offset_ms INTEGER NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clusters (
     recording TEXT NOT NULL REFERENCES recordings(id),
