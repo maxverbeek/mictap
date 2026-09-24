@@ -56,6 +56,7 @@ impl Machine {
         match &mut self.session {
             Some(s) => {
                 s.mode = Mode::Manual;
+                s.lost_at = None;
                 if source.is_some() {
                     s.source = source;
                 }
@@ -192,5 +193,15 @@ mod tests {
         m.start(Some("headset".into()));
         assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=headset", "app-11=11"]);
         assert!(m.tick(&quiet(), t0 + secs(600)).is_some());
+    }
+
+    #[test]
+    fn start_during_grace_clears_the_countdown() {
+        let (mut m, t0) = (Machine::default(), Instant::now());
+        m.tick(&meeting("mic1"), t0);
+        m.tick(&quiet(), t0 + secs(1));
+        m.start(None);
+        assert!(m.tick(&quiet(), t0 + secs(2)).is_some());
+        assert_eq!(m.session.as_ref().unwrap().lost_at, None);
     }
 }
