@@ -140,13 +140,13 @@ fn sources(g: &Graph) -> String {
     .to_string()
 }
 
-/// Offers Discard for an auto-started recording. A click after the recording
-/// ended is a no-op: the id no longer matches.
+/// Offers Discard for an auto-started recording, for as long as the upload
+/// hold (60 s). A click after the recording ended is a no-op: the id no longer matches.
 fn notify(id: String, app: Option<&str>, tx: mpsc::Sender<Msg>) {
     let body = format!("{} opened the mic", app.unwrap_or("A meeting app"));
     tokio::spawn(async move {
         let out = tokio::process::Command::new("notify-send")
-            .args(["-a", "mictap", "-A", "discard=Discard", "-w", "Recording", &body])
+            .args(["-a", "mictap", "-t", "60000", "-A", "discard=Discard", "-w", "Recording", &body])
             .output()
             .await;
         if out.is_ok_and(|o| o.stdout.starts_with(b"discard")) {
