@@ -37,8 +37,7 @@ impl App {
             dir,
             db: Mutex::new(db),
             tz: TimeZone::system(),
-            vault: std::env::var_os("MICTAP_VAULT")
-                .map_or_else(|| "/srv/vault/mictap".into(), PathBuf::from),
+            vault: std::env::var_os("MICTAP_VAULT").map_or_else(|| "/srv/vault/mictap".into(), PathBuf::from),
         })
     }
 
@@ -49,10 +48,7 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route(
-            "/recordings",
-            post(upload).layer(DefaultBodyLimit::disable()),
-        )
+        .route("/recordings", post(upload).layer(DefaultBodyLimit::disable()))
         .route(
             "/recordings/{id}/files/{name}",
             put(put_file).layer(DefaultBodyLimit::max(16 << 20)),
@@ -79,18 +75,12 @@ const EXPIRED: &str = r#"<!doctype html>
 <p>This recording's audio was deleted after 30 days. The transcript stays.</p>
 "#;
 
-async fn audio(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    req: Request,
-) -> Result<Response> {
+async fn audio(State(app): State<Arc<App>>, Path(id): Path<String>, req: Request) -> Result<Response> {
     let state: Option<String> = if valid_name(&id) {
         app.db
             .lock()
             .await
-            .query_row("SELECT audio FROM recordings WHERE id = ?1", [&id], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT audio FROM recordings WHERE id = ?1", [&id], |r| r.get(0))
             .optional()?
             .flatten()
     } else {
@@ -127,8 +117,7 @@ pub(crate) fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.as_bytes()[0].is_ascii_alphanumeric()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         && s != "meta.json"
         && s != "audio.ogg"
 }
@@ -166,10 +155,7 @@ async fn put_file(
     let skip = (size - q.offset) as usize;
     let mut size = size;
     if skip < body.len() {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         f.write_all(&body[skip..])?;
         f.sync_data()?;
         size += (body.len() - skip) as u64;
@@ -177,14 +163,10 @@ async fn put_file(
     Ok(Json(json!({ "size": size })).into_response())
 }
 
-async fn put_meta(
-    State(app): State<Arc<App>>,
-    Path(id): Path<String>,
-    body: Bytes,
-) -> Result<StatusCode> {
+async fn put_meta(State(app): State<Arc<App>>, Path(id): Path<String>, body: Bytes) -> Result<StatusCode> {
     check_name(&id)?;
-    let meta: Value = serde_json::from_slice(&body)
-        .map_err(|e| Error(StatusCode::BAD_REQUEST, format!("meta.json: {e}")))?;
+    let meta: Value =
+        serde_json::from_slice(&body).map_err(|e| Error(StatusCode::BAD_REQUEST, format!("meta.json: {e}")))?;
     let db = app.db.lock().await;
     crate::db::ensure_recording(&db, &id, "laptop")?;
     if let Some(ms) = meta["started_ms"].as_i64() {
@@ -219,17 +201,9 @@ struct UploadQuery {
     mtime_ms: Option<i64>,
 }
 
-async fn upload(
-    State(app): State<Arc<App>>,
-    Query(q): Query<UploadQuery>,
-    req: Request,
-) -> Result<Response> {
+async fn upload(State(app): State<Arc<App>>, Query(q): Query<UploadQuery>, req: Request) -> Result<Response> {
     let now = Timestamp::now();
-    let id = format!(
-        "up-{}-{:03}",
-        now.strftime("%Y%m%dT%H%M%SZ"),
-        now.subsec_millisecond()
-    );
+    let id = format!("up-{}-{:03}", now.strftime("%Y%m%dT%H%M%SZ"), now.subsec_millisecond());
     let dir = app.recording_dir(&id);
     std::fs::create_dir(&dir)?;
     let res = receive(&app, &id, &dir, q, now, req).await;
@@ -239,14 +213,7 @@ async fn upload(
     res
 }
 
-async fn receive(
-    app: &App,
-    id: &str,
-    dir: &FsPath,
-    q: UploadQuery,
-    now: Timestamp,
-    req: Request,
-) -> Result<Response> {
+async fn receive(app: &App, id: &str, dir: &FsPath, q: UploadQuery, now: Timestamp, req: Request) -> Result<Response> {
     let multipart = req
         .headers()
         .get(header::CONTENT_TYPE)
@@ -372,8 +339,7 @@ fn upload_started_ms(
         let dt = DateTime::strptime("%Y_%m_%d %H_%M", std::str::from_utf8(w).ok()?).ok()?;
         Some(dt.to_zoned(tz.clone()).ok()?.timestamp().as_millisecond())
     });
-    meet.or(mtime_ms.zip(duration_ms).map(|(m, d)| m - d))
-        .unwrap_or(now_ms)
+    meet.or(mtime_ms.zip(duration_ms).map(|(m, d)| m - d)).unwrap_or(now_ms)
 }
 
 #[cfg(test)]
@@ -396,10 +362,7 @@ mod tests {
             .unwrap();
         let res = router(app.clone()).oneshot(req).await.unwrap();
         let status = res.status();
-        (
-            status,
-            res.into_body().collect().await.unwrap().to_bytes().to_vec(),
-        )
+        (status, res.into_body().collect().await.unwrap().to_bytes().to_vec())
     }
 
     #[tokio::test]
@@ -425,10 +388,7 @@ mod tests {
 
         // Gap.
         let (s, b) = send(&app, "PUT", &url(20), b"x").await;
-        assert_eq!(
-            (s, b.as_slice()),
-            (StatusCode::CONFLICT, &br#"{"size":12}"#[..])
-        );
+        assert_eq!((s, b.as_slice()), (StatusCode::CONFLICT, &br#"{"size":12}"#[..]));
 
         let data = std::fs::read(tmp.path().join("recordings/r1/00-mic.oga")).unwrap();
         assert_eq!(data, b"hello world!");
@@ -457,10 +417,7 @@ mod tests {
         let meta = br#"{"id":"r1","started_ms":1727179202000,"app":"Zen","segments":[]}"#;
         let (s, _) = send(&app, "PUT", "/recordings/r1/meta", meta).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(
-            std::fs::read(tmp.path().join("recordings/r1/meta.json")).unwrap(),
-            meta
-        );
+        assert_eq!(std::fs::read(tmp.path().join("recordings/r1/meta.json")).unwrap(), meta);
 
         for _ in 0..2 {
             let (s, _) = send(&app, "POST", "/recordings/r1/finish", b"").await;
@@ -470,11 +427,9 @@ mod tests {
             .db
             .lock()
             .await
-            .query_row(
-                "SELECT started_ms, finished FROM recordings WHERE id = 'r1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT started_ms, finished FROM recordings WHERE id = 'r1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(row, (1727179202000, 1));
     }
@@ -490,8 +445,7 @@ mod tests {
             .to_string();
         let dir = tmp.path().join("recordings").join(&id);
         assert_eq!(std::fs::read(dir.join("upload.m4a")).unwrap(), b"audio");
-        let meta: Value =
-            serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
+        let meta: Value = serde_json::from_slice(&std::fs::read(dir.join("meta.json")).unwrap()).unwrap();
         assert_eq!(meta["source"], "upload");
         assert_eq!(meta["segments"][0]["file"], "upload.m4a");
     }
@@ -514,8 +468,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let data =
-            std::fs::read(tmp.path().join("recordings").join(id).join("upload.ogg")).unwrap();
+        let data = std::fs::read(tmp.path().join("recordings").join(id).join("upload.ogg")).unwrap();
         assert_eq!(data, b"OGGDATA");
     }
 
@@ -555,11 +508,7 @@ mod tests {
         let body = res.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&body).contains("deleted after 30 days"));
 
-        for uri in [
-            "/r/r3/audio.ogg",
-            "/r/nope/audio.ogg",
-            "/r/..%2Fr1/audio.ogg",
-        ] {
+        for uri in ["/r/r3/audio.ogg", "/r/nope/audio.ogg", "/r/..%2Fr1/audio.ogg"] {
             let res = get(uri, None).await.unwrap();
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
         }
@@ -571,46 +520,23 @@ mod tests {
         let meet = "Team Sync - 2026_08_11 14_59 CEST - Recording.mp4";
         let now = 5_000_000_000_000;
 
-        let tag = upload_started_ms(
-            Some("2026-08-11T12:00:00.000000Z"),
-            meet,
-            None,
-            None,
-            now,
-            &tz,
-        );
+        let tag = upload_started_ms(Some("2026-08-11T12:00:00.000000Z"), meet, None, None, now, &tz);
         assert_eq!(
             tag,
-            "2026-08-11T12:00:00Z"
-                .parse::<Timestamp>()
-                .unwrap()
-                .as_millisecond()
+            "2026-08-11T12:00:00Z".parse::<Timestamp>().unwrap().as_millisecond()
         );
 
         // 14:59 CEST is 12:59 UTC; a bogus 1970 tag is ignored.
-        let from_name = upload_started_ms(
-            Some("1970-01-01T00:00:00Z"),
-            meet,
-            Some(1),
-            Some(1),
-            now,
-            &tz,
-        );
+        let from_name = upload_started_ms(Some("1970-01-01T00:00:00Z"), meet, Some(1), Some(1), now, &tz);
         assert_eq!(
             from_name,
-            "2026-08-11T12:59:00Z"
-                .parse::<Timestamp>()
-                .unwrap()
-                .as_millisecond()
+            "2026-08-11T12:59:00Z".parse::<Timestamp>().unwrap().as_millisecond()
         );
 
         assert_eq!(
             upload_started_ms(None, "memo.m4a", Some(10_000), Some(3_000), now, &tz),
             7_000
         );
-        assert_eq!(
-            upload_started_ms(None, "memo.m4a", None, Some(3_000), now, &tz),
-            now
-        );
+        assert_eq!(upload_started_ms(None, "memo.m4a", None, Some(3_000), now, &tz), now);
     }
 }

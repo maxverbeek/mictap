@@ -98,10 +98,7 @@ async fn timeline(dir: &Path, files: &[(String, i64)], wav: &Path) -> Result<()>
         .await
         .context("ffmpeg")?;
     if !out.status.success() {
-        bail!(
-            "ffmpeg timeline: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("ffmpeg timeline: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
 }
@@ -167,21 +164,10 @@ extern "C" {
     fn SherpaOnnxDestroySpeakerEmbeddingExtractor(p: *const RawExtractor);
     fn SherpaOnnxSpeakerEmbeddingExtractorDim(p: *const RawExtractor) -> i32;
     fn SherpaOnnxSpeakerEmbeddingExtractorCreateStream(p: *const RawExtractor) -> *const RawStream;
-    fn SherpaOnnxOnlineStreamAcceptWaveform(
-        s: *const RawStream,
-        rate: i32,
-        samples: *const f32,
-        n: i32,
-    );
+    fn SherpaOnnxOnlineStreamAcceptWaveform(s: *const RawStream, rate: i32, samples: *const f32, n: i32);
     fn SherpaOnnxOnlineStreamInputFinished(s: *const RawStream);
-    fn SherpaOnnxSpeakerEmbeddingExtractorIsReady(
-        p: *const RawExtractor,
-        s: *const RawStream,
-    ) -> i32;
-    fn SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(
-        p: *const RawExtractor,
-        s: *const RawStream,
-    ) -> *const f32;
+    fn SherpaOnnxSpeakerEmbeddingExtractorIsReady(p: *const RawExtractor, s: *const RawStream) -> i32;
+    fn SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(p: *const RawExtractor, s: *const RawStream) -> *const f32;
     fn SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(v: *const f32);
     fn SherpaOnnxDestroyOnlineStream(s: *const RawStream);
 }
@@ -212,12 +198,7 @@ impl Extractor {
         unsafe {
             let dim = SherpaOnnxSpeakerEmbeddingExtractorDim(self.0) as usize;
             let s = SherpaOnnxSpeakerEmbeddingExtractorCreateStream(self.0);
-            SherpaOnnxOnlineStreamAcceptWaveform(
-                s,
-                RATE as i32,
-                samples.as_ptr(),
-                samples.len() as i32,
-            );
+            SherpaOnnxOnlineStreamAcceptWaveform(s, RATE as i32, samples.as_ptr(), samples.len() as i32);
             SherpaOnnxOnlineStreamInputFinished(s);
             let v = (SherpaOnnxSpeakerEmbeddingExtractorIsReady(self.0, s) != 0).then(|| {
                 let p = SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(self.0, s);
@@ -246,18 +227,13 @@ fn normalize(v: &mut [f32]) {
 }
 
 /// Per speaker, the normalized mean of its turns' normalized embeddings.
-fn cluster_embeddings(
-    model: &str,
-    samples: &[f32],
-    turns: &[Turn],
-) -> Result<Vec<Option<Vec<f32>>>> {
+fn cluster_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Vec<Option<Vec<f32>>>> {
     let ex = Extractor::new(model)?;
     let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
     let mut sums: Vec<Option<Vec<f32>>> = vec![None; n];
     let at = |ms: i64| (ms.max(0) as usize * RATE / 1000).min(samples.len());
     for t in turns {
-        let Some(mut v) = ex.embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))])
-        else {
+        let Some(mut v) = ex.embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))]) else {
             continue;
         };
         normalize(&mut v);
@@ -291,10 +267,8 @@ pub async fn step(app: &App) -> Result<bool> {
     let db = || app.db.lock();
     match label(app, &id).await {
         Ok(()) => {
-            db().await.execute(
-                "UPDATE recordings SET status = 'diarized' WHERE id = ?1",
-                [&id],
-            )?;
+            db().await
+                .execute("UPDATE recordings SET status = 'diarized' WHERE id = ?1", [&id])?;
         }
         Err(e) => {
             eprintln!("{id}: diarizing: {e:#}");
@@ -310,15 +284,13 @@ async fn label(app: &App, id: &str) -> Result<()> {
     let mut segments: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();
     {
         let db = app.db.lock().await;
-        let mut st = db.prepare(
-            "SELECT DISTINCT track, file, offset_ms FROM windows WHERE recording = ?1 ORDER BY file",
-        )?;
+        let mut st =
+            db.prepare("SELECT DISTINCT track, file, offset_ms FROM windows WHERE recording = ?1 ORDER BY file")?;
         for r in st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
             let (track, file, offset): (String, String, i64) = r?;
             tracks.entry(track).or_default().push((file, offset));
         }
-        let mut st =
-            db.prepare("SELECT track, id, start_ms, end_ms FROM segments WHERE recording = ?1")?;
+        let mut st = db.prepare("SELECT track, id, start_ms, end_ms FROM segments WHERE recording = ?1")?;
         for r in st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))? {
             let (track, sid, s, e): (String, i64, i64, i64) = r?;
             segments.entry(track).or_default().push((sid, s, e));
@@ -346,9 +318,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
             }
         }
         let model = model.clone();
-        let embeddings =
-            tokio::task::spawn_blocking(move || cluster_embeddings(&model, &samples, &turns))
-                .await??;
+        let embeddings = tokio::task::spawn_blocking(move || cluster_embeddings(&model, &samples, &turns)).await??;
         for (i, v) in embeddings.into_iter().enumerate() {
             if let Some(v) = v {
                 clusters.push((name(i), v.iter().flat_map(|x| x.to_le_bytes()).collect()));
@@ -359,10 +329,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
     let mut db = app.db.lock().await;
     let tx = db.transaction()?;
     for (sid, label) in labels {
-        tx.execute(
-            "UPDATE segments SET speaker = ?2 WHERE id = ?1",
-            params![sid, label],
-        )?;
+        tx.execute("UPDATE segments SET speaker = ?2 WHERE id = ?1", params![sid, label])?;
     }
     for (label, emb) in clusters {
         tx.execute(
@@ -489,9 +456,7 @@ mod tests {
         assert!(!step(&app).await.unwrap());
 
         let db = app.db.lock().await;
-        let status: String = db
-            .query_row("SELECT status FROM recordings", [], |r| r.get(0))
-            .unwrap();
+        let status: String = db.query_row("SELECT status FROM recordings", [], |r| r.get(0)).unwrap();
         assert_eq!(status, "diarized");
         let labels: Vec<(String, String)> = db
             .prepare("SELECT text, speaker FROM segments ORDER BY text")
@@ -517,20 +482,13 @@ mod tests {
                 let b: Vec<u8> = r.get(1)?;
                 Ok((
                     r.get(0)?,
-                    b.as_chunks::<4>()
-                        .0
-                        .iter()
-                        .map(|&c| f32::from_le_bytes(c))
-                        .collect(),
+                    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect(),
                 ))
             })
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(
-            emb.keys().collect::<Vec<_>>(),
-            ["remote/S1", "room/S1", "room/S2"]
-        );
+        assert_eq!(emb.keys().collect::<Vec<_>>(), ["remote/S1", "room/S1", "room/S2"]);
         let same = cos(&emb["room/S2"], &emb["remote/S1"]);
         let diff = cos(&emb["room/S1"], &emb["room/S2"]);
         assert!(same > 0.8 && diff < same - 0.2, "same {same}, diff {diff}");

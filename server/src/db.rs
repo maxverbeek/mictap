@@ -81,10 +81,7 @@ pub fn set_started(conn: &Connection, id: &str, started_ms: i64) -> rusqlite::Re
 
 /// Returns false when the recording doesn't exist.
 pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
-    Ok(conn.execute(
-        "UPDATE recordings SET finished = 1 WHERE id = ?1",
-        params![id],
-    )? == 1)
+    Ok(conn.execute("UPDATE recordings SET finished = 1 WHERE id = ?1", params![id])? == 1)
 }
 
 pub fn fail(conn: &Connection, id: &str, error: &str) -> rusqlite::Result<()> {

@@ -18,8 +18,7 @@ const DAY: Duration = Duration::from_secs(24 * 3600);
 /// Mixes every file of `id` that has audio, at its offset, into `audio.ogg` (Opus).
 async fn mixdown(app: &App, id: &str) -> Result<()> {
     let dir = app.recording_dir(id);
-    let meta: Meta =
-        serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?).context("meta.json")?;
+    let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join("meta.json"))?).context("meta.json")?;
     let decoded: Vec<String> = app
         .db
         .lock()
@@ -52,10 +51,7 @@ async fn mixdown(app: &App, id: &str) -> Result<()> {
         .context("ffmpeg")?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&tmp);
-        bail!(
-            "ffmpeg mixdown: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        bail!("ffmpeg mixdown: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     std::fs::rename(tmp, dir.join("audio.ogg"))?;
     Ok(())
@@ -85,10 +81,10 @@ pub async fn step(app: &App) -> Result<bool> {
             "failed"
         }
     };
-    app.db.lock().await.execute(
-        "UPDATE recordings SET audio = ?2 WHERE id = ?1",
-        params![id, state],
-    )?;
+    app.db
+        .lock()
+        .await
+        .execute("UPDATE recordings SET audio = ?2 WHERE id = ?1", params![id, state])?;
     Ok(true)
 }
 
@@ -120,10 +116,7 @@ pub fn expire(app: &App, db: &rusqlite::Connection, now: SystemTime) -> Result<(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e).with_context(|| id.clone()),
         }
-        db.execute(
-            "UPDATE recordings SET audio = 'expired' WHERE id = ?1",
-            [&id],
-        )?;
+        db.execute("UPDATE recordings SET audio = 'expired' WHERE id = ?1", [&id])?;
     }
     Ok(())
 }
@@ -269,12 +262,7 @@ mod tests {
             .unwrap();
         assert_eq!(audio, "ready");
         let out = std::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration:stream=codec_name",
-            ])
+            .args(["-v", "error", "-show_entries", "format=duration:stream=codec_name"])
             .args(["-of", "default=nw=1"])
             .arg(dir.join("audio.ogg"))
             .output()

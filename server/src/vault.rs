@@ -113,13 +113,7 @@ fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::Result<Optio
 
 /// Writes `content` to a temp file in `vault`, then renames it over `target`, or links it to
 /// the first free `<base>.md`, `<base> 2.md`, ... Returns the file name.
-pub(crate) fn put(
-    vault: &Path,
-    id: &str,
-    target: Option<&Path>,
-    base: &str,
-    content: &str,
-) -> Result<String> {
+pub(crate) fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, content: &str) -> Result<String> {
     let tmp = vault.join(format!(".mictap-{id}.tmp"));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(content.as_bytes())?;
@@ -227,10 +221,7 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
     } else {
         let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
         let content = render(&header, &segs);
-        (
-            Some(put(&app.vault, id, target.as_deref(), &base, &content)?),
-            key,
-        )
+        (Some(put(&app.vault, id, target.as_deref(), &base, &content)?), key)
     };
     // The lock was released for the file IO, so the status read above may be stale: only
     // 'done' is written back, never the old value.
@@ -298,12 +289,7 @@ mod tests {
                 "Zullen we zeggen dat het volgende sprint wordt?",
                 Some("room/S1"),
             ),
-            seg(
-                "remote",
-                845_400,
-                "Hallo? Zijn jullie er nog?",
-                Some("remote/S1"),
-            ),
+            seg("remote", 845_400, "Hallo? Zijn jullie er nog?", Some("remote/S1")),
             seg("room", 3_725_000, "Ja, prima.", Some("room/S10")),
             seg("room", 3_726_000, "Hm.", None),
             seg("room", 3_727_000, "Ok.", Some("room/S2")),
@@ -337,25 +323,10 @@ mod tests {
     fn finds_by_id_and_avoids_collisions() {
         let tmp = tempfile::tempdir().unwrap();
         let v = tmp.path();
-        std::fs::write(
-            v.join("2026-09-24 1400 Meeting.md"),
-            "---\nid: other\n---\n",
-        )
-        .unwrap();
-        let name = put(
-            v,
-            "r1",
-            None,
-            "2026-09-24 1400 Meeting",
-            "---\nid: r1\n---\n",
-        )
-        .unwrap();
+        std::fs::write(v.join("2026-09-24 1400 Meeting.md"), "---\nid: other\n---\n").unwrap();
+        let name = put(v, "r1", None, "2026-09-24 1400 Meeting", "---\nid: r1\n---\n").unwrap();
         assert_eq!(name, "2026-09-24 1400 Meeting 2.md");
-        assert_eq!(
-            std::fs::read_dir(v).unwrap().count(),
-            2,
-            "temp file left behind"
-        );
+        assert_eq!(std::fs::read_dir(v).unwrap().count(), 2, "temp file left behind");
 
         std::fs::rename(v.join(&name), v.join("Planning.md")).unwrap();
         let found = locate(v, "r1", Some(&name)).unwrap().unwrap();
@@ -364,10 +335,7 @@ mod tests {
             put(v, "r1", Some(&found), "x", "---\nid: r1\nnew\n").unwrap(),
             "Planning.md"
         );
-        assert_eq!(
-            std::fs::read_to_string(&found).unwrap(),
-            "---\nid: r1\nnew\n"
-        );
+        assert_eq!(std::fs::read_to_string(&found).unwrap(), "---\nid: r1\nnew\n");
 
         // Obsidian may quote the id; an id in the body doesn't count.
         std::fs::write(&found, "---\nid: \"r1\"\n---\n").unwrap();
@@ -462,7 +430,12 @@ mod tests {
             text.contains("speakers:\n  room/S1: \"\"\n  remote/S1: \"\"\n"),
             "{text}"
         );
-        assert!(text.contains("**S1** (room, [00:00:01](http://homeserver:8765/r/r1/audio.ogg#t=1)): Goedemorgen allemaal.\n"), "{text}");
+        assert!(
+            text.contains(
+                "**S1** (room, [00:00:01](http://homeserver:8765/r/r1/audio.ogg#t=1)): Goedemorgen allemaal.\n"
+            ),
+            "{text}"
+        );
         let status: String = app
             .db
             .lock()
@@ -480,12 +453,7 @@ mod tests {
     #[tokio::test]
     async fn failed_gets_an_error_line() {
         let (_tmp, app) = setup().await;
-        crate::db::fail(
-            &*app.db.lock().await,
-            "r1",
-            "transcribing: whisper-cli: boom",
-        )
-        .unwrap();
+        crate::db::fail(&*app.db.lock().await, "r1", "transcribing: whisper-cli: boom").unwrap();
         sync(&app, "r1").await.unwrap();
         let text = read(&app, "2026-09-26 1600 Meeting.md");
         assert!(
@@ -506,11 +474,7 @@ mod tests {
             tmp.path().join("elsewhere.md"),
         )
         .unwrap();
-        app.db
-            .lock()
-            .await
-            .execute("UPDATE windows SET done = 1", [])
-            .unwrap();
+        app.db.lock().await.execute("UPDATE windows SET done = 1", []).unwrap();
         sync(&app, "r1").await.unwrap();
         assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
         let written: String = app

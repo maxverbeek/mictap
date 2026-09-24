@@ -55,33 +55,22 @@ struct Offsets {
 /// Segments of `wav` as (start_ms, end_ms, text), clamped to `len_ms`, plus whisper's stderr.
 // ponytail: one whisper-cli process per window; model load is ~0.2 s against 10+ s of
 // transcription per window, well under the 20% that would call for whisper-server.
-async fn whisper(
-    wav: &Path,
-    len_ms: i64,
-    lang: &str,
-    prompt: &str,
-) -> Result<(Vec<(i64, i64, String)>, String)> {
+async fn whisper(wav: &Path, len_ms: i64, lang: &str, prompt: &str) -> Result<(Vec<(i64, i64, String)>, String)> {
     let model = std::env::var("MICTAP_WHISPER_MODEL").context("MICTAP_WHISPER_MODEL not set")?;
     let base = wav.with_extension("");
     let json = wav.with_extension("json");
     let mut cmd = Command::new("whisper-cli");
-    cmd.args(["-t", "4", "-m", &model, "-l", lang, "-oj", "-of"])
-        .arg(&base);
+    cmd.args(["-t", "4", "-m", &model, "-l", lang, "-oj", "-of"]).arg(&base);
     if !prompt.is_empty() {
         cmd.args(["--prompt", prompt]);
     }
-    let out = cmd
-        .arg("-f")
-        .arg(wav)
-        .output()
-        .await
-        .context("whisper-cli")?;
+    let out = cmd.arg("-f").arg(wav).output().await.context("whisper-cli")?;
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
         bail!("whisper-cli: {}", stderr.trim());
     }
-    let parsed: Output = serde_json::from_slice(&std::fs::read(&json).context("whisper json")?)
-        .context("whisper json")?;
+    let parsed: Output =
+        serde_json::from_slice(&std::fs::read(&json).context("whisper json")?).context("whisper json")?;
     let _ = std::fs::remove_file(&json);
     let segs = parsed
         .transcription
@@ -96,12 +85,7 @@ async fn whisper(
 }
 
 /// Transcribes `wav` with the sticky language bias. Returns the segments and the language used.
-async fn transcribe(
-    wav: &Path,
-    len_ms: i64,
-    current: &str,
-    prompt: &str,
-) -> Result<(Vec<(i64, i64, String)>, String)> {
+async fn transcribe(wav: &Path, len_ms: i64, current: &str, prompt: &str) -> Result<(Vec<(i64, i64, String)>, String)> {
     let (segs, stderr) = whisper(wav, len_ms, "auto", prompt).await?;
     let detected = parse_detected(&stderr);
     if accept(current, detected.as_ref()) {
@@ -169,10 +153,7 @@ pub async fn step(app: &App) -> Result<bool> {
         )?;
     }
     tx.execute("UPDATE windows SET done = 1 WHERE id = ?1", [wid])?;
-    tx.execute(
-        "UPDATE recordings SET lang = ?2 WHERE id = ?1",
-        params![id, lang],
-    )?;
+    tx.execute("UPDATE recordings SET lang = ?2 WHERE id = ?1", params![id, lang])?;
     tx.commit()?;
     Ok(true)
 }
@@ -246,9 +227,7 @@ mod tests {
 
         let db = app.db.lock().await;
         let status: String = db
-            .query_row("SELECT status || '/' || lang FROM recordings", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT status || '/' || lang FROM recordings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "receiving/nl");
         let segs: Vec<(String, i64, i64, String)> = db
@@ -273,9 +252,6 @@ mod tests {
             .to_lowercase();
         assert!(text.contains("westerwald"), "{text}");
         let dutch = [" de ", " het ", " een ", " en ", " is ", " van "];
-        assert!(
-            dutch.iter().filter(|w| text.contains(*w)).count() >= 4,
-            "{text}"
-        );
+        assert!(dutch.iter().filter(|w| text.contains(*w)).count() >= 4, "{text}");
     }
 }

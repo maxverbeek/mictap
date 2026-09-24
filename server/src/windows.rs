@@ -38,10 +38,7 @@ pub fn cut(speech: &[(i64, i64)], audio_ms: i64, finished: bool) -> (Vec<Window>
     let closed = if finished {
         windows.len()
     } else {
-        windows
-            .iter()
-            .take_while(|w| audio_ms - w.end_ms >= TAIL_MS)
-            .count()
+        windows.iter().take_while(|w| audio_ms - w.end_ms >= TAIL_MS).count()
     };
     let closed_end = windows[..closed].last().map_or(0, |w| w.end_ms);
     let resume = match windows.get(closed) {
@@ -107,11 +104,7 @@ pub async fn advance(app: &App, id: &str, finished: bool) -> Result<()> {
         };
         let _ = std::fs::remove_file(&wav);
         let (windows, resume) = cut(&speech, audio_ms, finished);
-        let track = if seg.key.starts_with("app-") {
-            "remote"
-        } else {
-            "room"
-        };
+        let track = if seg.key.starts_with("app-") { "remote" } else { "room" };
 
         let mut db = app.db.lock().await;
         let tx = db.transaction()?;
@@ -152,18 +145,18 @@ pub async fn run(app: Arc<App>) {
             vec![]
         }) {
             let res = match advance(&app, &id, finished).await {
-                Ok(()) if finished => app.db.lock().await.execute(
-                    "UPDATE recordings SET status = 'windowed' WHERE id = ?1",
-                    [&id],
-                ),
+                Ok(()) if finished => app
+                    .db
+                    .lock()
+                    .await
+                    .execute("UPDATE recordings SET status = 'windowed' WHERE id = ?1", [&id]),
                 Ok(()) => continue,
                 Err(e) => {
                     eprintln!("{id}: windowing: {e:#}");
                     if !finished {
                         continue;
                     }
-                    crate::db::fail(&*app.db.lock().await, &id, &format!("windowing: {e:#}"))
-                        .map(|()| 0)
+                    crate::db::fail(&*app.db.lock().await, &id, &format!("windowing: {e:#}")).map(|()| 0)
                 }
             };
             if let Err(e) = res {
@@ -176,16 +169,10 @@ pub async fn run(app: Arc<App>) {
 
 /// Decodes `path` from `from_ms` (for `dur_ms`, else to the end) to a 16 kHz mono wav
 /// and returns its length in ms.
-pub(crate) async fn decode(
-    path: &Path,
-    from_ms: i64,
-    dur_ms: Option<i64>,
-    wav: &Path,
-) -> Result<i64> {
+pub(crate) async fn decode(path: &Path, from_ms: i64, dur_ms: Option<i64>, wav: &Path) -> Result<i64> {
     let secs = |ms: i64| format!("{}.{:03}", ms / 1000, ms % 1000);
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-nostdin", "-v", "error", "-y", "-ss"])
-        .arg(secs(from_ms));
+    cmd.args(["-nostdin", "-v", "error", "-y", "-ss"]).arg(secs(from_ms));
     if let Some(d) = dur_ms {
         cmd.arg("-t").arg(secs(d));
     }
@@ -233,12 +220,7 @@ async fn vad(wav: &Path, audio_ms: i64) -> Result<Vec<(i64, i64)>> {
 
 /// Parses `Speech segment 0: start = 144.00, end = 397.00` (centiseconds) lines to ms.
 fn parse_vad(out: &str, audio_ms: i64) -> Vec<(i64, i64)> {
-    let cs = |x: &str| {
-        x.trim()
-            .parse::<f64>()
-            .ok()
-            .map(|v| (v * 10.0).round() as i64)
-    };
+    let cs = |x: &str| x.trim().parse::<f64>().ok().map(|v| (v * 10.0).round() as i64);
     out.lines()
         .filter_map(|l| {
             let (a, b) = l.split_once("start = ")?.1.split_once(", end = ")?;
@@ -257,12 +239,7 @@ mod tests {
 
     #[test]
     fn groups_up_to_30s_on_pauses() {
-        let speech = [
-            (0, 5_000),
-            (6_000, 20_000),
-            (21_000, 29_000),
-            (31_000, 40_000),
-        ];
+        let speech = [(0, 5_000), (6_000, 20_000), (21_000, 29_000), (31_000, 40_000)];
         assert_eq!(
             cut(&speech, 50_000, false),
             (vec![w(0, 29_000), w(31_000, 40_000)], 48_000)
@@ -276,20 +253,14 @@ mod tests {
         assert_eq!(cut(&speech, 11_000, false), (vec![w(0, 9_000)], 9_000));
         assert_eq!(cut(&speech, 9_500, true), (vec![w(0, 9_000)], 9_500));
         // More speech may still join the open window.
-        assert_eq!(
-            cut(&[(0, 10_000), (10_500, 12_000)], 12_500, false),
-            (vec![], 0)
-        );
+        assert_eq!(cut(&[(0, 10_000), (10_500, 12_000)], 12_500, false), (vec![], 0));
     }
 
     #[test]
     fn splits_long_speech() {
         assert_eq!(
             cut(&[(1_000, 70_000)], 80_000, false),
-            (
-                vec![w(1_000, 31_000), w(31_000, 61_000), w(61_000, 70_000)],
-                78_000
-            )
+            (vec![w(1_000, 31_000), w(31_000, 61_000), w(61_000, 70_000)], 78_000)
         );
     }
 
@@ -327,11 +298,7 @@ mod tests {
                 {"file":"01-app-427.oga","key":"app-427","target":"y","offset_ms":5000,"end_ms":null}]}"#,
         )
         .unwrap();
-        let full = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/speech-60s.oga"
-        ))
-        .unwrap();
+        let full = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/speech-60s.oga")).unwrap();
 
         // App file not uploaded yet, mic file about 36 s in.
         std::fs::write(dir.join("00-mic.oga"), &full[..110_000]).unwrap();

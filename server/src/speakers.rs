@@ -41,10 +41,9 @@ fn parse(front: &str) -> Result<Option<(String, Names)>> {
 
 /// What a line of `label` shows: its name, else `S<n>` as the vault writer renders it.
 fn display<'a>(label: &'a str, names: &'a Names) -> &'a str {
-    names.get(label).map_or_else(
-        || label.split_once('/').map_or(label, |(_, n)| n),
-        String::as_str,
-    )
+    names
+        .get(label)
+        .map_or_else(|| label.split_once('/').map_or(label, |(_, n)| n), String::as_str)
 }
 
 /// Relabels `**<old>** (<track>, ...` lines from the `applied` names to `names`.
@@ -98,10 +97,7 @@ fn set_attendees(front: &str, names: &Names) -> String {
     let mut lines = front.lines().peekable();
     while let Some(line) = lines.next() {
         if !replaced && line.starts_with("attendees:") {
-            while lines
-                .peek()
-                .is_some_and(|l| l.starts_with([' ', '\t', '-']))
-            {
+            while lines.peek().is_some_and(|l| l.starts_with([' ', '\t', '-'])) {
                 lines.next();
             }
             out += &attendees;
@@ -234,11 +230,7 @@ mod tests {
     #[tokio::test]
     async fn relabels_only_matching_lines_and_attendees() {
         let (_tmp, app, path) = setup().await;
-        assert_eq!(
-            edit(&app, &path, FIXTURE).await,
-            FIXTURE,
-            "nothing named yet"
-        );
+        assert_eq!(edit(&app, &path, FIXTURE).await, FIXTURE, "nothing named yet");
 
         let named = sub(
             FIXTURE,
@@ -312,12 +304,8 @@ mod tests {
 
     #[test]
     fn same_name_labels_keep_it_on_conflict() {
-        let names = |pairs: &[(&str, &str)]| -> Names {
-            pairs
-                .iter()
-                .map(|(l, n)| (l.to_string(), n.to_string()))
-                .collect()
-        };
+        let names =
+            |pairs: &[(&str, &str)]| -> Names { pairs.iter().map(|(l, n)| (l.to_string(), n.to_string())).collect() };
         let applied = names(&[("room/S1", "Max"), ("room/S2", "Max")]);
         let body = "**Max** (room, x\n**S3** (room, y\n";
         assert_eq!(
@@ -329,11 +317,7 @@ mod tests {
             "**Max** (room, x\n**Bo** (room, y\n"
         );
         assert_eq!(
-            relabel(
-                body,
-                &applied,
-                &names(&[("room/S1", "Jo"), ("room/S2", "Jo")])
-            ),
+            relabel(body, &applied, &names(&[("room/S1", "Jo"), ("room/S2", "Jo")])),
             "**Jo** (room, x\n**S3** (room, y\n"
         );
     }

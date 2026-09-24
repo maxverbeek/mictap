@@ -34,11 +34,7 @@ fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
 /// The words of `r` spoken within `[s, e]` +- `SLICE_MS`, spreading them evenly over its span.
 fn slice<'a>(r: &Segment, words: &'a [String], s: i64, e: i64) -> impl Iterator<Item = &'a str> {
     let step = (r.end_ms - r.start_ms) as f64 / words.len().max(1) as f64;
-    let (r0, s, e) = (
-        r.start_ms as f64,
-        (s - SLICE_MS) as f64,
-        (e + SLICE_MS) as f64,
-    );
+    let (r0, s, e) = (r.start_ms as f64, (s - SLICE_MS) as f64, (e + SLICE_MS) as f64);
     words.iter().enumerate().filter_map(move |(i, w)| {
         let t = r0 + (i as f64 + 0.5) * step;
         (s <= t && t <= e).then_some(w.as_str())
@@ -108,19 +104,17 @@ pub fn merged(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Segment>> {
 }
 
 fn load(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Segment>> {
-    conn.prepare(
-        "SELECT track, start_ms, end_ms, text, speaker FROM segments WHERE recording = ?1",
-    )?
-    .query_map([id], |r| {
-        Ok(Segment {
-            track: r.get(0)?,
-            start_ms: r.get(1)?,
-            end_ms: r.get(2)?,
-            text: r.get(3)?,
-            speaker: r.get(4)?,
-        })
-    })?
-    .collect()
+    conn.prepare("SELECT track, start_ms, end_ms, text, speaker FROM segments WHERE recording = ?1")?
+        .query_map([id], |r| {
+            Ok(Segment {
+                track: r.get(0)?,
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                text: r.get(3)?,
+                speaker: r.get(4)?,
+            })
+        })?
+        .collect()
 }
 
 #[cfg(test)]
@@ -155,13 +149,7 @@ mod tests {
     #[test]
     fn drops_room_echo_near_similar_remote() {
         let segs = vec![
-            s(
-                "room",
-                10_000,
-                12_000,
-                "Het Westerwald is een gebergte",
-                "room/S2",
-            ),
+            s("room", 10_000, 12_000, "Het Westerwald is een gebergte", "room/S2"),
             s(
                 "remote",
                 8_500,
@@ -170,13 +158,7 @@ mod tests {
                 "remote/S1",
             ),
             // Similar but too far away.
-            s(
-                "room",
-                13_000,
-                15_000,
-                "het westerwald is een laaggebergte",
-                "room/S1",
-            ),
+            s("room", 13_000, 15_000, "het westerwald is een laaggebergte", "room/S1"),
             // Near but different.
             s("room", 9_000, 11_000, "yes I agree", "room/S1"),
             s("room", 0, 2_000, "good morning", "room/S1"),
@@ -184,12 +166,7 @@ mod tests {
         let out = merge(segs.clone(), 0.6);
         assert_eq!(
             out,
-            vec![
-                segs[4].clone(),
-                segs[1].clone(),
-                segs[3].clone(),
-                segs[2].clone()
-            ]
+            vec![segs[4].clone(), segs[1].clone(), segs[3].clone(), segs[2].clone()]
         );
         // The threshold is honored.
         assert_eq!(merge(segs, 0.9).len(), 5);
@@ -200,11 +177,7 @@ mod tests {
         let long = "Dit is de gesproken versie van het artikel Westerwald, zoals het op 5 \
                     februari 2017 op de Nederlandse Wikipedia stond.";
         let halves = [
-            (
-                26_400,
-                29_560,
-                "Dit is de gesproken versie van het artikel Westerwald.",
-            ),
+            (26_400, 29_560, "Dit is de gesproken versie van het artikel Westerwald."),
             (
                 30_020,
                 34_280,
@@ -223,32 +196,9 @@ mod tests {
 
     #[test]
     fn drops_mostly_echoed_room_cluster() {
-        let r = |start: i64| {
-            s(
-                "remote",
-                start,
-                start + 2_000,
-                "precies wat hij zei",
-                "remote/S1",
-            )
-        };
-        let echo = |start: i64| {
-            s(
-                "room",
-                start + 150,
-                start + 2_150,
-                "precies wat hij zei",
-                "room/S2",
-            )
-        };
-        let mut segs = vec![
-            r(0),
-            echo(0),
-            r(5_000),
-            echo(5_000),
-            r(10_000),
-            echo(10_000),
-        ];
+        let r = |start: i64| s("remote", start, start + 2_000, "precies wat hij zei", "remote/S1");
+        let echo = |start: i64| s("room", start + 150, start + 2_150, "precies wat hij zei", "room/S2");
+        let mut segs = vec![r(0), echo(0), r(5_000), echo(5_000), r(10_000), echo(10_000)];
         let leftover = s("room", 20_000, 21_000, "hmm", "room/S2");
         let own = s("room", 22_000, 23_000, "ok", "room/S1");
         segs.extend([leftover.clone(), own.clone()]);
