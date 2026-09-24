@@ -30,14 +30,22 @@ pub struct Recorder {
     /// key -> (index into segments, pw-record)
     running: HashMap<String, (usize, Child)>,
     segments: Vec<Segment>,
+    finished: bool,
 }
 
 impl Recorder {
     pub fn new(root: &Path) -> Result<Self> {
         let now = OffsetDateTime::now_utc();
-        let id = now.format(format_description!("[year][month][day]T[hour][minute][second]Z"))?;
-        let dir = root.join(&id);
-        std::fs::create_dir_all(&dir)?;
+        let stamp = now.format(format_description!("[year][month][day]T[hour][minute][second]Z"))?;
+        std::fs::create_dir_all(root)?;
+        // A stop and start within one second must not share (and truncate) a directory.
+        let (id, dir) = (1..)
+            .map(|n| if n == 1 { stamp.clone() } else { format!("{stamp}-{n}") })
+            .find_map(|id| match std::fs::create_dir(root.join(&id)) {
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+                r => Some(r.map(|()| (id.clone(), root.join(id)))),
+            })
+            .unwrap()?;
         Ok(Self {
             id,
             started_ms: (now.unix_timestamp_nanos() / 1_000_000) as u64,
@@ -46,6 +54,7 @@ impl Recorder {
             app: None,
             running: HashMap::new(),
             segments: vec![],
+            finished: false,
         })
     }
 
@@ -53,6 +62,15 @@ impl Recorder {
     pub async fn sync(&mut self, want: &[Track], app: Option<&str>) -> Result<()> {
         if app.is_some() {
             self.app = app.map(String::from);
+        }
+        // A pw-record that quit (PipeWire restarted) is restarted as a new segment.
+        let dead: Vec<String> = self
+            .running
+            .iter_mut()
+            .filter_map(|(k, (_, c))| (!matches!(c.try_wait(), Ok(None))).then(|| k.clone()))
+            .collect();
+        for k in &dead {
+            self.stop(k).await;
         }
         let stale: Vec<String> = self
             .running
@@ -77,6 +95,7 @@ impl Recorder {
 
     pub async fn finish(mut self) -> Result<()> {
         self.stop_all().await;
+        self.finished = true;
         self.write_meta()
     }
 
@@ -142,8 +161,55 @@ impl Recorder {
     }
 
     fn write_meta(&self) -> Result<()> {
-        let meta = json!({"id": self.id, "started_ms": self.started_ms, "app": self.app, "segments": self.segments});
+        let meta = json!({
+            "id": self.id,
+            "started_ms": self.started_ms,
+            "app": self.app,
+            "finished": self.finished,
+            "segments": self.segments,
+        });
         std::fs::write(self.dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
         Ok(())
+    }
+}
+
+/// Marks every recording under `root` finished: at daemon start none is live, so an
+/// unfinished one was cut off by a crash. Its open segments keep `end_ms: null`.
+pub fn close_orphans(root: &Path) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path().join("meta.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut meta: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if meta["finished"] != true {
+            meta["finished"] = true.into();
+            std::fs::write(&path, serde_json::to_vec_pretty(&meta)?)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_unique_within_a_second() {
+        let root = std::env::temp_dir().join(format!("mictap-test-{}", std::process::id()));
+        let a = Recorder::new(&root).unwrap();
+        let b = Recorder::new(&root).unwrap();
+        let c = Recorder::new(&root).unwrap();
+        assert!(a.id != b.id && b.id != c.id && a.id != c.id);
+        assert!(root.join(&c.id).is_dir());
+
+        a.write_meta().unwrap();
+        close_orphans(&root).unwrap();
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(a.dir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["finished"], true);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

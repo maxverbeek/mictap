@@ -50,6 +50,9 @@ pub async fn run() -> Result<()> {
     let (status_tx, status_rx) = watch::channel(String::new());
     tokio::spawn(serve(listener, tx.clone(), status_rx));
 
+    if let Err(e) = crate::recorder::close_orphans(&spool()) {
+        eprintln!("closing orphaned recordings: {e:#}");
+    }
     let mut machine = Machine::default();
     let mut rec: Option<Recorder> = None;
     let mut graph = Graph::default();
@@ -78,24 +81,32 @@ pub async fn run() -> Result<()> {
                 }
             },
         }
-        match (machine.tick(&graph, Instant::now()), rec.take()) {
+        // Errors are logged, not returned: exiting would SIGKILL every pw-record mid-meeting.
+        let res = match (machine.tick(&graph, Instant::now()), rec.take()) {
             (Some(tracks), r) => {
-                let mut r = match r {
-                    Some(r) => r,
-                    None => {
-                        let r = Recorder::new(&spool())?;
+                let r = match r {
+                    Some(r) => Ok(r),
+                    None => Recorder::new(&spool()).inspect(|r| {
                         if machine.mode() == Some(Mode::Auto) {
                             notify(r.id.clone(), machine.app(), tx.clone());
                         }
-                        r
-                    }
+                    }),
                 };
-                r.sync(&tracks, machine.app()).await?;
-                rec = Some(r);
+                match r {
+                    Ok(mut r) => {
+                        let res = r.sync(&tracks, machine.app()).await;
+                        rec = Some(r);
+                        res
+                    }
+                    Err(e) => Err(e),
+                }
             }
-            (None, Some(r)) if discard => r.discard().await?,
-            (None, Some(r)) => r.finish().await?,
-            (None, None) => {}
+            (None, Some(r)) if discard => r.discard().await,
+            (None, Some(r)) => r.finish().await,
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = res {
+            eprintln!("recording: {e:#}");
         }
         let s = status(&machine, rec.as_ref(), Instant::now());
         status_tx.send_if_modified(|cur| {
