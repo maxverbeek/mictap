@@ -48,11 +48,13 @@ pub async fn run() -> Result<()> {
     let listener = UnixListener::bind(&path)?;
     let (tx, mut rx) = mpsc::channel::<Msg>(16);
     let (status_tx, status_rx) = watch::channel(String::new());
-    tokio::spawn(serve(listener, tx.clone(), status_rx));
-
+    // Before the uploader starts, so it sends an orphan's finish rather than waiting for one.
     if let Err(e) = crate::recorder::close_orphans(&spool()) {
         eprintln!("closing orphaned recordings: {e:#}");
     }
+    tokio::spawn(serve(listener, tx.clone(), status_rx));
+    tokio::spawn(crate::upload::run(spool()));
+
     let mut machine = Machine::default();
     let mut rec: Option<Recorder> = None;
     let mut graph = Graph::default();

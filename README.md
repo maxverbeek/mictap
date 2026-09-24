@@ -34,7 +34,8 @@ so reloading the bar never kills a recording.
   Uses the default source unless another mic is picked. Manual starts only
   stop manually.
 - **Discard.** A notification offers Discard. Nothing is uploaded during the
-  first 60 s, so a discarded recording never reaches the VPS.
+  first 60 s, so a discarded recording never reaches the VPS. A discard
+  after that only deletes the laptop's copy; the server keeps what it got.
 - **Spool.** Chunks are written locally, uploaded over the tailnet and
   deleted once the server acknowledges them. Offline periods just queue up.
 

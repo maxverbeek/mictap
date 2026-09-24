@@ -2,6 +2,7 @@ mod daemon;
 mod machine;
 mod pw;
 mod recorder;
+mod upload;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

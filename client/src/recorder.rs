@@ -168,9 +168,15 @@ impl Recorder {
             "finished": self.finished,
             "segments": self.segments,
         });
-        std::fs::write(self.dir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)?;
-        Ok(())
+        write_atomic(&self.dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)
     }
+}
+
+/// The uploader reads meta.json while the recorder rewrites it.
+fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    Ok(std::fs::rename(tmp, path)?)
 }
 
 /// Marks every recording under `root` finished: at daemon start none is live, so an
@@ -187,7 +193,7 @@ pub fn close_orphans(root: &Path) -> Result<()> {
         let mut meta: serde_json::Value = serde_json::from_slice(&bytes)?;
         if meta["finished"] != true {
             meta["finished"] = true.into();
-            std::fs::write(&path, serde_json::to_vec_pretty(&meta)?)?;
+            write_atomic(&path, &serde_json::to_vec_pretty(&meta)?)?;
         }
     }
     Ok(())
