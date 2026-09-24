@@ -108,11 +108,17 @@ pub fn expire(app: &App, db: &rusqlite::Connection, now: SystemTime) -> Result<(
         if made.is_ok_and(|t| t + RETENTION > now) {
             continue;
         }
-        for entry in std::fs::read_dir(&dir)? {
-            let entry = entry?;
-            if entry.file_name() != "meta.json" {
-                std::fs::remove_file(entry.path())?;
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    if entry.file_name() != "meta.json" {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| id.clone()),
         }
         db.execute(
             "UPDATE recordings SET audio = 'expired' WHERE id = ?1",
@@ -180,6 +186,14 @@ mod tests {
                 )
                 .unwrap();
         }
+        app.db
+            .lock()
+            .await
+            .execute(
+                "INSERT INTO recordings (id, source, status, audio) VALUES ('gone', 'laptop', 'done', 'ready')",
+                [],
+            )
+            .unwrap();
         expire(&app, &*app.db.lock().await, SystemTime::now()).unwrap();
 
         let files = |id| {
@@ -206,7 +220,12 @@ mod tests {
         let s = |a: &str, b: &str| (a.to_string(), b.to_string());
         assert_eq!(
             states,
-            [s("busy", "ready"), s("new", "ready"), s("old", "expired")]
+            [
+                s("busy", "ready"),
+                s("gone", "expired"),
+                s("new", "ready"),
+                s("old", "expired")
+            ]
         );
     }
 
