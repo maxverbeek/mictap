@@ -94,7 +94,7 @@ pub async fn advance(app: &App, id: &str, finished: bool) -> Result<()> {
             continue;
         }
         let path = dir.join(&seg.file);
-        let audio_ms = match decode(&path, done_ms, &wav).await {
+        let audio_ms = match decode(&path, done_ms, None, &wav).await {
             Ok(ms) => ms,
             // Not a single Ogg page yet (or an empty segment).
             Err(_) if done_ms == 0 && std::fs::metadata(&path).map_or(0, |m| m.len()) < 4096 => 0,
@@ -173,11 +173,22 @@ pub async fn run(app: Arc<App>) {
     }
 }
 
-/// Decodes `path` from `from_ms` to a 16 kHz mono wav and returns its length in ms.
-async fn decode(path: &Path, from_ms: i64, wav: &Path) -> Result<i64> {
-    let out = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error", "-y", "-ss"])
-        .arg(format!("{}.{:03}", from_ms / 1000, from_ms % 1000))
+/// Decodes `path` from `from_ms` (for `dur_ms`, else to the end) to a 16 kHz mono wav
+/// and returns its length in ms.
+pub(crate) async fn decode(
+    path: &Path,
+    from_ms: i64,
+    dur_ms: Option<i64>,
+    wav: &Path,
+) -> Result<i64> {
+    let secs = |ms: i64| format!("{}.{:03}", ms / 1000, ms % 1000);
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-v", "error", "-y", "-ss"])
+        .arg(secs(from_ms));
+    if let Some(d) = dur_ms {
+        cmd.arg("-t").arg(secs(d));
+    }
+    let out = cmd
         .arg("-i")
         .arg(path)
         .args(["-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le"])

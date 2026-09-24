@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     started_ms INTEGER,
     status TEXT NOT NULL DEFAULT 'receiving',
     vault_path TEXT,
-    finished INTEGER NOT NULL DEFAULT 0
+    finished INTEGER NOT NULL DEFAULT 0,
+    lang TEXT
 );
 CREATE TABLE IF NOT EXISTS file_progress (
     recording TEXT NOT NULL REFERENCES recordings(id),
@@ -26,7 +27,18 @@ CREATE TABLE IF NOT EXISTS windows (
     track TEXT NOT NULL,
     offset_ms INTEGER NOT NULL,
     start_ms INTEGER NOT NULL,
-    end_ms INTEGER NOT NULL
+    end_ms INTEGER NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+);
+-- start_ms/end_ms are within the recording.
+CREATE TABLE IF NOT EXISTS segments (
+    id INTEGER PRIMARY KEY,
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    window INTEGER NOT NULL REFERENCES windows(id),
+    track TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    text TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clusters (
     recording TEXT NOT NULL REFERENCES recordings(id),

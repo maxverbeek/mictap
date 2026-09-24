@@ -24,6 +24,7 @@ pub struct App {
     // ponytail: one lock for the db and all file appends; per-recording locks if uploads contend.
     pub(crate) db: Mutex<Connection>,
     tz: TimeZone,
+    pub(crate) vault: PathBuf,
 }
 
 impl App {
@@ -34,6 +35,8 @@ impl App {
             dir,
             db: Mutex::new(db),
             tz: TimeZone::system(),
+            vault: std::env::var_os("MICTAP_VAULT")
+                .map_or_else(|| "/srv/vault/mictap".into(), PathBuf::from),
         })
     }
 
