@@ -38,8 +38,10 @@ CREATE TABLE IF NOT EXISTS segments (
     track TEXT NOT NULL,
     start_ms INTEGER NOT NULL,
     end_ms INTEGER NOT NULL,
-    text TEXT NOT NULL
+    text TEXT NOT NULL,
+    speaker TEXT
 );
+-- embedding: the mean of the cluster's L2-normalized turn embeddings, f32 little-endian.
 CREATE TABLE IF NOT EXISTS clusters (
     recording TEXT NOT NULL REFERENCES recordings(id),
     label TEXT NOT NULL,

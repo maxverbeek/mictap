@@ -14,12 +14,14 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
+          buildInputs = [ pkgs.sherpa-onnx ];
         };
       });
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
+          buildInputs = [ pkgs.sherpa-onnx ];
         };
       });
     };

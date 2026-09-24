@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod diarize;
 mod transcribe;
 mod windows;
 
@@ -14,6 +15,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Arc::new(api::App::open(dir)?);
     tokio::spawn(windows::run(app.clone()));
     tokio::spawn(transcribe::run(app.clone()));
+    tokio::spawn(diarize::run(app.clone()));
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
