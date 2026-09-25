@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS recordings (
     error TEXT,
     -- Failed attempts at the current step; see fail().
     attempts INTEGER NOT NULL DEFAULT 0,
+    -- Unix ms before which workers leave a failing recording alone.
+    retry_at INTEGER NOT NULL DEFAULT 0,
     -- What the vault file last showed; 'done', 'failed' and 'gone' are final.
     written TEXT,
     -- The speakers map (label -> name, JSON) last applied to the vault file's lines.
@@ -72,6 +74,9 @@ CREATE TABLE IF NOT EXISTS voices (
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    if conn.prepare("SELECT retry_at FROM recordings").is_err() {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(conn)
 }
 
@@ -96,16 +101,24 @@ pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("UPDATE recordings SET finished = 1 WHERE id = ?1", params![id])? == 1)
 }
 
-const ATTEMPTS: i64 = 3;
+pub fn now_ms() -> i64 {
+    jiff::Timestamp::now().as_millisecond()
+}
 
-/// Counts a failed attempt at the current step; the third in a row fails the recording.
-/// Returns true when it did. Workers reset `attempts` when a step succeeds.
+/// Consecutive failures at one step before the recording fails for good. With the backoff
+/// below that spans about 3 hours, so an OOM kill or a full disk is waited out.
+pub(crate) const ATTEMPTS: i64 = 10;
+
+/// Counts a failed attempt at the current step and holds the recording back from the
+/// workers for 30 s, doubling per attempt up to an hour; the `ATTEMPTS`th in a row fails
+/// the recording. Returns true when it did. Workers reset `attempts` when a step succeeds.
 pub fn fail(conn: &Connection, id: &str, error: &str) -> rusqlite::Result<bool> {
     conn.query_row(
         "UPDATE recordings SET attempts = attempts + 1, error = ?2,
+         retry_at = ?4 + MIN(30000 << attempts, 3600000),
          status = CASE WHEN attempts + 1 >= ?3 THEN 'failed' ELSE status END
          WHERE id = ?1 RETURNING status = 'failed'",
-        params![id, error, ATTEMPTS],
+        params![id, error, ATTEMPTS, now_ms()],
         |r| r.get(0),
     )
 }
@@ -113,21 +126,47 @@ pub fn fail(conn: &Connection, id: &str, error: &str) -> rusqlite::Result<bool> 
 #[cfg(test)]
 mod tests {
     #[test]
-    fn fails_on_the_third_attempt() {
+    fn backs_off_then_fails() {
         let conn = super::open(std::path::Path::new(":memory:")).unwrap();
         super::ensure_recording(&conn, "r1", "laptop").unwrap();
-        assert!(!super::fail(&conn, "r1", "a").unwrap());
-        assert!(!super::fail(&conn, "r1", "b").unwrap());
-        let status: String = conn
-            .query_row("SELECT status FROM recordings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(status, "receiving");
-        assert!(super::fail(&conn, "r1", "c").unwrap());
+        let row = || -> (String, i64) {
+            conn.query_row("SELECT status, retry_at - ?1 FROM recordings", [super::now_ms()], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        let mut waits = vec![];
+        for i in 1..super::ATTEMPTS {
+            assert!(!super::fail(&conn, "r1", &format!("e{i}")).unwrap());
+            let (status, wait) = row();
+            assert_eq!(status, "receiving");
+            waits.push((wait + 500) / 1000);
+        }
+        assert_eq!(waits, [30, 60, 120, 240, 480, 960, 1920, 3600, 3600]);
+        assert!(super::fail(&conn, "r1", "last").unwrap());
         let row: (String, String) = conn
             .query_row("SELECT status, error FROM recordings", [], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        assert_eq!(row, ("failed".into(), "c".into()));
+        assert_eq!(row, ("failed".into(), "last".into()));
+    }
+
+    #[test]
+    fn adds_retry_at_to_an_old_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL)")
+            .unwrap();
+        let conn = super::open(&path).unwrap();
+        conn.execute("INSERT INTO recordings (id, source) VALUES ('r1', 'laptop')", [])
+            .unwrap();
+        let r: i64 = conn
+            .query_row("SELECT retry_at FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(r, 0);
+        super::open(&path).unwrap();
     }
 }

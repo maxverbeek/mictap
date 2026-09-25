@@ -148,8 +148,8 @@ pub async fn tick(app: &App, now: SystemTime) -> Result<()> {
         .db
         .lock()
         .await
-        .prepare("SELECT id, finished FROM recordings WHERE status = 'receiving'")?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare("SELECT id, finished FROM recordings WHERE status = 'receiving' AND retry_at <= ?1")?
+        .query_map([crate::db::now_ms()], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, mut finished) in recordings {
         if !finished && last_upload(&app.recording_dir(&id)).is_none_or(|t| t + IDLE < now) {

@@ -506,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn failed_gets_an_error_line() {
         let (_tmp, app) = setup().await;
-        for _ in 0..3 {
+        for _ in 0..crate::db::ATTEMPTS {
             crate::db::fail(&*app.db.lock().await, "r1", "transcribing: whisper-cli: boom").unwrap();
         }
         sync(&app, "r1").await.unwrap();

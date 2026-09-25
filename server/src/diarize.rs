@@ -279,10 +279,10 @@ pub async fn step(app: &App) -> Result<bool> {
         .lock()
         .await
         .query_row(
-            "SELECT id FROM recordings r WHERE status = 'windowed'
+            "SELECT id FROM recordings r WHERE status = 'windowed' AND retry_at <= ?1
              AND NOT EXISTS (SELECT 1 FROM windows w WHERE w.recording = r.id AND NOT w.done)
              ORDER BY id LIMIT 1",
-            [],
+            [crate::db::now_ms()],
             |r| r.get(0),
         )
         .optional()?;

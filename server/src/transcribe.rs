@@ -106,8 +106,8 @@ pub async fn step(app: &App) -> Result<bool> {
             "SELECT w.id, w.recording, w.file, w.track, w.offset_ms, w.start_ms, w.end_ms,
                     COALESCE(r.lang, ?1)
              FROM windows w JOIN recordings r ON r.id = w.recording
-             WHERE NOT w.done AND r.status != 'failed' ORDER BY w.id LIMIT 1",
-            [DEFAULT_LANG],
+             WHERE NOT w.done AND r.status != 'failed' AND r.retry_at <= ?2 ORDER BY w.id LIMIT 1",
+            params![DEFAULT_LANG, crate::db::now_ms()],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -140,7 +140,7 @@ pub async fn step(app: &App) -> Result<bool> {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{id}: transcribing window {wid}: {e:#}");
-            // Not final: the window stays pending and is retried after the worker's pause.
+            // Not final: the window stays pending and is retried after the backoff.
             return Ok(crate::db::fail(&db, &id, &format!("transcribing: {e:#}"))?);
         }
     };
