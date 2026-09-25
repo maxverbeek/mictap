@@ -106,7 +106,7 @@ async fn timeline(dir: &Path, files: &[(String, i64)], wav: &Path) -> Result<()>
 async fn diarize(wav: &Path) -> Result<Vec<Turn>> {
     let seg = std::env::var("MICTAP_SEG_MODEL").context("MICTAP_SEG_MODEL not set")?;
     let emb = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
-    let threshold = std::env::var("MICTAP_CLUSTER_THRESHOLD").unwrap_or_else(|_| "0.5".into());
+    let threshold = std::env::var("MICTAP_CLUSTER_THRESHOLD").unwrap_or_else(|_| "0.8".into());
     let out = Command::new("sherpa-onnx-offline-speaker-diarization")
         .arg(format!("--segmentation.pyannote-model={seg}"))
         .arg(format!("--embedding.model={emb}"))
