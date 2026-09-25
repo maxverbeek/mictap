@@ -582,6 +582,9 @@ mod tests {
             .await
             .execute("UPDATE recordings SET status = 'done'", [])
             .unwrap();
+        let (_, b) = send(&app, "GET", "/recordings", b"").await;
+        let list: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(list[0]["status"], "done");
         let (s, _) = send(&app, "DELETE", "/recordings/r1", b"").await;
         assert_eq!(s, StatusCode::NO_CONTENT);
         assert!(!tmp.path().join("recordings/r1").exists());
