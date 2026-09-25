@@ -59,6 +59,15 @@ struct Offsets {
     to: i64,
 }
 
+/// Whisper marks a speaker turn with a leading "- "; the transcript's labels already do that.
+fn clean(text: &str) -> &str {
+    let text = text.trim();
+    match text.strip_prefix('-') {
+        Some(rest) if rest.is_empty() || rest.starts_with(' ') => rest.trim_start(),
+        _ => text,
+    }
+}
+
 /// Segments of `wav` as (start_ms, end_ms, text), clamped to `len_ms`, plus whisper's stderr.
 // ponytail: one whisper-cli process per window; model load is ~0.3 s against the ~25 s
 // encode every window costs (spike S1), well under the 20% that would call for whisper-server.
@@ -88,7 +97,7 @@ async fn whisper(wav: &Path, len_ms: i64, lang: &str, prompt: &str) -> Result<(V
         .transcription
         .into_iter()
         .filter_map(|p| {
-            let text = p.text.trim();
+            let text = clean(&p.text);
             let start = p.offsets.from.clamp(0, len_ms);
             (!text.is_empty()).then(|| (start, p.offsets.to.clamp(start, len_ms), text.to_string()))
         })
@@ -208,6 +217,13 @@ mod tests {
         assert_eq!(accept("", d("en", 0.8).as_ref()).as_deref(), Some("en"));
         assert_eq!(accept("", d("en", 0.5).as_ref()).as_deref(), Some(""));
         assert_eq!(accept("", None).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn drops_turn_dash() {
+        assert_eq!(clean(" - What?"), "What?");
+        assert_eq!(clean("-5 degrees"), "-5 degrees");
+        assert_eq!(clean(" - "), "");
     }
 
     #[test]
