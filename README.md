@@ -76,8 +76,10 @@ meeting instead of after it.
   are consistent over the whole meeting.
 - Diarization is the `sherpa-onnx-offline-speaker-diarization` CLI
   (pyannote segmentation-3.0 ONNX, 3D-Speaker CAM++ zh/en embeddings) on a
-  timeline wav of the track. Each segment goes to the speaker it overlaps
-  most. Each cluster's mean embedding comes from sherpa-onnx's C API and is
+  timeline wav of the track. sherpa over-splits (39 clusters for 3 people),
+  so clusters under 10 s are folded into the most similar larger one, and
+  clusters whose mean embeddings are at least `MICTAP_MERGE_THRESHOLD` alike
+  are merged. Each segment goes to the speaker it overlaps most. Each cluster's mean embedding comes from sherpa-onnx's C API and is
   kept in SQLite. No pyannote Python: its models are gated.
 - Tracks are merged chronologically and each line is tagged `room` or
   `remote`.
@@ -224,8 +226,8 @@ services.mictap.recorder = {
 - **Neighbourly.** `Nice=19`, `CPUWeight=20`: transcription takes every core.
 - **Models** are pinned with `fetchurl`; override them with
   `services.mictap.server.models.*`. Tunables go in `settings`:
-  `MICTAP_CLUSTER_THRESHOLD` (0.9), `MICTAP_MATCH_THRESHOLD` (0.75),
-  `MICTAP_ECHO_JACCARD` (0.6).
+  `MICTAP_CLUSTER_THRESHOLD` (0.9), `MICTAP_MERGE_THRESHOLD` (0.75),
+  `MICTAP_MATCH_THRESHOLD` (0.75), `MICTAP_ECHO_JACCARD` (0.6).
 - `url` (default `http://<hostname>:<port>`) is the base of the timestamp
   links and the one dotted host name the server accepts besides `*.ts.net`.
 

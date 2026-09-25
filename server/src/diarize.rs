@@ -226,24 +226,91 @@ fn normalize(v: &mut [f32]) {
     }
 }
 
-/// Per speaker, the normalized mean of its turns' normalized embeddings.
-fn cluster_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Vec<Option<Vec<f32>>>> {
+/// Each turn's normalized embedding, or None when it is too short.
+fn turn_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Vec<Option<Vec<f32>>>> {
     let ex = Extractor::new(model)?;
+    let at = |ms: i64| (ms.max(0) as usize * RATE / 1000).min(samples.len());
+    Ok(turns
+        .iter()
+        .map(|t| {
+            let mut v = ex.embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))])?;
+            normalize(&mut v);
+            Some(v)
+        })
+        .collect())
+}
+
+/// Per speaker, the normalized mean of its turns' embeddings, weighted by turn length.
+fn means(turns: &[Turn], embs: &[Option<Vec<f32>>]) -> Vec<Option<Vec<f32>>> {
     let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
     let mut sums: Vec<Option<Vec<f32>>> = vec![None; n];
-    let at = |ms: i64| (ms.max(0) as usize * RATE / 1000).min(samples.len());
-    for t in turns {
-        let Some(mut v) = ex.embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))]) else {
-            continue;
-        };
-        normalize(&mut v);
+    for (t, v) in turns.iter().zip(embs) {
+        let Some(v) = v else { continue };
+        let w = (t.end_ms - t.start_ms) as f32;
         match &mut sums[t.speaker] {
-            Some(sum) => sum.iter_mut().zip(&v).for_each(|(a, b)| *a += b),
-            slot => *slot = Some(v),
+            Some(sum) => sum.iter_mut().zip(v).for_each(|(a, b)| *a += w * b),
+            slot => *slot = Some(v.iter().map(|b| w * b).collect()),
         }
     }
     sums.iter_mut().flatten().for_each(|v| normalize(v));
-    Ok(sums)
+    sums
+}
+
+/// Clusters with less speech than this are folded into the most similar larger one.
+const MIN_CLUSTER_MS: i64 = 10_000;
+
+/// sherpa splits a speaker into many clusters, most of them fragments of a few seconds (spike
+/// S3; a 3-person meeting got 39). Folds the fragments into the most similar larger cluster,
+/// then merges the most similar pair while their means are at least `threshold` alike, and
+/// renumbers speakers by first appearance. Never splits a cluster.
+fn merge(turns: &mut [Turn], embs: &[Option<Vec<f32>>], threshold: f32) {
+    let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
+    let mut len = vec![0; n];
+    for t in turns.iter() {
+        len[t.speaker] += t.end_ms - t.start_ms;
+    }
+    let relabel = |turns: &mut [Turn], from: usize, to: usize| {
+        turns
+            .iter_mut()
+            .filter(|t| t.speaker == from)
+            .for_each(|t| t.speaker = to);
+    };
+
+    let m = means(turns, embs);
+    let big: Vec<usize> = (0..n).filter(|&i| len[i] >= MIN_CLUSTER_MS && m[i].is_some()).collect();
+    for small in (0..n).filter(|&i| len[i] < MIN_CLUSTER_MS) {
+        let Some(v) = &m[small] else { continue };
+        let nearest = big
+            .iter()
+            .map(|&b| (cosine(v, m[b].as_ref().unwrap()), b))
+            .filter(|p| p.0.is_finite())
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        if let Some((_, b)) = nearest {
+            relabel(turns, small, b);
+        }
+    }
+
+    loop {
+        let m = means(turns, embs);
+        let live: Vec<usize> = (0..m.len()).filter(|&i| m[i].is_some()).collect();
+        let best = live
+            .iter()
+            .enumerate()
+            .flat_map(|(k, &a)| live[k + 1..].iter().map(move |&b| (a, b)))
+            .map(|(a, b)| (cosine(m[a].as_ref().unwrap(), m[b].as_ref().unwrap()), a, b))
+            .filter(|p| p.0 >= threshold)
+            .max_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((_, a, b)) = best else { break };
+        relabel(turns, b, a);
+    }
+
+    let mut seen: Vec<usize> = vec![];
+    for t in turns.iter_mut() {
+        t.speaker = seen.iter().position(|&s| s == t.speaker).unwrap_or_else(|| {
+            seen.push(t.speaker);
+            seen.len() - 1
+        });
+    }
 }
 
 fn floats(b: &[u8]) -> Vec<f32> {
@@ -313,6 +380,10 @@ async fn label(app: &App, id: &str) -> Result<()> {
         Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD")?,
         Err(_) => 0.75,
     };
+    let merge_threshold: f32 = match std::env::var("MICTAP_MERGE_THRESHOLD") {
+        Ok(v) => v.parse().context("MICTAP_MERGE_THRESHOLD")?,
+        Err(_) => 0.75,
+    };
     let mut tracks: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     let mut segments: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();
     {
@@ -343,15 +414,21 @@ async fn label(app: &App, id: &str) -> Result<()> {
         }
         .await;
         let _ = std::fs::remove_file(&wav);
-        let (turns, samples) = res?;
+        let (mut turns, samples) = res?;
+        let model = model.clone();
+        let (turns, embeddings) = tokio::task::spawn_blocking(move || {
+            let embs = turn_embeddings(&model, &samples, &turns)?;
+            merge(&mut turns, &embs, merge_threshold);
+            let m = means(&turns, &embs);
+            anyhow::Ok((turns, m))
+        })
+        .await??;
         let name = |i: usize| format!("{track}/S{}", i + 1);
         for &(sid, s, e) in segments.get(track).into_iter().flatten() {
             if let Some(i) = assign(&turns, s, e) {
                 labels.push((sid, name(i)));
             }
         }
-        let model = model.clone();
-        let embeddings = tokio::task::spawn_blocking(move || cluster_embeddings(&model, &samples, &turns)).await??;
         clusters.extend(
             embeddings
                 .into_iter()
@@ -458,6 +535,51 @@ mod tests {
         assert_eq!(assign(&turns, 8_000, 9_000), Some(0));
         assert_eq!(assign(&turns, 15_000, 19_000), Some(1));
         assert_eq!(assign(&[], 0, 1_000), None);
+    }
+
+    #[test]
+    fn folds_fragments_and_merges_alike_clusters() {
+        let mut turns = [
+            t(0, 20_000, 0),
+            t(20_000, 35_000, 1),
+            t(35_000, 40_000, 2),
+            t(40_000, 70_000, 3),
+            t(70_000, 71_000, 4),
+            t(71_000, 72_000, 5),
+        ];
+        let unit = |v: [f32; 3]| {
+            let mut v = v.to_vec();
+            normalize(&mut v);
+            Some(v)
+        };
+        let embs = [
+            unit([1.0, 0.0, 0.0]),
+            // Same speaker as S1: merged.
+            unit([0.9, 0.1, 0.0]),
+            // A fragment, closest to S4 though below the threshold: folded.
+            unit([0.0, 1.0, 0.0]),
+            unit([0.0, 0.8, 0.6]),
+            // A fragment without an embedding: kept.
+            None,
+            // A fragment alike to nothing big still goes to the nearest.
+            unit([0.0, 0.0, -1.0]),
+        ];
+        merge(&mut turns, &embs, 0.9);
+        let speakers: Vec<usize> = turns.iter().map(|t| t.speaker).collect();
+        assert_eq!(speakers, [0, 0, 1, 1, 2, 0]);
+
+        let mut two = [t(0, 20_000, 0), t(20_000, 40_000, 1)];
+        merge(&mut two, &[unit([1.0, 0.0, 0.0]), unit([0.6, 0.8, 0.0])], 0.7);
+        assert_eq!(two.map(|t| t.speaker), [0, 1], "0.6 < 0.7 stays apart");
+    }
+
+    #[test]
+    fn weights_means_by_turn_length() {
+        let turns = [t(0, 3_000, 0), t(3_000, 4_000, 0), t(4_000, 5_000, 2)];
+        let m = means(&turns, &[Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0]), None]);
+        let s = m[0].as_ref().unwrap();
+        assert!((s[0] - 0.9487).abs() < 1e-3 && (s[1] - 0.3162).abs() < 1e-3, "{s:?}");
+        assert_eq!(m[1..], [None, None]);
     }
 
     #[test]
