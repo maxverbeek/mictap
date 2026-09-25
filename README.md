@@ -100,11 +100,10 @@ source: laptop            # or upload
 status: done              # transcribing | done | failed
 progress: 52/52 min
 attendees: ["[[Max]]", "[[Jan]]", "[[Eva]]"]
-speakers:
-  room/S1: Max
-  room/S2: Eva
-  remote/S1: Jan
-  remote/S2: ""           # fill in to name
+room/S1: Max
+room/S2: Eva
+remote/S1: Jan
+remote/S2: ""             # fill in to name
 ---
 
 **Max** (room, [00:14:02](http://homeserver:8765/r/01J8X.../audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?
@@ -113,8 +112,12 @@ speakers:
 ```
 
 - The file appears with the first transcribed speech and fills in as
-  transcription progresses. A recording without any speech gets no file. `status: failed` comes with an `error:` line. Writes go to a
-  temp file in `mictap/` that is renamed over the transcript.
+  transcription progresses. A recording without any speech gets no file.
+  `status: failed` comes with an `error:` line. Writes go to a temp file in
+  `mictap/` that is renamed over the transcript.
+- Every speaker is its own property, named after its label (`room/S1`,
+  `remote/S2`): Obsidian's property editor only edits flat values. Other
+  properties you add are left alone.
 - Filenames are `YYYY-MM-DD HHMM Meeting.md`. Rename freely: the server finds
   transcripts by `id`, not by filename. Moving a file out of `mictap/` hands
   it over to you entirely.
@@ -123,10 +126,10 @@ Who owns what:
 
 - **Body**: the server's until `status: done`, yours afterwards. The server
   never reads it back, so editing prose has no side effects.
-- **`speakers`**: yours, editable any time. Filling in a name makes the
+- **Speaker properties** (`room/S1`, ...): yours, editable any time. Filling in a name makes the
   server rewrite that speaker's line labels (and nothing else in the body)
   and add a wikilink to `attendees`. The server polls every 30 s.
-- **`attendees`**: derived by the server from `speakers`.
+- **`attendees`**: derived by the server from the speaker properties.
 - **`mictap/vocabulary.md`**: yours. Words whisper keeps getting wrong
   (names, clients, jargon), one per line. Nothing is inferred from your edits.
 
@@ -135,7 +138,7 @@ Who owns what:
 Naming a speaker stores that cluster's voice embedding. After diarizing a
 new recording, each cluster is matched against the stored voices (cosine,
 best match at or above `MICTAP_MATCH_THRESHOLD`, default 0.75), and a match
-pre-fills `speakers` and labels its lines. Unmatched clusters stay `""`, and
+pre-fills its speaker property and labels its lines. Unmatched clusters stay `""`, and
 a name you set is never overwritten. Only new transcripts are pre-filled:
 blanks in older ones are left alone. Accuracy is modest (see
 `local/learning-names.md`): expect misses more than wrong names.

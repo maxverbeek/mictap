@@ -6,10 +6,9 @@ source: laptop
 status: done
 progress: 1/1 min
 attendees: []
-speakers:
-  room/S1: ""
-  room/S2: ""
-  remote/S1: ""
+room/S1: ""
+room/S2: ""
+remote/S1: ""
 ---
 
 **S1** (room, [00:00:02](http://homeserver:8765/r/01J8XTEST/audio.ogg#t=2)): Zullen we zeggen dat het volgende sprint wordt?

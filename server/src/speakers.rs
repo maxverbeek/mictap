@@ -23,17 +23,31 @@ fn split(text: &str) -> Option<(&str, &str)> {
     Some((&rest[..end], &rest[end + 4..]))
 }
 
-/// `id` and the non-empty names of `speakers`, whatever YAML style Obsidian saved them in.
+/// A speaker property's key: `room/S<n>` or `remote/S<n>`.
+fn is_label(k: &str) -> bool {
+    k.split_once('/').is_some_and(|(track, n)| {
+        matches!(track, "room" | "remote")
+            && n.strip_prefix('S')
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// `id` and the non-empty speaker names, whatever YAML style Obsidian saved them in.
 fn parse(front: &str) -> Result<Option<(String, Names)>> {
     let yaml: serde_norway::Value = serde_norway::from_str(front)?;
     let Some(id) = yaml["id"].as_str() else {
         return Ok(None);
     };
-    let names = yaml["speakers"]
+    let names = yaml
         .as_mapping()
         .into_iter()
         .flatten()
-        .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.trim().to_string())))
+        .filter_map(|(k, v)| {
+            Some((
+                k.as_str().filter(|k| is_label(k))?.to_string(),
+                v.as_str()?.trim().to_string(),
+            ))
+        })
         .filter(|(_, n)| !n.is_empty())
         .collect();
     Ok(Some((id.to_string(), names)))
@@ -117,7 +131,7 @@ fn set_attendees(front: &str, names: &Names) -> String {
     out
 }
 
-/// Applies a changed `speakers` map of the transcript at `path` (last modified at `mtime`).
+/// Applies changed speaker names in the transcript at `path` (last modified at `mtime`).
 async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
     let Some((front, body)) = split(&text) else {
@@ -205,7 +219,7 @@ async fn scan(app: &App, seen: &mut HashMap<PathBuf, SystemTime>) -> std::io::Re
     Ok(())
 }
 
-/// Polls the vault for `speakers` edits.
+/// Polls the vault for speaker name edits.
 pub async fn run(app: Arc<App>) {
     let mut seen = HashMap::new();
     loop {
@@ -275,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn waits_until_uploads_are_quiet() {
         let (_tmp, app, path) = setup().await;
-        let named = sub(FIXTURE, &[("  room/S1: \"\"", "  room/S1: Max")]);
+        let named = sub(FIXTURE, &[("room/S1: \"\"", "room/S1: Max")]);
         // An upload in progress: frontmatter complete, body still arriving.
         let partial = &named[..named.len() - 40];
         std::fs::write(&path, partial).unwrap();
@@ -305,8 +319,8 @@ mod tests {
         let named = sub(
             FIXTURE,
             &[
-                ("  room/S1: \"\"", "  room/S1: Max"),
-                ("  remote/S1: \"\"", "  remote/S1: Jan"),
+                ("room/S1: \"\"", "room/S1: Max"),
+                ("remote/S1: \"\"", "remote/S1: Jan"),
             ],
         );
         let got = edit(&app, &path, &named).await;
@@ -327,7 +341,7 @@ mod tests {
         let obsidian = format!(
             "---\nid: \"01J8XTEST\"\ndate: 2026-09-24 14:00\nduration: 1m\nsource: laptop\n\
              status: done\nprogress: 1/1 min\nattendees:\n  - \"[[Max]]\"\n  - \"[[Jan]]\"\n\
-             speakers:\n  \"remote/S1\": Jan\n  \"room/S2\": Eva\n  'room/S1': Maxime\n\
+             \"remote/S1\": Jan\n\"room/S2\": Eva\n'room/S1': Maxime\n\
              tags: [meeting]\n---\n{body}"
         );
         let got = edit(&app, &path, &obsidian).await;
@@ -354,7 +368,7 @@ mod tests {
         );
 
         // Clearing a name restores the label.
-        let cleared = sub(&got, &[("  'room/S1': Maxime\n", "  room/S1:\n")]);
+        let cleared = sub(&got, &[("'room/S1': Maxime\n", "room/S1:\n")]);
         let want = sub(
             &cleared,
             &[
@@ -378,7 +392,7 @@ mod tests {
             .await
             .execute("UPDATE recordings SET written = 'transcribing 0/1 0'", [])
             .unwrap();
-        let named = sub(FIXTURE, &[("  room/S1: \"\"", "  room/S1: Max")]);
+        let named = sub(FIXTURE, &[("room/S1: \"\"", "room/S1: Max")]);
         assert_eq!(edit(&app, &path, &named).await, named);
     }
 

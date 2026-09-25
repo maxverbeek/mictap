@@ -42,7 +42,7 @@ and Piper TTS clips for Dutch. Results in `local/spike.md`.
 - [x] Server: progressive vault file (`status`, `progress`, body).
 - [x] Server: on finish, per-track diarization, chronological merge with
   `room`/`remote` tags, echo dedupe, `status: done`.
-- [x] Server: watch `speakers` frontmatter, rewrite labels, derive
+- [x] Server: watch the speaker properties, rewrite labels, derive
   `attendees` wikilinks.
 - [x] Server: mixdown, `/r/{id}/audio.ogg`, timestamp links, 30-day
   retention with an expired page.
@@ -56,7 +56,7 @@ and Piper TTS clips for Dutch. Results in `local/spike.md`.
 ## Next
 
 - [x] Learn names: store the embedding when a speaker is named, match new
-  clusters against the library, pre-fill `speakers`. Older transcripts'
+  clusters against the library, pre-fill speaker properties. Older transcripts'
   blanks are not filled (decided: no, for now).
 
 ## Later

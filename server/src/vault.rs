@@ -63,13 +63,9 @@ fn render(h: &Header, segs: &[Segment], names: &Names) -> String {
     labels.sort_by_key(|l| label_order(l));
     labels.dedup();
     out += &attendees(names);
-    if labels.is_empty() {
-        out += "speakers: {}\n";
-    } else {
-        out += "speakers:\n";
-        for l in labels {
-            out += &format!("  {l}: {}\n", Value::from(names.get(l).map_or("", String::as_str)));
-        }
+    // One flat property per speaker: Obsidian can only edit flat values.
+    for l in labels {
+        out += &format!("{l}: {}\n", Value::from(names.get(l).map_or("", String::as_str)));
     }
     out += "---\n\n";
     for s in segs {
@@ -345,8 +341,8 @@ mod tests {
         assert_eq!(
             render(&h, &segs, &Names::new()),
             "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
-             status: done\nprogress: 52/52 min\nattendees: []\nspeakers:\n  room/S1: \"\"\n  \
-             room/S2: \"\"\n  room/S10: \"\"\n  remote/S1: \"\"\n---\n\n\
+             status: done\nprogress: 52/52 min\nattendees: []\nroom/S1: \"\"\n\
+             room/S2: \"\"\nroom/S10: \"\"\nremote/S1: \"\"\n---\n\n\
              **S1** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
              **S1** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
              **S10** (room, [01:02:05](http://localhost:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
@@ -363,7 +359,7 @@ mod tests {
             render(&h, &[], &Names::new()),
             "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
              status: failed\nprogress: 2/52 min\nerror: \"whisper-cli: \\\"model\\\" missing\"\n\
-             attendees: []\nspeakers: {}\n---\n\n"
+             attendees: []\n---\n\n"
         );
     }
 
@@ -443,7 +439,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("speakers: {}\n"), "{text}");
+        assert!(text.contains("attendees: []\n---\n"), "{text}");
         assert!(text.contains("**?** (remote, [00:01:01]"), "{text}");
 
         // The user renames it; the next window lands there.
@@ -475,7 +471,7 @@ mod tests {
         let text = read(&app, "Kickoff.md");
         assert!(text.contains("status: done\nprogress: 4/4 min\n"), "{text}");
         assert!(
-            text.contains("speakers:\n  room/S1: \"\"\n  remote/S1: \"\"\n"),
+            text.contains("attendees: []\nroom/S1: \"\"\nremote/S1: \"\"\n---\n"),
             "{text}"
         );
         assert!(
@@ -514,7 +510,7 @@ mod tests {
         sync(&app, "r1").await.unwrap();
         let text = read(&app, "2026-09-26 1600 Meeting.md");
         assert!(
-            text.contains("attendees: [\"[[Max]]\"]\nspeakers:\n  room/S1: \"Max\"\n  remote/S1: \"\"\n---\n"),
+            text.contains("attendees: [\"[[Max]]\"]\nroom/S1: \"Max\"\nremote/S1: \"\"\n---\n"),
             "{text}"
         );
         assert!(text.contains("**Max** (room, [00:00:01]"), "{text}");
