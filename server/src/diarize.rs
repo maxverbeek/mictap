@@ -69,6 +69,64 @@ fn assign(turns: &[Turn], s: i64, e: i64) -> Option<usize> {
         .map(|t| t.speaker)
 }
 
+/// A speaker's run of words shorter than this joins its neighbour instead of becoming a line.
+const MIN_RUN_MS: i64 = 1_000;
+
+/// A cut moves up to this many words to end a line on a sentence or clause.
+const SNAP_WORDS: usize = 2;
+
+/// Segment `[s, e)` as `(start_ms, end_ms, text, speaker)` lines, cut where the speaker
+/// changes, since whisper segments often span a reply. The speaker of each word is the one
+/// its share of the segment overlaps most.
+// ponytail: words spread evenly over the segment, as merge.rs does; whisper-cli's token
+// timestamps (-ojf) would place cuts better if they land mid-phrase.
+fn split(turns: &[Turn], s: i64, e: i64, text: &str) -> Vec<(i64, i64, String, usize)> {
+    let Some(whole) = assign(turns, s, e) else {
+        return vec![];
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let step = (e - s) as f64 / words.len().max(1) as f64;
+    let at = |i: usize| s + (i as f64 * step).round() as i64;
+    // [from, to) word ranges and their speaker.
+    let mut runs: Vec<(usize, usize, usize)> = vec![];
+    for i in 0..words.len() {
+        let k = assign(turns, at(i), at(i + 1)).unwrap_or(whole);
+        match runs.last_mut() {
+            Some(r) if r.2 == k => r.1 = i + 1,
+            _ => runs.push((i, i + 1, k)),
+        }
+    }
+    let short = |r: &(usize, usize, usize)| ((r.1 - r.0) as f64 * step) < MIN_RUN_MS as f64;
+    let mut lines: Vec<(usize, usize, usize)> = vec![];
+    for r in runs {
+        match lines.last_mut() {
+            Some(l) if l.2 == r.2 || short(&r) => l.1 = r.1,
+            // Only the first line can still be short: it takes the next speaker.
+            Some(l) if short(l) => *l = (l.0, r.1, r.2),
+            _ => lines.push(r),
+        }
+    }
+    if lines.len() < 2 {
+        return vec![(s, e, text.to_string(), whole)];
+    }
+    for j in 1..lines.len() {
+        let cut = lines[j].0;
+        let ends = |c: usize| words[c - 1].ends_with(['.', '?', '!', ',', ';', ':']);
+        let snap = (0..=SNAP_WORDS)
+            .flat_map(|d| [cut.checked_sub(d), Some(cut + d)])
+            .flatten()
+            .find(|&c| c > lines[j - 1].0 && c < lines[j].1 && ends(c));
+        if let Some(c) = snap {
+            lines[j - 1].1 = c;
+            lines[j].0 = c;
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(from, to, k)| (at(from), at(to), words[from..to].join(" "), k))
+        .collect()
+}
+
 /// ffmpeg filter placing each input at its offset on one timeline.
 pub(crate) fn mix_filter(offsets_ms: &[i64]) -> String {
     let mut f = String::new();
@@ -385,7 +443,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
         Err(_) => 0.75,
     };
     let mut tracks: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
-    let mut segments: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();
+    let mut segments: BTreeMap<String, Vec<(i64, i64, i64, String)>> = BTreeMap::new();
     {
         let db = app.db.lock().await;
         let mut st =
@@ -394,15 +452,15 @@ async fn label(app: &App, id: &str) -> Result<()> {
             let (track, file, offset): (String, String, i64) = r?;
             tracks.entry(track).or_default().push((file, offset));
         }
-        let mut st = db.prepare("SELECT track, id, start_ms, end_ms FROM segments WHERE recording = ?1")?;
-        for r in st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))? {
-            let (track, sid, s, e): (String, i64, i64, i64) = r?;
-            segments.entry(track).or_default().push((sid, s, e));
+        let mut st = db.prepare("SELECT track, id, start_ms, end_ms, text FROM segments WHERE recording = ?1")?;
+        for r in st.query_map([id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))? {
+            let (track, seg): (String, _) = r?;
+            segments.entry(track).or_default().push(seg);
         }
     }
 
     let dir = app.recording_dir(id);
-    let mut labels: Vec<(i64, String)> = vec![];
+    let mut labels: Vec<(i64, Vec<Line>)> = vec![];
     let mut clusters: Vec<(String, Vec<f32>)> = vec![];
     for (track, files) in &tracks {
         let wav = dir.join(format!(".{track}.wav"));
@@ -424,9 +482,10 @@ async fn label(app: &App, id: &str) -> Result<()> {
         })
         .await??;
         let name = |i: usize| format!("{track}/S{}", i + 1);
-        for &(sid, s, e) in segments.get(track).into_iter().flatten() {
-            if let Some(i) = assign(&turns, s, e) {
-                labels.push((sid, name(i)));
+        for (sid, s, e, text) in segments.get(track).into_iter().flatten() {
+            let lines = split(&turns, *s, *e, text);
+            if !lines.is_empty() {
+                labels.push((*sid, lines.into_iter().map(|(s, e, t, k)| (s, e, t, name(k))).collect()));
             }
         }
         clusters.extend(
@@ -440,18 +499,39 @@ async fn label(app: &App, id: &str) -> Result<()> {
     save(&mut *app.db.lock().await, id, &labels, &clusters, threshold)
 }
 
-/// Stores the segments' labels and the clusters' embeddings, and pre-fills the speakers map
-/// with the clusters that match a voice of another recording.
+/// `(start_ms, end_ms, text, label)` of a segment, or of a part of one after `split`.
+type Line = (i64, i64, String, String);
+
+/// Labels each segment, replacing it by its lines when it was split, stores the clusters'
+/// embeddings, and pre-fills the speakers map with the clusters that match a voice of
+/// another recording.
 fn save(
     db: &mut rusqlite::Connection,
     id: &str,
-    labels: &[(i64, String)],
+    labels: &[(i64, Vec<Line>)],
     clusters: &[(String, Vec<f32>)],
     threshold: f32,
 ) -> Result<()> {
     let tx = db.transaction()?;
-    for (sid, label) in labels {
-        tx.execute("UPDATE segments SET speaker = ?2 WHERE id = ?1", params![sid, label])?;
+    for (sid, lines) in labels {
+        let Some(((_, end, text, label), rest)) = lines.split_first() else {
+            continue;
+        };
+        if rest.is_empty() {
+            tx.execute("UPDATE segments SET speaker = ?2 WHERE id = ?1", params![sid, label])?;
+            continue;
+        }
+        tx.execute(
+            "UPDATE segments SET end_ms = ?2, text = ?3, speaker = ?4 WHERE id = ?1",
+            params![sid, end, text, label],
+        )?;
+        for (s, e, text, label) in rest {
+            tx.execute(
+                "INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker)
+                 SELECT recording, window, track, ?2, ?3, ?4, ?5 FROM segments WHERE id = ?1",
+                params![sid, s, e, text, label],
+            )?;
+        }
     }
     for (label, emb) in clusters {
         let bytes: Vec<u8> = emb.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -535,6 +615,70 @@ mod tests {
         assert_eq!(assign(&turns, 8_000, 9_000), Some(0));
         assert_eq!(assign(&turns, 15_000, 19_000), Some(1));
         assert_eq!(assign(&[], 0, 1_000), None);
+    }
+
+    #[test]
+    fn splits_segments_where_the_speaker_changes() {
+        let line = |s: i64, e: i64, text: &str, k: usize| (s, e, text.to_string(), k);
+        // 9 words over 8 s; the change at 4 s falls in "Ja", the cut moves back to "Wesley?".
+        let turns = [t(0, 4_000, 0), t(4_000, 8_000, 1)];
+        assert_eq!(
+            split(&turns, 0, 8_000, "Heb jij tijd, Wesley? Ja hoor dat kan wel."),
+            [
+                line(0, 3_556, "Heb jij tijd, Wesley?", 0),
+                line(3_556, 8_000, "Ja hoor dat kan wel.", 1)
+            ]
+        );
+        // Without punctuation nearby, the cut stays at the change.
+        assert_eq!(
+            split(&turns, 0, 8_000, "een twee drie vier vijf zes zeven acht"),
+            [
+                line(0, 4_000, "een twee drie vier", 0),
+                line(4_000, 8_000, "vijf zes zeven acht", 1)
+            ]
+        );
+        // Runs under a second don't become lines: a blip, or a short first run.
+        let text = "een twee drie vier vijf zes zeven acht negen tien";
+        let blip = [t(0, 2_000, 0), t(2_000, 2_600, 1), t(2_600, 5_000, 0)];
+        assert_eq!(split(&blip, 0, 5_000, text), [line(0, 5_000, text, 0)]);
+        let late = [t(0, 400, 0), t(400, 5_000, 1)];
+        assert_eq!(split(&late, 0, 5_000, text), [line(0, 5_000, text, 1)]);
+        assert_eq!(split(&[], 0, 5_000, text), []);
+    }
+
+    #[test]
+    fn saves_split_segments_as_lines() {
+        let mut db = crate::db::open(Path::new(":memory:")).unwrap();
+        crate::db::ensure_recording(&db, "r1", "laptop").unwrap();
+        db.execute_batch(
+            "INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms)
+               VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000);
+             INSERT INTO segments (id, recording, window, track, start_ms, end_ms, text)
+               VALUES (1, 'r1', 1, 'room', 0, 8000, 'a b'), (2, 'r1', 1, 'room', 9000, 9500, 'c');",
+        )
+        .unwrap();
+        let l = |s: i64, e: i64, text: &str, label: &str| (s, e, text.to_string(), label.to_string());
+        let labels = [
+            (1, vec![l(0, 4_000, "a", "room/S1"), l(4_000, 8_000, "b", "room/S2")]),
+            (2, vec![l(9_000, 9_500, "c", "room/S2")]),
+        ];
+        save(&mut db, "r1", &labels, &[], 0.75).unwrap();
+        let rows: Vec<(i64, i64, i64, String, String)> = db
+            .prepare("SELECT window, start_ms, end_ms, text, speaker FROM segments ORDER BY start_ms")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let row = |s: i64, e: i64, text: &str, spk: &str| (1, s, e, text.to_string(), spk.to_string());
+        assert_eq!(
+            rows,
+            [
+                row(0, 4_000, "a", "room/S1"),
+                row(4_000, 8_000, "b", "room/S2"),
+                row(9_000, 9_500, "c", "room/S2")
+            ]
+        );
     }
 
     #[test]

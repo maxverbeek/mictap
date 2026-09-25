@@ -79,7 +79,9 @@ meeting instead of after it.
   timeline wav of the track. sherpa over-splits (39 clusters for 3 people),
   so clusters under 10 s are folded into the most similar larger one, and
   clusters whose mean embeddings are at least `MICTAP_MERGE_THRESHOLD` alike
-  are merged. Each segment goes to the speaker it overlaps most. Each cluster's mean embedding comes from sherpa-onnx's C API and is
+  are merged. Each segment goes to the speaker it overlaps most, and is cut
+  into lines where the speaker changes for at least 1 s (words spread evenly
+  over the segment, the cut moved to a nearby sentence or clause end). Each cluster's mean embedding comes from sherpa-onnx's C API and is
   kept in SQLite. No pyannote Python: its models are gated.
 - Tracks are merged chronologically and each line is tagged `room` or
   `remote`.
