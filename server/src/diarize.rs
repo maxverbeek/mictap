@@ -106,7 +106,7 @@ async fn timeline(dir: &Path, files: &[(String, i64)], wav: &Path) -> Result<()>
 async fn diarize(wav: &Path) -> Result<Vec<Turn>> {
     let seg = std::env::var("MICTAP_SEG_MODEL").context("MICTAP_SEG_MODEL not set")?;
     let emb = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
-    let threshold = std::env::var("MICTAP_CLUSTER_THRESHOLD").unwrap_or_else(|_| "0.8".into());
+    let threshold = std::env::var("MICTAP_CLUSTER_THRESHOLD").unwrap_or_else(|_| "0.9".into());
     let out = Command::new("sherpa-onnx-offline-speaker-diarization")
         .arg(format!("--segmentation.pyannote-model={seg}"))
         .arg(format!("--embedding.model={emb}"))
@@ -260,6 +260,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// The name of the voice most similar to `emb`, if at least `threshold` similar.
+// ponytail: one voice per name; the same person across a room/remote channel change scores
+// ~0.6 and stays unnamed (spike S4). Keep one voice per track kind if that matters.
 fn best_match<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], threshold: f32) -> Option<&'a str> {
     voices
         .iter()
@@ -309,7 +311,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
     let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
     let threshold: f32 = match std::env::var("MICTAP_MATCH_THRESHOLD") {
         Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD")?,
-        Err(_) => 0.8,
+        Err(_) => 0.75,
     };
     let mut tracks: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     let mut segments: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();

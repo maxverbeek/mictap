@@ -7,7 +7,6 @@ use tokio::process::Command;
 
 use crate::{api::App, windows::decode};
 
-const DEFAULT_LANG: &str = "nl";
 const SWITCH_P: f64 = 0.8;
 
 /// Whisper's auto-detected language and its probability, from
@@ -19,10 +18,12 @@ fn parse_detected(stderr: &str) -> Option<(String, f64)> {
     Some((lang.to_string(), p))
 }
 
-/// Keep the auto-detected transcription only if it stays in `current` or is confident
-/// enough to switch away from it.
+/// Keep the auto-detected transcription if there is no `current` language yet (the first
+/// window seeds it), if it stays in `current`, or if it is confident enough to switch.
+// ponytail: code-switching only works per window; English inside a Dutch window is dropped
+// or spelled out as Dutch (spike S2). Finer windows would be the only fix.
 fn accept(current: &str, detected: Option<&(String, f64)>) -> bool {
-    detected.is_some_and(|(lang, p)| lang == current || *p >= SWITCH_P)
+    current.is_empty() || detected.is_some_and(|(lang, p)| lang == current || *p >= SWITCH_P)
 }
 
 /// `vocabulary.md`, one term per line (list bullets and headings tolerated), as a prompt.
@@ -53,14 +54,19 @@ struct Offsets {
 }
 
 /// Segments of `wav` as (start_ms, end_ms, text), clamped to `len_ms`, plus whisper's stderr.
-// ponytail: one whisper-cli process per window; model load is ~0.2 s against 10+ s of
-// transcription per window, well under the 20% that would call for whisper-server.
+// ponytail: one whisper-cli process per window; model load is ~0.3 s against the ~25 s
+// encode every window costs (spike S1), well under the 20% that would call for whisper-server.
+// A fresh process also means no text carries over between windows, which is what keeps
+// greedy decoding out of repetition loops (S2); never pass earlier text as --prompt.
 async fn whisper(wav: &Path, len_ms: i64, lang: &str, prompt: &str) -> Result<(Vec<(i64, i64, String)>, String)> {
     let model = std::env::var("MICTAP_WHISPER_MODEL").context("MICTAP_WHISPER_MODEL not set")?;
     let base = wav.with_extension("");
     let json = wav.with_extension("json");
     let mut cmd = Command::new("whisper-cli");
-    cmd.args(["-t", "4", "-m", &model, "-l", lang, "-oj", "-of"]).arg(&base);
+    cmd.args([
+        "-t", "4", "-bs", "1", "-bo", "1", "-m", &model, "-l", lang, "-oj", "-of",
+    ])
+    .arg(&base);
     if !prompt.is_empty() {
         cmd.args(["--prompt", prompt]);
     }
@@ -89,7 +95,7 @@ async fn transcribe(wav: &Path, len_ms: i64, current: &str, prompt: &str) -> Res
     let (segs, stderr) = whisper(wav, len_ms, "auto", prompt).await?;
     let detected = parse_detected(&stderr);
     if accept(current, detected.as_ref()) {
-        return Ok((segs, detected.unwrap().0));
+        return Ok((segs, detected.map_or_else(|| current.to_string(), |d| d.0)));
     }
     let (segs, _) = whisper(wav, len_ms, current, prompt).await?;
     Ok((segs, current.to_string()))
@@ -104,10 +110,10 @@ pub async fn step(app: &App) -> Result<bool> {
         .await
         .query_row(
             "SELECT w.id, w.recording, w.file, w.track, w.offset_ms, w.start_ms, w.end_ms,
-                    COALESCE(r.lang, ?1)
+                    COALESCE(r.lang, '')
              FROM windows w JOIN recordings r ON r.id = w.recording
-             WHERE NOT w.done AND r.status != 'failed' AND r.retry_at <= ?2 ORDER BY w.id LIMIT 1",
-            params![DEFAULT_LANG, crate::db::now_ms()],
+             WHERE NOT w.done AND r.status != 'failed' AND r.retry_at <= ?1 ORDER BY w.id LIMIT 1",
+            [crate::db::now_ms()],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -193,6 +199,7 @@ mod tests {
         assert!(accept("nl", d("en", 0.8).as_ref()));
         assert!(!accept("nl", d("en", 0.79).as_ref()));
         assert!(!accept("nl", None));
+        assert!(accept("", d("en", 0.5).as_ref()));
     }
 
     #[test]
