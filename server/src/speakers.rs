@@ -75,6 +75,12 @@ fn relabel(body: &str, applied: &Names, names: &Names) -> String {
             })
             .or_insert(new);
     }
+    // A sync can upload an older copy of the file over a relabeled one, bringing bare labels
+    // back that `applied` says are named.
+    for (label, name) in names {
+        let (track, short) = label.split_once('/').unwrap_or(("", label));
+        map.entry((track, short)).or_insert(name);
+    }
     body.split_inclusive('\n')
         .map(|line| {
             let relabeled = line
@@ -155,14 +161,11 @@ async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
         .map(|s| serde_json::from_str(&s))
         .transpose()?
         .unwrap_or_default();
-    if names == applied {
+    let relabeled = relabel(body, &applied, &names);
+    if names == applied && relabeled == body {
         return Ok(());
     }
-    let content = format!(
-        "---\n{}---\n{}",
-        set_attendees(front, &names),
-        relabel(body, &applied, &names)
-    );
+    let content = format!("---\n{}---\n{relabeled}", set_attendees(front, &names));
     // Edited since it was read: the next poll picks up the newer version.
     if std::fs::metadata(path)?.modified()? != mtime {
         return Ok(());
@@ -309,6 +312,18 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("**Max** (room, [00:00:02]"), "{text}");
         assert!(text.ends_with("zei ik al.\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn heals_bare_labels_a_sync_brought_back() {
+        let (_tmp, app, path) = setup().await;
+        let named = sub(FIXTURE, &[("room/S1: \"\"", "room/S1: Max")]);
+        let relabeled = edit(&app, &path, &named).await;
+        assert!(relabeled.contains("**Max** (room, [00:00:02]"));
+        // An older copy (named, but lines not relabeled yet) is uploaded over it.
+        let got = edit(&app, &path, &named).await;
+        assert_eq!(got, relabeled);
+        assert_eq!(edit(&app, &path, &got).await, got, "nothing left to do");
     }
 
     #[tokio::test]
