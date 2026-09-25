@@ -13,7 +13,7 @@ use tokio::{
 };
 
 use crate::{
-    machine::{Machine, Mode, GRACE},
+    machine::{Machine, Mode, Track, GRACE},
     pw::{self, Graph},
     recorder::Recorder,
 };
@@ -113,7 +113,7 @@ pub async fn run() -> Result<()> {
         if let Err(e) = res {
             eprintln!("recording: {e:#}");
         }
-        let s = status(&machine, rec.as_ref(), Instant::now());
+        let s = status(&machine, rec.as_ref(), &graph, Instant::now());
         status_tx.send_if_modified(|cur| {
             let changed = *cur != s;
             if changed {
@@ -127,7 +127,7 @@ pub async fn run() -> Result<()> {
     }
 }
 
-fn status(m: &Machine, rec: Option<&Recorder>, now: Instant) -> String {
+fn status(m: &Machine, rec: Option<&Recorder>, g: &Graph, now: Instant) -> String {
     match (&m.session, rec) {
         (Some(s), Some(r)) => json!({
             "recording": true,
@@ -136,11 +136,27 @@ fn status(m: &Machine, rec: Option<&Recorder>, now: Instant) -> String {
             "mode": s.mode,
             "app": s.app,
             "stopping_in": s.lost_at.map(|t| GRACE.saturating_sub(now - t).as_secs()),
-            "tracks": s.tracks.iter().map(|t| &t.key).collect::<Vec<_>>(),
+            "tracks": s.tracks.iter().map(|t| json!({"key": t.key, "name": track_name(g, t)})).collect::<Vec<_>>(),
         }),
         _ => json!({"recording": false}),
     }
     .to_string()
+}
+
+/// What a track records, for people: the mic's description or the app's name.
+fn track_name(g: &Graph, t: &Track) -> String {
+    let name = if t.key == "mic" {
+        g.nodes
+            .iter()
+            .find(|n| n.name == t.target)
+            .map(|n| n.description.clone())
+    } else {
+        g.nodes
+            .iter()
+            .find(|n| n.serial.to_string() == t.target)
+            .map(|n| n.app.clone())
+    };
+    name.filter(|n| !n.is_empty()).unwrap_or_else(|| t.target.clone())
 }
 
 fn sources(g: &Graph) -> String {
@@ -218,5 +234,36 @@ async fn serve(listener: UnixListener, tx: mpsc::Sender<Msg>, status: watch::Rec
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pw::Node;
+
+    #[test]
+    fn track_names() {
+        let node = |name: &str, serial, description: &str, app: &str| Node {
+            id: 0,
+            serial,
+            class: String::new(),
+            name: name.into(),
+            description: description.into(),
+            app: app.into(),
+            binary: String::new(),
+        };
+        let g = Graph {
+            nodes: vec![node("mic1", 5, "Digital Microphone", ""), node("", 427, "", "Zen")],
+            links: vec![],
+            default_source: None,
+        };
+        let t = |key: &str, target: &str| Track {
+            key: key.into(),
+            target: target.into(),
+        };
+        assert_eq!(track_name(&g, &t("mic", "mic1")), "Digital Microphone");
+        assert_eq!(track_name(&g, &t("app-427", "427")), "Zen");
+        assert_eq!(track_name(&g, &t("app-9", "9")), "9", "gone from the graph");
     }
 }
