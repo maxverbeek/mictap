@@ -246,8 +246,32 @@ fn cluster_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Ve
     Ok(sums)
 }
 
+fn floats(b: &[u8]) -> Vec<f32> {
+    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
+}
+
+/// NaN, which matches nothing, for a zero vector or vectors of different lengths.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+    if a.len() != b.len() {
+        return f32::NAN;
+    }
+    dot(a, b) / (dot(a, a) * dot(b, b)).sqrt()
+}
+
+/// The name of the voice most similar to `emb`, if at least `threshold` similar.
+fn best_match<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], threshold: f32) -> Option<&'a str> {
+    voices
+        .iter()
+        .map(|(name, v)| (name, cosine(emb, v)))
+        .filter(|&(_, c)| c >= threshold)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(name, _)| name.as_str())
+}
+
 /// Diarizes the oldest windowed recording whose windows are all transcribed: labels its
-/// segments `track/S<n>` and stores each cluster's embedding. Returns false when there is none,
+/// segments `track/S<n>`, stores each cluster's embedding and names the clusters that match a
+/// known voice. Returns false when there is none,
 /// or when it failed and will be retried after a pause.
 pub async fn step(app: &App) -> Result<bool> {
     let next: Option<String> = app
@@ -283,6 +307,10 @@ pub async fn step(app: &App) -> Result<bool> {
 
 async fn label(app: &App, id: &str) -> Result<()> {
     let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
+    let threshold: f32 = match std::env::var("MICTAP_MATCH_THRESHOLD") {
+        Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD")?,
+        Err(_) => 0.6,
+    };
     let mut tracks: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     let mut segments: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();
     {
@@ -302,7 +330,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
 
     let dir = app.recording_dir(id);
     let mut labels: Vec<(i64, String)> = vec![];
-    let mut clusters: Vec<(String, Vec<u8>)> = vec![];
+    let mut clusters: Vec<(String, Vec<f32>)> = vec![];
     for (track, files) in &tracks {
         let wav = dir.join(format!(".{track}.wav"));
         let res = async {
@@ -322,24 +350,50 @@ async fn label(app: &App, id: &str) -> Result<()> {
         }
         let model = model.clone();
         let embeddings = tokio::task::spawn_blocking(move || cluster_embeddings(&model, &samples, &turns)).await??;
-        for (i, v) in embeddings.into_iter().enumerate() {
-            if let Some(v) = v {
-                clusters.push((name(i), v.iter().flat_map(|x| x.to_le_bytes()).collect()));
-            }
-        }
+        clusters.extend(
+            embeddings
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, v)| Some((name(i), v?))),
+        );
     }
 
-    let mut db = app.db.lock().await;
+    save(&mut *app.db.lock().await, id, &labels, &clusters, threshold)
+}
+
+/// Stores the segments' labels and the clusters' embeddings, and pre-fills the speakers map
+/// with the clusters that match a voice of another recording.
+fn save(
+    db: &mut rusqlite::Connection,
+    id: &str,
+    labels: &[(i64, String)],
+    clusters: &[(String, Vec<f32>)],
+    threshold: f32,
+) -> Result<()> {
     let tx = db.transaction()?;
     for (sid, label) in labels {
         tx.execute("UPDATE segments SET speaker = ?2 WHERE id = ?1", params![sid, label])?;
     }
     for (label, emb) in clusters {
+        let bytes: Vec<u8> = emb.iter().flat_map(|x| x.to_le_bytes()).collect();
         tx.execute(
             "INSERT OR REPLACE INTO clusters (recording, label, embedding) VALUES (?1, ?2, ?3)",
-            params![id, label, emb],
+            params![id, label, bytes],
         )?;
     }
+    let voices: Vec<(String, Vec<f32>)> = tx
+        .prepare("SELECT name, embedding FROM voices WHERE recording != ?1")?
+        .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
+        .collect::<rusqlite::Result<_>>()?;
+    let names: BTreeMap<&str, &str> = clusters
+        .iter()
+        .filter_map(|(label, emb)| Some((label.as_str(), best_match(emb, &voices, threshold)?)))
+        .collect();
+    // Never replaces names already set.
+    tx.execute(
+        "UPDATE recordings SET speakers = ?2 WHERE id = ?1 AND speakers IS NULL",
+        params![id, serde_json::to_string(&names)?],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -416,6 +470,74 @@ mod tests {
         );
     }
 
+    #[test]
+    fn matches_the_most_similar_voice_above_threshold() {
+        let voices = [
+            ("Max".to_string(), vec![1.0, 0.0, 0.0]),
+            ("Eva".to_string(), vec![0.0, 1.0, 0.0]),
+            ("Max".to_string(), vec![0.8, 0.6, 0.0]),
+        ];
+        assert_eq!(best_match(&[0.9, 0.1, 0.0], &voices, 0.6), Some("Max"));
+        assert_eq!(best_match(&[0.3, 2.0, 0.0], &voices, 0.6), Some("Eva"));
+        // Unnormalized input: cosine ignores length.
+        assert_eq!(best_match(&[8.0, 6.0, 0.0], &voices[1..], 0.99), Some("Max"));
+        assert_eq!(best_match(&[0.0, 0.0, 1.0], &voices, 0.6), None);
+        assert_eq!(best_match(&[1.0, 1.0, 0.0], &voices[..2], 0.8), None);
+        assert_eq!(best_match(&[0.0, 0.0, 0.0], &voices, 0.0), None);
+        assert_eq!(best_match(&[1.0, 0.0], &voices, 0.0), None, "other model's dimension");
+        assert_eq!(best_match(&[1.0, 0.0, 0.0], &[], 0.0), None);
+    }
+
+    #[test]
+    fn prefills_matched_clusters_but_keeps_names_set() {
+        let mut db = crate::db::open(Path::new(":memory:")).unwrap();
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        for id in ["old", "r1", "r2"] {
+            crate::db::ensure_recording(&db, id, "laptop").unwrap();
+        }
+        db.execute(
+            "INSERT INTO voices (name, embedding, recording, label) VALUES
+             ('Max', ?1, 'old', 'room/S1'), ('Eva', ?2, 'old', 'remote/S1'), ('Self', ?3, 'r1', 'room/S3')",
+            params![
+                bytes(&[1.0, 0.0, 0.0]),
+                bytes(&[0.0, 1.0, 0.0]),
+                bytes(&[0.0, 0.0, 1.0])
+            ],
+        )
+        .unwrap();
+        let clusters = |xs: &[(&str, [f32; 3])]| -> Vec<(String, Vec<f32>)> {
+            xs.iter().map(|(l, v)| (l.to_string(), v.to_vec())).collect()
+        };
+        let speakers = |db: &rusqlite::Connection, id: &str| -> String {
+            db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        let r1 = clusters(&[
+            ("room/S1", [0.1, 0.9, 0.0]),
+            ("room/S2", [0.7, 0.7, 0.1]),
+            ("room/S3", [0.0, 0.1, 1.0]),
+            ("remote/S1", [0.95, 0.0, 0.1]),
+        ]);
+        save(&mut db, "r1", &[], &r1, 0.9).unwrap();
+        assert_eq!(speakers(&db, "r1"), r#"{"remote/S1":"Max","room/S1":"Eva"}"#);
+        let stored: Vec<f32> = db
+            .query_row(
+                "SELECT embedding FROM clusters WHERE recording = 'r1' AND label = 'room/S2'",
+                [],
+                |r| Ok(floats(&r.get::<_, Vec<u8>>(0)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, [0.7, 0.7, 0.1]);
+
+        db.execute(
+            "UPDATE recordings SET speakers = '{\"room/S1\":\"Jo\"}' WHERE id = 'r2'",
+            [],
+        )
+        .unwrap();
+        save(&mut db, "r2", &[], &clusters(&[("room/S1", [0.0, 1.0, 0.0])]), 0.6).unwrap();
+        assert_eq!(speakers(&db, "r2"), r#"{"room/S1":"Jo"}"#);
+    }
+
     fn cos(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| x * y).sum()
     }
@@ -481,13 +603,7 @@ mod tests {
         let emb: BTreeMap<String, Vec<f32>> = db
             .prepare("SELECT label, embedding FROM clusters")
             .unwrap()
-            .query_map([], |r| {
-                let b: Vec<u8> = r.get(1)?;
-                Ok((
-                    r.get(0)?,
-                    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect(),
-                ))
-            })
+            .query_map([], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();

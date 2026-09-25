@@ -10,7 +10,11 @@ use jiff::Timestamp;
 use rusqlite::params;
 use serde_json::Value;
 
-use crate::{api::App, merge::Segment};
+use crate::{
+    api::App,
+    merge::Segment,
+    speakers::{attendees, display, Names},
+};
 
 const AUDIO_URL: &str = "http://homeserver:8765/r";
 
@@ -39,8 +43,8 @@ pub(crate) fn label_order(label: &str) -> (bool, u32) {
     (track != "room", n.parse().unwrap_or(u32::MAX))
 }
 
-/// The transcript as README specifies it. Speakers are unnamed: C7 fills in names.
-fn render(h: &Header, segs: &[Segment]) -> String {
+/// The transcript as README specifies it, lines labeled with `names` where set.
+fn render(h: &Header, segs: &[Segment], names: &Names) -> String {
     let (done, total) = (minutes(h.done_ms), minutes(h.total_ms));
     let mut out = format!(
         "---\nid: {}\ndate: {}\nduration: {total}m\nsource: {}\nstatus: {}\nprogress: {}/{total} min\n",
@@ -56,21 +60,18 @@ fn render(h: &Header, segs: &[Segment]) -> String {
     let mut labels: Vec<&str> = segs.iter().filter_map(|s| s.speaker.as_deref()).collect();
     labels.sort_by_key(|l| label_order(l));
     labels.dedup();
-    out += "attendees: []\n";
+    out += &attendees(names);
     if labels.is_empty() {
         out += "speakers: {}\n";
     } else {
         out += "speakers:\n";
         for l in labels {
-            out += &format!("  {l}: \"\"\n");
+            out += &format!("  {l}: {}\n", Value::from(names.get(l).map_or("", String::as_str)));
         }
     }
     out += "---\n\n";
     for s in segs {
-        let name = s
-            .speaker
-            .as_deref()
-            .map_or("?", |l| l.split_once('/').map_or(l, |(_, n)| n));
+        let name = s.speaker.as_deref().map_or("?", |l| display(l, names));
         out += &format!(
             "**{name}** ({}, [{}]({AUDIO_URL}/{}/audio.ogg#t={})): {}\n",
             s.track,
@@ -158,6 +159,13 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
         return Ok(());
     }
     let segs = crate::merge::merged(&db, id)?;
+    // Names matched at diarization, for the labels that survived the echo dedupe.
+    let speakers: Option<String> = db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
+    let mut names: Names = speakers
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default();
+    names.retain(|l, _| segs.iter().any(|s| s.speaker.as_ref() == Some(l)));
     // Where the earliest untranscribed window starts, else where the last transcribed one ends.
     let transcribed_ms: i64 = db.query_row(
         "SELECT COALESCE(MIN(CASE WHEN NOT done THEN offset_ms + start_ms END),
@@ -233,16 +241,18 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
         }
     } else {
         let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
-        let content = render(&header, &segs);
+        let content = render(&header, &segs, &names);
         (Some(put(&app.vault, id, target.as_deref(), &base, &content)?), key)
     };
     // The lock was released for the file IO, so the status read above may be stale: only
-    // 'done' is written back, never the old value.
+    // 'done' is written back, never the old value. With it, the names shown become the ones
+    // C7 compares the file against.
     let done = (shown == "done" && !key.starts_with("missing")).then_some("done");
     app.db.lock().await.execute(
-        "UPDATE recordings SET vault_path = ?2, written = ?3, status = COALESCE(?4, status)
+        "UPDATE recordings SET vault_path = ?2, written = ?3, status = COALESCE(?4, status),
+         speakers = CASE WHEN ?4 IS NULL THEN speakers ELSE ?5 END
          WHERE id = ?1",
-        params![id, name, key, done],
+        params![id, name, key, done, serde_json::to_string(&names)?],
     )?;
     Ok(())
 }
@@ -308,7 +318,7 @@ mod tests {
             seg("room", 3_727_000, "Ok.", Some("room/S2")),
         ];
         assert_eq!(
-            render(&h, &segs),
+            render(&h, &segs, &Names::new()),
             "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
              status: done\nprogress: 52/52 min\nattendees: []\nspeakers:\n  room/S1: \"\"\n  \
              room/S2: \"\"\n  room/S10: \"\"\n  remote/S1: \"\"\n---\n\n\
@@ -325,7 +335,7 @@ mod tests {
             ..h
         };
         assert_eq!(
-            render(&h, &[]),
+            render(&h, &[], &Names::new()),
             "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
              status: failed\nprogress: 2/52 min\nerror: \"whisper-cli: \\\"model\\\" missing\"\n\
              attendees: []\nspeakers: {}\n---\n\n"
@@ -461,6 +471,36 @@ mod tests {
         std::fs::write(app.vault.join("Kickoff.md"), "---\nid: r1\n---\nmine\n").unwrap();
         sync(&app, "r1").await.unwrap();
         assert_eq!(read(&app, "Kickoff.md"), "---\nid: r1\n---\nmine\n");
+    }
+
+    #[tokio::test]
+    async fn prefilled_names_label_lines() {
+        let (_tmp, app) = setup().await;
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                r#"UPDATE recordings SET status = 'diarized', finished = 1,
+                     speakers = '{"room/S1":"Max","room/S9":"Echo"}';
+                   UPDATE windows SET done = 1;
+                   UPDATE segments SET speaker = track || '/S1';"#,
+            )
+            .unwrap();
+        sync(&app, "r1").await.unwrap();
+        let text = read(&app, "2026-09-26 1600 Meeting.md");
+        assert!(
+            text.contains("attendees: [\"[[Max]]\"]\nspeakers:\n  room/S1: \"Max\"\n  remote/S1: \"\"\n---\n"),
+            "{text}"
+        );
+        assert!(text.contains("**Max** (room, [00:00:01]"), "{text}");
+        assert!(text.contains("**S1** (remote, [00:01:01]"), "{text}");
+        let speakers: String = app
+            .db
+            .lock()
+            .await
+            .query_row("SELECT speakers FROM recordings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(speakers, r#"{"room/S1":"Max"}"#, "labels not shown are dropped");
     }
 
     #[tokio::test]

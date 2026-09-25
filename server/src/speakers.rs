@@ -14,7 +14,7 @@ use crate::{
     vault::{label_order, put},
 };
 
-type Names = BTreeMap<String, String>;
+pub(crate) type Names = BTreeMap<String, String>;
 
 /// Splits `---\n<front>---\n<body>` into front (with its last newline) and body.
 fn split(text: &str) -> Option<(&str, &str)> {
@@ -40,7 +40,7 @@ fn parse(front: &str) -> Result<Option<(String, Names)>> {
 }
 
 /// What a line of `label` shows: its name, else `S<n>` as the vault writer renders it.
-fn display<'a>(label: &'a str, names: &'a Names) -> &'a str {
+pub(crate) fn display<'a>(label: &'a str, names: &'a Names) -> &'a str {
     names
         .get(label)
         .map_or_else(|| label.split_once('/').map_or(label, |(_, n)| n), String::as_str)
@@ -76,8 +76,8 @@ fn relabel(body: &str, applied: &Names, names: &Names) -> String {
         .collect()
 }
 
-/// Replaces the `attendees` key (flow or block style) in `front`, or appends it.
-fn set_attendees(front: &str, names: &Names) -> String {
+/// `attendees: [...]\n`: wikilinks of the unique names, in label order.
+pub(crate) fn attendees(names: &Names) -> String {
     let mut labels: Vec<&String> = names.keys().collect();
     labels.sort_by_key(|l| label_order(l));
     let mut unique: Vec<&str> = vec![];
@@ -90,8 +90,12 @@ fn set_attendees(front: &str, names: &Names) -> String {
         .iter()
         .map(|n| Value::from(format!("[[{n}]]")).to_string())
         .collect();
-    let attendees = format!("attendees: [{}]\n", links.join(", "));
+    format!("attendees: [{}]\n", links.join(", "))
+}
 
+/// Replaces the `attendees` key (flow or block style) in `front`, or appends it.
+fn set_attendees(front: &str, names: &Names) -> String {
+    let attendees = attendees(names);
     let mut out = String::new();
     let mut replaced = false;
     let mut lines = front.lines().peekable();
