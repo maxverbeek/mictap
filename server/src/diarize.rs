@@ -309,7 +309,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
     let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
     let threshold: f32 = match std::env::var("MICTAP_MATCH_THRESHOLD") {
         Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD")?,
-        Err(_) => 0.6,
+        Err(_) => 0.8,
     };
     let mut tracks: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     let mut segments: BTreeMap<String, Vec<(i64, i64, i64)>> = BTreeMap::new();
