@@ -36,7 +36,7 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into())).join("mictap.sock")
 }
 
-fn spool() -> PathBuf {
+pub(crate) fn spool() -> PathBuf {
     std::env::var("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/state"))

@@ -11,7 +11,7 @@ use tokio::{
 };
 
 use daemon::Req;
-use mictap::upload;
+use mictap::{remote, upload};
 
 #[derive(Parser)]
 #[command(version, about = "Meeting recorder")]
@@ -42,6 +42,17 @@ enum Cmd {
     Upload {
         file: std::path::PathBuf,
     },
+    /// List recordings on the server, and any still on this laptop
+    Recordings,
+    /// Save a recording's audio (default: <id>.ogg)
+    Download {
+        id: String,
+        file: Option<std::path::PathBuf>,
+    },
+    /// Delete a finished recording's audio and state from the server; the transcript stays
+    Delete {
+        id: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -56,6 +67,32 @@ async fn main() -> Result<()> {
         Cmd::Sources => Req::Sources,
         Cmd::Upload { file } => {
             println!("{}", upload::whole(&upload::server(), &file).await?);
+            return Ok(());
+        }
+        Cmd::Recordings => {
+            if let Ok(dirs) = std::fs::read_dir(daemon::spool()) {
+                for d in dirs.flatten() {
+                    println!(
+                        "{:<24} {:<16} {:<6} still on this laptop",
+                        d.file_name().to_string_lossy(),
+                        "",
+                        "laptop"
+                    );
+                }
+            }
+            for r in remote::list(&upload::server()).await? {
+                println!("{}", remote::line(&r));
+            }
+            return Ok(());
+        }
+        Cmd::Download { id, file } => {
+            let to = file.unwrap_or_else(|| format!("{id}.ogg").into());
+            remote::download(&upload::server(), &id, &to).await?;
+            println!("{}", to.display());
+            return Ok(());
+        }
+        Cmd::Delete { id } => {
+            remote::delete(&upload::server(), &id).await?;
             return Ok(());
         }
     };

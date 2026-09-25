@@ -112,8 +112,8 @@ speakers:
 **Jan** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
 ```
 
-- The file appears when the first audio lands and fills in as transcription
-  progresses. `status: failed` comes with an `error:` line. Writes go to a
+- The file appears with the first transcribed speech and fills in as
+  transcription progresses. A recording without any speech gets no file. `status: failed` comes with an `error:` line. Writes go to a
   temp file in `mictap/` that is renamed over the transcript.
 - Filenames are `YYYY-MM-DD HHMM Meeting.md`. Rename freely: the server finds
   transcripts by `id`, not by filename. Moving a file out of `mictap/` hands
@@ -148,6 +148,11 @@ The transcript's timestamps link to a mixdown of all tracks, served over the
 tailnet. `#t=` is a standard media fragment, so the browser's own player
 opens at that moment. Expired recordings return an "expired" page.
 
+`mictap recordings` lists what the server has (date, transcription progress,
+whether the audio is still kept) plus anything not uploaded yet.
+`mictap download <id> [file]` saves the audio; `mictap delete <id>` removes a
+finished recording's audio and state from the server, leaving the transcript.
+
 ## Upload
 
 For recordings made elsewhere (phone recorder app): a plain upload form
@@ -172,6 +177,10 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   Data for a finished recording gets 410.
 - `POST /recordings?filename=&mtime_ms=`: whole-file upload, raw body or
   multipart.
+- `GET /recordings`: every recording, newest first, with its status and
+  progress.
+- `DELETE /recordings/{id}`: audio and state of a finished recording (409
+  while transcribing). The transcript stays.
 - `GET /r/{id}/audio.ogg`: mixdown.
 - `GET /upload`: upload form.
 

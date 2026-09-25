@@ -183,7 +183,7 @@ impl Uploader {
     }
 }
 
-async fn check(res: reqwest::Response) -> Result<reqwest::Response> {
+pub(crate) async fn check(res: reqwest::Response) -> Result<reqwest::Response> {
     if res.status().is_success() {
         return Ok(res);
     }

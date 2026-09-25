@@ -27,6 +27,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("bind {listen}"))?;
     eprintln!("mictap-server listening on {listen}");
-    axum::serve(listener, api::router(app)).await?;
+    axum::serve(listener, api::router(app))
+        .with_graceful_shutdown(terminated())
+        .await?;
     Ok(())
+}
+
+/// Under PrivatePIDs this is PID 1, which the kernel shields from signals it doesn't handle.
+async fn terminated() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+    term.recv().await;
 }

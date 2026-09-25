@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::Result;
 use jiff::Timestamp;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde_json::Value;
 
 use crate::{
@@ -143,32 +143,14 @@ pub(crate) fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, con
 /// Missed syncs (5 s apart) before a transcript that vanished from the folder is given up.
 const GONE_AFTER: u32 = 60;
 
-/// Brings the vault file of `id` up to date with the database.
-pub async fn sync(app: &App, id: &str) -> Result<()> {
-    let db = app.db.lock().await;
-    let (source, started_ms, status, error, cached, written): (
-        String,
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = db.query_row(
-        "SELECT source, started_ms, status, error, vault_path, written FROM recordings WHERE id = ?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
-    )?;
-    if matches!(written.as_deref(), Some("done" | "failed" | "gone")) {
-        return Ok(());
-    }
-    let segs = crate::merge::merged(&db, id)?;
-    // Names matched at diarization, for the labels that survived the echo dedupe.
-    let speakers: Option<String> = db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
-    let mut names: Names = speakers
-        .map(|s| serde_json::from_str(&s))
-        .transpose()?
-        .unwrap_or_default();
-    names.retain(|l, _| segs.iter().any(|s| s.speaker.as_ref() == Some(l)));
+/// What the note shows for `id`: its status, and how much of how much audio is transcribed.
+pub(crate) fn progress(
+    app: &App,
+    db: &Connection,
+    id: &str,
+    status: &str,
+    segs: &[Segment],
+) -> Result<(&'static str, i64, i64)> {
     // Where the earliest untranscribed window starts, else where the last transcribed one ends.
     let transcribed_ms: i64 = db.query_row(
         "SELECT COALESCE(MIN(CASE WHEN NOT done THEN offset_ms + start_ms END),
@@ -200,7 +182,7 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
         .chain(segs.iter().map(|s| s.end_ms))
         .max()
         .unwrap_or(0);
-    let shown = match status.as_str() {
+    let shown = match status {
         "diarized" => "done",
         "failed" => "failed",
         _ => "transcribing",
@@ -209,6 +191,46 @@ pub async fn sync(app: &App, id: &str) -> Result<()> {
         "done" => total_ms,
         _ => transcribed_ms,
     };
+    Ok((shown, done_ms, total_ms))
+}
+
+/// Brings the vault file of `id` up to date with the database.
+pub async fn sync(app: &App, id: &str) -> Result<()> {
+    let db = app.db.lock().await;
+    let (source, started_ms, status, error, cached, written): (
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = db.query_row(
+        "SELECT source, started_ms, status, error, vault_path, written FROM recordings WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    )?;
+    if matches!(written.as_deref(), Some("done" | "failed" | "gone")) {
+        return Ok(());
+    }
+    let segs = crate::merge::merged(&db, id)?;
+    // Names matched at diarization, for the labels that survived the echo dedupe.
+    let speakers: Option<String> = db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
+    let mut names: Names = speakers
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default();
+    names.retain(|l, _| segs.iter().any(|s| s.speaker.as_ref() == Some(l)));
+    let (shown, done_ms, total_ms) = progress(app, &db, id, &status, &segs)?;
+    // No note until there is speech; a recording that ends without any never gets one.
+    if cached.is_none() && segs.is_empty() && shown != "failed" {
+        if shown == "done" {
+            db.execute(
+                "UPDATE recordings SET written = 'done', status = 'done' WHERE id = ?1",
+                [id],
+            )?;
+        }
+        return Ok(());
+    }
     let key = match shown {
         "transcribing" => format!("transcribing {done_ms}/{total_ms} {}", segs.len()),
         s => s.to_string(),
@@ -567,5 +589,29 @@ mod tests {
             .query_row("SELECT status FROM recordings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "done");
+    }
+
+    #[tokio::test]
+    async fn no_speech_no_note() {
+        let (_tmp, app) = setup().await;
+        app.db.lock().await.execute("DELETE FROM segments", []).unwrap();
+        sync(&app, "r1").await.unwrap();
+        assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
+        app.db
+            .lock()
+            .await
+            .execute_batch("UPDATE windows SET done = 1; UPDATE recordings SET status = 'diarized', finished = 1;")
+            .unwrap();
+        sync(&app, "r1").await.unwrap();
+        assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
+        let row: (String, String) = app
+            .db
+            .lock()
+            .await
+            .query_row("SELECT status, written FROM recordings", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("done".into(), "done".into()));
     }
 }

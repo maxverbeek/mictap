@@ -10,7 +10,7 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -50,7 +50,8 @@ impl App {
 
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
-        .route("/recordings", post(upload).layer(DefaultBodyLimit::disable()))
+        .route("/recordings", post(upload).layer(DefaultBodyLimit::disable()).get(list))
+        .route("/recordings/{id}", delete(remove))
         .route(
             "/recordings/{id}/files/{name}",
             put(put_file).layer(DefaultBodyLimit::max(16 << 20)),
@@ -237,6 +238,56 @@ async fn finish(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         Ok(StatusCode::OK)
     } else {
         Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")))
+    }
+}
+
+/// Every recording, newest first, with what its note shows.
+async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
+    let db = app.db.lock().await;
+    type Row = (String, String, Option<i64>, String, Option<String>, Option<String>);
+    let rows: Vec<Row> = db
+        .prepare(
+            "SELECT id, source, started_ms, status, audio, vault_path FROM recordings
+             ORDER BY started_ms DESC",
+        )?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, source, started_ms, status, audio, transcript) in rows {
+        let segs = crate::merge::merged(&db, &id)?;
+        let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
+        let date = started_ms
+            .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+            .map(|t| t.to_zoned(app.tz.clone()).strftime("%Y-%m-%d %H:%M").to_string());
+        out.push(json!({
+            "id": id, "source": source, "date": date, "status": status,
+            "done_ms": done_ms, "total_ms": total_ms, "audio": audio, "transcript": transcript,
+        }));
+    }
+    Ok(Json(out))
+}
+
+/// Deletes a finished recording's audio and state. The transcript stays in the vault.
+async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
+    check_name(&id)?;
+    let db = app.db.lock().await;
+    let status: Option<String> = db
+        .query_row("SELECT status FROM recordings WHERE id = ?1", [&id], |r| r.get(0))
+        .optional()?;
+    match status.as_deref() {
+        None => return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}"))),
+        Some("done" | "failed") => {}
+        Some(_) => return Err(Error(StatusCode::CONFLICT, format!("{id} is still being transcribed"))),
+    }
+    for table in ["segments", "windows", "file_progress", "clusters"] {
+        db.execute(&format!("DELETE FROM {table} WHERE recording = ?1"), [&id])?;
+    }
+    db.execute("DELETE FROM recordings WHERE id = ?1", [&id])?;
+    match std::fs::remove_dir_all(app.recording_dir(&id)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(StatusCode::NO_CONTENT),
     }
 }
 
@@ -503,6 +554,41 @@ mod tests {
             })
             .unwrap();
         assert_eq!(row, (1727179202000, 1));
+    }
+
+    #[tokio::test]
+    async fn lists_and_deletes() {
+        let (tmp, app) = app();
+        send(&app, "PUT", "/recordings/r1/files/00-mic.oga?offset=0", b"abc").await;
+        send(
+            &app,
+            "PUT",
+            "/recordings/r1/meta",
+            br#"{"id":"r1","started_ms":1,"segments":[]}"#,
+        )
+        .await;
+
+        let (s, b) = send(&app, "GET", "/recordings", b"").await;
+        assert_eq!(s, StatusCode::OK);
+        let list: Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(list[0]["id"], "r1");
+        assert_eq!(list[0]["status"], "transcribing");
+
+        let (s, _) = send(&app, "DELETE", "/recordings/r1", b"").await;
+        assert_eq!(s, StatusCode::CONFLICT, "still transcribing");
+
+        app.db
+            .lock()
+            .await
+            .execute("UPDATE recordings SET status = 'done'", [])
+            .unwrap();
+        let (s, _) = send(&app, "DELETE", "/recordings/r1", b"").await;
+        assert_eq!(s, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("recordings/r1").exists());
+        let (_, b) = send(&app, "GET", "/recordings", b"").await;
+        assert_eq!(b, b"[]");
+        let (s, _) = send(&app, "DELETE", "/recordings/r1", b"").await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
