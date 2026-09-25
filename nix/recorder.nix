@@ -8,6 +8,18 @@ self:
 let
   cfg = config.services.mictap.recorder;
   inherit (lib) mkOption types;
+  # The CLI knows its server however it's started: shell, bar, or the service.
+  # --set-default, so an explicit MICTAP_SERVER still wins.
+  wrapped = pkgs.symlinkJoin {
+    name = "mictap-recorder";
+    paths = [ cfg.package ];
+    nativeBuildInputs = [ pkgs.makeWrapper ];
+    postBuild = ''
+      wrapProgram $out/bin/mictap \
+        --set-default MICTAP_SERVER ${lib.escapeShellArg cfg.server} \
+        --set-default MICTAP_ALLOWLIST ${lib.escapeShellArg (lib.concatStringsSep "," cfg.allowlist)}
+    '';
+  };
 in
 {
   options.services.mictap.recorder = {
@@ -48,7 +60,7 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [ wrapped ];
 
     systemd.user.services.mictap = {
       description = "mictap meeting recorder";
@@ -59,12 +71,8 @@ in
         pkgs.pipewire
         pkgs.libnotify
       ];
-      environment = {
-        MICTAP_SERVER = cfg.server;
-        MICTAP_ALLOWLIST = lib.concatStringsSep "," cfg.allowlist;
-      };
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/mictap daemon";
+        ExecStart = "${wrapped}/bin/mictap daemon";
         Restart = "on-failure";
         RestartSec = 2;
       };
