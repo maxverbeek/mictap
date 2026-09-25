@@ -12,7 +12,7 @@ let
   tools = with pkgs; [
     whisper-cpp
     sherpa-onnx
-    ffmpeg
+    ffmpeg-headless
   ];
 in
 {
