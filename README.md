@@ -71,7 +71,7 @@ meeting instead of after it.
 - **Every track is transcribed and diarized separately**: room speakers
   (mic) and remote speakers (app) are never clustered together. Diarization
   runs once per track over the whole recording after it finishes, so labels
-  are consistent across chunks.
+  are consistent over the whole meeting.
 - Diarization is the `sherpa-onnx-offline-speaker-diarization` CLI
   (pyannote segmentation-3.0 ONNX, 3D-Speaker CAM++ zh/en embeddings) on a
   timeline wav of the track. Each segment goes to the speaker it overlaps
