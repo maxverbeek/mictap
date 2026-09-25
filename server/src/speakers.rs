@@ -176,7 +176,13 @@ async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
     Ok(())
 }
 
+/// rclone's WebDAV server writes an upload into the file in place, so a file modified this
+/// recently may be half uploaded: renaming a relabeled copy of it over the file would cut
+/// the transcript short on every device.
+const QUIET: Duration = Duration::from_secs(10);
+
 async fn scan(app: &App, seen: &mut HashMap<PathBuf, SystemTime>) -> std::io::Result<()> {
+    let quiet_since = SystemTime::now() - QUIET;
     let mut now = HashMap::new();
     for entry in std::fs::read_dir(&app.vault)? {
         let entry = entry?;
@@ -185,6 +191,9 @@ async fn scan(app: &App, seen: &mut HashMap<PathBuf, SystemTime>) -> std::io::Re
             continue;
         }
         let mtime = entry.metadata()?.modified()?;
+        if mtime > quiet_since {
+            continue;
+        }
         if seen.get(&path) != Some(&mtime) {
             if let Err(e) = apply(app, &path, mtime).await {
                 eprintln!("{}: speakers: {e:#}", path.display());
@@ -261,6 +270,31 @@ mod tests {
             assert!(s.contains(a), "{a:?} not in {s}");
             s.replacen(a, b, 1)
         })
+    }
+
+    #[tokio::test]
+    async fn waits_until_uploads_are_quiet() {
+        let (_tmp, app, path) = setup().await;
+        let named = sub(FIXTURE, &[("  room/S1: \"\"", "  room/S1: Max")]);
+        // An upload in progress: frontmatter complete, body still arriving.
+        let partial = &named[..named.len() - 40];
+        std::fs::write(&path, partial).unwrap();
+        let mut seen = HashMap::new();
+        scan(&app, &mut seen).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), partial);
+
+        std::fs::write(&path, &named).unwrap();
+        let old = SystemTime::now() - QUIET - Duration::from_secs(1);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        scan(&app, &mut seen).await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("**Max** (room, [00:00:02]"), "{text}");
+        assert!(text.ends_with("zei ik al.\n"), "{text}");
     }
 
     #[tokio::test]
