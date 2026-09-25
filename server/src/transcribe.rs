@@ -18,12 +18,18 @@ fn parse_detected(stderr: &str) -> Option<(String, f64)> {
     Some((lang.to_string(), p))
 }
 
-/// Keep the auto-detected transcription if there is no `current` language yet (the first
-/// window seeds it), if it stays in `current`, or if it is confident enough to switch.
+/// The language to record after an auto-detected transcription, or None when the window must
+/// be redone in `current`. A detection stays if it matches `current` or is confident enough to
+/// switch. With no `current` yet, the transcription always stays, but only a confident
+/// detection seeds the language: a weak first guess would lock in a wrong one (spike S2).
 // ponytail: code-switching only works per window; English inside a Dutch window is dropped
 // or spelled out as Dutch (spike S2). Finer windows would be the only fix.
-fn accept(current: &str, detected: Option<&(String, f64)>) -> bool {
-    current.is_empty() || detected.is_some_and(|(lang, p)| lang == current || *p >= SWITCH_P)
+fn accept(current: &str, detected: Option<&(String, f64)>) -> Option<String> {
+    match detected {
+        Some((lang, p)) if lang == current || *p >= SWITCH_P => Some(lang.clone()),
+        _ if current.is_empty() => Some(String::new()),
+        _ => None,
+    }
 }
 
 /// `vocabulary.md`, one term per line (list bullets and headings tolerated), as a prompt.
@@ -94,8 +100,8 @@ async fn whisper(wav: &Path, len_ms: i64, lang: &str, prompt: &str) -> Result<(V
 async fn transcribe(wav: &Path, len_ms: i64, current: &str, prompt: &str) -> Result<(Vec<(i64, i64, String)>, String)> {
     let (segs, stderr) = whisper(wav, len_ms, "auto", prompt).await?;
     let detected = parse_detected(&stderr);
-    if accept(current, detected.as_ref()) {
-        return Ok((segs, detected.map_or_else(|| current.to_string(), |d| d.0)));
+    if let Some(lang) = accept(current, detected.as_ref()) {
+        return Ok((segs, lang));
     }
     let (segs, _) = whisper(wav, len_ms, current, prompt).await?;
     Ok((segs, current.to_string()))
@@ -195,11 +201,13 @@ mod tests {
     #[test]
     fn language_is_sticky() {
         let d = |l: &str, p| Some((l.to_string(), p));
-        assert!(accept("nl", d("nl", 0.3).as_ref()));
-        assert!(accept("nl", d("en", 0.8).as_ref()));
-        assert!(!accept("nl", d("en", 0.79).as_ref()));
-        assert!(!accept("nl", None));
-        assert!(accept("", d("en", 0.5).as_ref()));
+        assert_eq!(accept("nl", d("nl", 0.3).as_ref()).as_deref(), Some("nl"));
+        assert_eq!(accept("nl", d("en", 0.8).as_ref()).as_deref(), Some("en"));
+        assert_eq!(accept("nl", d("en", 0.79).as_ref()), None);
+        assert_eq!(accept("nl", None), None);
+        assert_eq!(accept("", d("en", 0.8).as_ref()).as_deref(), Some("en"));
+        assert_eq!(accept("", d("en", 0.5).as_ref()).as_deref(), Some(""));
+        assert_eq!(accept("", None).as_deref(), Some(""));
     }
 
     #[test]
