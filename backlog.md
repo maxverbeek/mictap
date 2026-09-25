@@ -69,5 +69,4 @@ and Piper TTS clips for Dutch. Results in `local/spike.md`.
   English inside a Dutch window is dropped).
 - [ ] Check mute behavior of Teams and Slack huddles (only if used).
 - [ ] Better voice matching: in the two-halves test (older model and
-  thresholds) only 3 of 11 known
-  speakers were pre-filled (`local/learning-names.md`).
+  thresholds) only 3 of 11 known speakers were pre-filled (`local/learning-names.md`).
