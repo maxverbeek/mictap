@@ -16,7 +16,9 @@ use crate::{
     speakers::{attendees, display, Names},
 };
 
-const AUDIO_URL: &str = "http://homeserver:8765/r";
+/// Base of the timestamp links, as browsers reach this server.
+pub static URL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| std::env::var("MICTAP_URL").unwrap_or_else(|_| "http://localhost:8765".into()));
 
 struct Header<'a> {
     id: &'a str,
@@ -73,9 +75,10 @@ fn render(h: &Header, segs: &[Segment], names: &Names) -> String {
     for s in segs {
         let name = s.speaker.as_deref().map_or("?", |l| display(l, names));
         out += &format!(
-            "**{name}** ({}, [{}]({AUDIO_URL}/{}/audio.ogg#t={})): {}\n",
+            "**{name}** ({}, [{}]({}/r/{}/audio.ogg#t={})): {}\n",
             s.track,
             hms(s.start_ms),
+            *URL,
             h.id,
             s.start_ms / 1000,
             s.text
@@ -322,11 +325,11 @@ mod tests {
             "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
              status: done\nprogress: 52/52 min\nattendees: []\nspeakers:\n  room/S1: \"\"\n  \
              room/S2: \"\"\n  room/S10: \"\"\n  remote/S1: \"\"\n---\n\n\
-             **S1** (room, [00:14:02](http://homeserver:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
-             **S1** (remote, [00:14:05](http://homeserver:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
-             **S10** (room, [01:02:05](http://homeserver:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
-             **?** (room, [01:02:06](http://homeserver:8765/r/r1/audio.ogg#t=3726)): Hm.\n\
-             **S2** (room, [01:02:07](http://homeserver:8765/r/r1/audio.ogg#t=3727)): Ok.\n"
+             **S1** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
+             **S1** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
+             **S10** (room, [01:02:05](http://localhost:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
+             **?** (room, [01:02:06](http://localhost:8765/r/r1/audio.ogg#t=3726)): Hm.\n\
+             **S2** (room, [01:02:07](http://localhost:8765/r/r1/audio.ogg#t=3727)): Ok.\n"
         );
         let h = Header {
             status: "failed",
@@ -455,7 +458,7 @@ mod tests {
         );
         assert!(
             text.contains(
-                "**S1** (room, [00:00:01](http://homeserver:8765/r/r1/audio.ogg#t=1)): Goedemorgen allemaal.\n"
+                "**S1** (room, [00:00:01](http://localhost:8765/r/r1/audio.ogg#t=1)): Goedemorgen allemaal.\n"
             ),
             "{text}"
         );

@@ -34,7 +34,7 @@ struct Size {
 }
 
 pub fn server() -> String {
-    std::env::var("MICTAP_SERVER").unwrap_or_else(|_| "http://homeserver:8765".into())
+    std::env::var("MICTAP_SERVER").unwrap_or_else(|_| "http://localhost:8765".into())
 }
 
 /// Posts a whole audio or video file; returns the server's reply (`{"id": ...}`).

@@ -175,30 +175,45 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
 
 ## Deployment
 
-Cargo workspace (`client`, `server`) with a flake exposing both binaries;
-`meta.json` and the API above are the contract between them. The NixOS
-module lives in `~/nixconfig/modules/services/mictap.nix`.
+Cargo workspace (`client`, `server`); `meta.json` and the API above are the
+contract between them. The flake exposes the package and two NixOS modules:
 
-- Listens on `0.0.0.0:8765` (`MICTAP_LISTEN`), but only `tailscale0` is a
-  trusted interface, so it's reachable over the tailnet only. No public
-  vhost.
-- `mictap` user in the `webdav` group, `UMask=0002`. `mictap/` in the vault
-  is `2770 webdav:webdav`. No ACL: transcripts are replaced by rename,
-  which needs only write access to the folder, so it doesn't matter that
-  rclone writes 0644 files.
-- `ProtectSystem=strict`, `TemporaryFileSystem=/srv/vault:ro` plus
-  `BindPaths=/srv/vault/mictap`: group `webdav` can read the whole
-  vault, so the rest of it is hidden, not just read-only. State (SQLite,
-  uploads, audio) is in `StateDirectory=mictap`, mode 0750.
-- `Nice=19`, `CPUWeight=20`, whisper `-t 4`: homeserver serves other things.
-- `TZ=Europe/Amsterdam`; `ffmpeg`, `whisper-cpp` and `sherpa-onnx` on the
-  unit's `PATH`.
-- Models are pinned with `fetchurl` and passed as `MICTAP_WHISPER_MODEL`,
-  `MICTAP_VAD_MODEL`, `MICTAP_SEG_MODEL`, `MICTAP_EMB_MODEL`. Tunables:
+```nix
+# the machine that transcribes
+imports = [ mictap.nixosModules.server ];
+services.mictap.server = {
+  enable = true;
+  listen = "0.0.0.0:8765";               # default 127.0.0.1:8765
+  outputDir = "/srv/notes/vault/mictap";
+  user = "syncthing";                     # the user that owns the vault
+  group = "syncthing";
+};
+
+# the laptop
+imports = [ mictap.nixosModules.recorder ];
+services.mictap.recorder = {
+  enable = true;
+  server = "http://myserver:8765";
+  allowlist = [ "firefox" "zoom" ];      # apps whose mic use starts a recording
+};
+```
+
+- **No login.** Listen on loopback or a VPN interface only, and keep the port
+  closed in the firewall.
+- **Vault access.** Run the server as the user that owns the synced vault,
+  so both can overwrite each other's files. The service runs in a chroot
+  (`confinement`) holding only its store paths; `outputDir` and the state
+  dir (SQLite, uploads, audio) are bind-mounted in, and nothing else of the
+  host is visible. `PrivatePIDs`, `ProtectProc=invisible` and
+  `SystemCallFilter=@system-service` keep it from seeing or ptracing the
+  sync daemon that shares its user.
+- **Neighbourly.** `Nice=19`, `CPUWeight=20`: transcription takes every core.
+- **Models** are pinned with `fetchurl`; override them with
+  `services.mictap.server.models.*`. Tunables go in `settings`:
   `MICTAP_CLUSTER_THRESHOLD` (0.9), `MICTAP_MATCH_THRESHOLD` (0.75),
   `MICTAP_ECHO_JACCARD` (0.6).
-- The laptop's user service points at the server with `MICTAP_SERVER`
-  (default `http://homeserver:8765`).
+- `url` (default `http://<hostname>:<port>`) is the base of the timestamp
+  links and the one dotted host name the server accepts besides `*.ts.net`.
 
 ## Non-goals
 

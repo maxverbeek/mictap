@@ -34,11 +34,12 @@ impl App {
     pub fn open(dir: PathBuf) -> anyhow::Result<Self> {
         std::fs::create_dir_all(dir.join("recordings"))?;
         let db = crate::db::open(&dir.join("mictap.db"))?;
+        let vault = std::env::var_os("MICTAP_VAULT").map_or_else(|| dir.join("vault"), PathBuf::from);
         Ok(Self {
             dir,
             db: Mutex::new(db),
             tz: TimeZone::system(),
-            vault: std::env::var_os("MICTAP_VAULT").map_or_else(|| "/srv/vault/mictap".into(), PathBuf::from),
+            vault,
         })
     }
 
@@ -73,8 +74,7 @@ async fn guard(req: Request, next: Next) -> Response {
 /// There is no login, so keep browsers out: a page on another site may not change anything
 /// (CSRF), and a Host outside the tailnet's names is a DNS rebinding attempt. mictap's
 /// client sends neither Origin nor Sec-Fetch-Site.
-// ponytail: Host allowlist of IP literals, single-label names and *.ts.net; add an env var
-// if homeserver gets another name.
+/// Allowed Hosts: IP literals, single-label names, *.ts.net and MICTAP_URL's host.
 fn allowed(method: &Method, headers: &HeaderMap) -> bool {
     let get = |h: &str| headers.get(h).map(|v| v.to_str().unwrap_or("?"));
     let host = get("host");
@@ -84,7 +84,14 @@ fn allowed(method: &Method, headers: &HeaderMap) -> bool {
             _ => host,
         };
         let name = name.trim_start_matches('[').trim_end_matches(']');
-        if !(name.parse::<std::net::IpAddr>().is_ok() || !name.contains('.') || name.ends_with(".ts.net")) {
+        let own = crate::vault::URL
+            .split_once("://")
+            .map(|(_, h)| h.split([':', '/']).next().unwrap_or(""));
+        if !(name.parse::<std::net::IpAddr>().is_ok()
+            || !name.contains('.')
+            || name.ends_with(".ts.net")
+            || own == Some(name))
+        {
             return false;
         }
     }

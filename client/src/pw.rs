@@ -2,7 +2,8 @@ use anyhow::{ensure, Result};
 use serde_json::Value;
 
 /// Matched case-insensitively against application.name and .process.binary.
-const ALLOWLIST: &[&str] = &["zen", "chromium", "chrome", "zoom", "slack"];
+/// MICTAP_ALLOWLIST (comma-separated) replaces it.
+const ALLOWLIST: &str = "zen,chromium,chrome,zoom,slack";
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -77,7 +78,10 @@ pub fn parse(json: &str) -> Result<Graph> {
 
 fn allowed(n: &Node) -> bool {
     let (app, bin) = (n.app.to_lowercase(), n.binary.to_lowercase());
-    ALLOWLIST.iter().any(|w| app.contains(w) || bin.contains(w))
+    let list = std::env::var("MICTAP_ALLOWLIST").unwrap_or_else(|_| ALLOWLIST.into());
+    list.split(',')
+        .map(|w| w.trim().to_lowercase())
+        .any(|w| !w.is_empty() && (app.contains(&w) || bin.contains(&w)))
 }
 
 impl Graph {

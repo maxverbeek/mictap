@@ -15,7 +15,7 @@ use anyhow::Context;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let dir = PathBuf::from(std::env::var("STATE_DIRECTORY").context("STATE_DIRECTORY not set")?);
-    let listen = std::env::var("MICTAP_LISTEN").unwrap_or_else(|_| "0.0.0.0:8765".into());
+    let listen = std::env::var("MICTAP_LISTEN").unwrap_or_else(|_| "127.0.0.1:8765".into());
     let app = Arc::new(api::App::open(dir)?);
     tokio::spawn(windows::run(app.clone()));
     tokio::spawn(transcribe::run(app.clone()));
