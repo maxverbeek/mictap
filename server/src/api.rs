@@ -58,6 +58,7 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/recordings/{id}/meta", put(put_meta))
         .route("/recordings/{id}/finish", post(finish))
+        .route("/recordings/{id}/rediarize", post(rediarize))
         .route("/r/{id}/audio.ogg", get(audio))
         .route("/upload", get(|| async { Html(UPLOAD_FORM) }))
         .layer(middleware::from_fn(guard))
@@ -289,6 +290,39 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(StatusCode::NO_CONTENT),
     }
+}
+
+/// Diarizes a finished recording again. Its labels, names and voices are dropped, the names
+/// are pre-filled anew from other recordings' voices, and the vault file is rewritten.
+async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
+    check_name(&id)?;
+    let mut db = app.db.lock().await;
+    let row: Option<(String, Option<String>)> = db
+        .query_row("SELECT status, audio FROM recordings WHERE id = ?1", [&id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()?;
+    match row {
+        None => return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}"))),
+        Some((s, _)) if s != "done" => {
+            return Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done")));
+        }
+        Some((_, a)) if a.as_deref() != Some("ready") => {
+            return Err(Error(StatusCode::GONE, format!("the audio of {id} is gone")));
+        }
+        _ => {}
+    }
+    let tx = db.transaction()?;
+    tx.execute("UPDATE segments SET speaker = NULL WHERE recording = ?1", [&id])?;
+    tx.execute("DELETE FROM clusters WHERE recording = ?1", [&id])?;
+    tx.execute("DELETE FROM voices WHERE recording = ?1", [&id])?;
+    tx.execute(
+        "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, written = NULL,
+         speakers = NULL WHERE id = ?1",
+        [&id],
+    )?;
+    tx.commit()?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// Refuses new data for a recording that was finished (by the client, or for a week without
@@ -592,6 +626,46 @@ mod tests {
         assert_eq!(b, b"[]");
         let (s, _) = send(&app, "DELETE", "/recordings/r1", b"").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rediarize_resets_labels_names_and_voices() {
+        let (_tmp, app) = app();
+        {
+            let db = app.db.lock().await;
+            db.execute_batch(
+                "INSERT INTO recordings (id, source, status, audio, written, speakers) VALUES
+                   ('r1', 'laptop', 'done', 'ready', 'done', '{\"room/S1\":\"Max\"}'),
+                   ('r2', 'laptop', 'transcribing', 'ready', NULL, NULL),
+                   ('r3', 'laptop', 'done', 'expired', 'done', NULL);
+                 INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done)
+                   VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 1000, 1);
+                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker)
+                   VALUES ('r1', 1, 'room', 0, 1000, 'a', 'room/S1');
+                 INSERT INTO clusters VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
+                 INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');",
+            )
+            .unwrap();
+        }
+        for (id, want) in [
+            ("r2", StatusCode::CONFLICT),
+            ("r3", StatusCode::GONE),
+            ("nope", StatusCode::NOT_FOUND),
+            ("r1", StatusCode::ACCEPTED),
+        ] {
+            let (s, _) = send(&app, "POST", &format!("/recordings/{id}/rediarize"), b"").await;
+            assert_eq!(s, want, "{id}");
+        }
+
+        let db = app.db.lock().await;
+        let one = |sql: &str| -> String { db.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            one("SELECT status || '/' || attempts || '/' || COALESCE(written, '-') || '/' || COALESCE(speakers, '-') FROM recordings WHERE id = 'r1'"),
+            "windowed/0/-/-"
+        );
+        assert_eq!(one("SELECT COALESCE(speaker, '-') FROM segments"), "-");
+        assert_eq!(one("SELECT group_concat(recording) FROM clusters"), "r3");
+        assert_eq!(one("SELECT group_concat(recording) FROM voices"), "r3");
     }
 
     #[tokio::test]

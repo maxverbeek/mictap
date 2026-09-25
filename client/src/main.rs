@@ -57,6 +57,10 @@ enum Cmd {
     Delete {
         id: String,
     },
+    /// Diarize a finished recording again; its speaker names are reset
+    Rediarize {
+        id: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -98,6 +102,10 @@ async fn main() -> Result<()> {
         }
         Cmd::Delete { id } => {
             remote::delete(&upload::server(), &id).await?;
+            return Ok(());
+        }
+        Cmd::Rediarize { id } => {
+            remote::rediarize(&upload::server(), &id).await?;
             return Ok(());
         }
     };

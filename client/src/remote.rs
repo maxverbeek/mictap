@@ -29,6 +29,15 @@ pub async fn delete(server: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn rediarize(server: &str, id: &str) -> Result<()> {
+    let res = reqwest::Client::new()
+        .post(format!("{server}/recordings/{id}/rediarize"))
+        .send()
+        .await?;
+    check(res).await?;
+    Ok(())
+}
+
 /// One line of `mictap recordings`: id, date, source, state.
 pub fn line(r: &Value) -> String {
     let min = |v: &Value| (v.as_i64().unwrap_or(0) + 59_999) / 60_000;
