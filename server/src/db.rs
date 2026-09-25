@@ -59,6 +59,14 @@ CREATE TABLE IF NOT EXISTS clusters (
     embedding BLOB NOT NULL,
     PRIMARY KEY (recording, label)
 );
+-- A cluster the user named: its embedding, copied from clusters.
+CREATE TABLE IF NOT EXISTS voices (
+    name TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    label TEXT NOT NULL,
+    PRIMARY KEY (recording, label)
+);
 ";
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

@@ -150,10 +150,25 @@ async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
         return Ok(());
     }
     put(&app.vault, &id, Some(path), "", &content)?;
-    db.execute(
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
         "UPDATE recordings SET speakers = ?2 WHERE id = ?1",
         params![id, serde_json::to_string(&names)?],
     )?;
+    for label in applied.keys().filter(|l| !names.contains_key(*l)) {
+        tx.execute(
+            "DELETE FROM voices WHERE recording = ?1 AND label = ?2",
+            params![id, label],
+        )?;
+    }
+    for (label, name) in names.iter().filter(|(l, n)| applied.get(*l) != Some(n)) {
+        tx.execute(
+            "INSERT OR REPLACE INTO voices (name, embedding, recording, label)
+             SELECT ?3, embedding, recording, label FROM clusters WHERE recording = ?1 AND label = ?2",
+            params![id, label, name],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -202,10 +217,12 @@ mod tests {
         app.db
             .lock()
             .await
-            .execute(
+            .execute_batch(
                 "INSERT INTO recordings (id, source, started_ms, written)
-                 VALUES ('01J8XTEST', 'laptop', 0, 'done')",
-                [],
+                 VALUES ('01J8XTEST', 'laptop', 0, 'done');
+                 INSERT INTO clusters (recording, label, embedding) VALUES
+                 ('01J8XTEST', 'room/S1', x'01'), ('01J8XTEST', 'room/S2', x'02'),
+                 ('01J8XTEST', 'remote/S1', x'03');",
             )
             .unwrap();
         let path = app.vault.join("Planning.md");
@@ -218,6 +235,21 @@ mod tests {
         let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
         apply(app, path, mtime).await.unwrap();
         std::fs::read_to_string(path).unwrap()
+    }
+
+    async fn voices(app: &App) -> Vec<(String, String, Vec<u8>)> {
+        let db = app.db.lock().await;
+        let mut stmt = db
+            .prepare("SELECT label, name, embedding FROM voices WHERE recording = '01J8XTEST' ORDER BY label")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn v(label: &str, name: &str, emb: u8) -> (String, String, Vec<u8>) {
+        (label.into(), name.into(), vec![emb])
     }
 
     fn sub(s: &str, pairs: &[(&str, &str)]) -> String {
@@ -250,6 +282,7 @@ mod tests {
             ],
         );
         assert_eq!(got, want);
+        assert_eq!(voices(&app).await, [v("remote/S1", "Jan", 3), v("room/S1", "Max", 1)]);
 
         // Obsidian re-serializes the frontmatter: quoted keys, reordered keys, block lists.
         let (_, body) = split(&got).unwrap();
@@ -273,6 +306,14 @@ mod tests {
             ],
         );
         assert_eq!(got, want);
+        assert_eq!(
+            voices(&app).await,
+            [
+                v("remote/S1", "Jan", 3),
+                v("room/S1", "Maxime", 1),
+                v("room/S2", "Eva", 2)
+            ]
+        );
 
         // Clearing a name restores the label.
         let cleared = sub(&got, &[("  'room/S1': Maxime\n", "  room/S1:\n")]);
@@ -288,6 +329,7 @@ mod tests {
             ],
         );
         assert_eq!(edit(&app, &path, &cleared).await, want);
+        assert_eq!(voices(&app).await, [v("remote/S1", "Jan", 3), v("room/S2", "Eva", 2)]);
     }
 
     #[tokio::test]
