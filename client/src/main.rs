@@ -43,7 +43,11 @@ enum Cmd {
         file: std::path::PathBuf,
     },
     /// List recordings on the server, and any still on this laptop
-    Recordings,
+    Recordings {
+        /// One JSON array, as barbell reads it
+        #[arg(long)]
+        json: bool,
+    },
     /// Save a recording's audio (default: <id>.ogg)
     Download {
         id: String,
@@ -69,19 +73,20 @@ async fn main() -> Result<()> {
             println!("{}", upload::whole(&upload::server(), &file).await?);
             return Ok(());
         }
-        Cmd::Recordings => {
-            if let Ok(dirs) = std::fs::read_dir(daemon::spool()) {
-                for d in dirs.flatten() {
-                    println!(
-                        "{:<24} {:<16} {:<6} still on this laptop",
-                        d.file_name().to_string_lossy(),
-                        "",
-                        "laptop"
-                    );
+        Cmd::Recordings { json } => {
+            let mut all: Vec<serde_json::Value> = std::fs::read_dir(daemon::spool())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|d| serde_json::json!({"id": d.file_name().to_string_lossy(), "source": "laptop", "status": "on laptop"}))
+                .collect();
+            all.extend(remote::list(&upload::server()).await?);
+            if json {
+                println!("{}", serde_json::Value::from(all));
+            } else {
+                for r in &all {
+                    println!("{}", remote::line(r));
                 }
-            }
-            for r in remote::list(&upload::server()).await? {
-                println!("{}", remote::line(&r));
             }
             return Ok(());
         }
