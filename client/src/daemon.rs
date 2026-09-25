@@ -26,6 +26,7 @@ pub enum Req {
     Sources,
     Start { source: Option<String> },
     Stop,
+    Toggle,
     Discard { id: Option<String> },
 }
 
@@ -73,6 +74,8 @@ pub async fn run() -> Result<()> {
                     match req {
                         Req::Start { source } => machine.start(source),
                         Req::Stop => machine.stop(),
+                        Req::Toggle if machine.session.is_some() => machine.stop(),
+                        Req::Toggle => machine.start(None),
                         Req::Discard { id } if id.is_none() || id.as_deref() == rec.as_ref().map(|r| r.id.as_str()) => {
                             machine.stop();
                             discard = true;

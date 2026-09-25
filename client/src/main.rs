@@ -31,6 +31,8 @@ enum Cmd {
         source: Option<String>,
     },
     Stop,
+    /// Stop if recording, else start from the default source
+    Toggle,
     /// Stop and delete the current recording
     Discard,
     Status,
@@ -48,6 +50,7 @@ async fn main() -> Result<()> {
         Cmd::Daemon => return daemon::run().await,
         Cmd::Start { source } => Req::Start { source },
         Cmd::Stop => Req::Stop,
+        Cmd::Toggle => Req::Toggle,
         Cmd::Discard => Req::Discard { id: None },
         Cmd::Status => Req::Status,
         Cmd::Sources => Req::Sources,

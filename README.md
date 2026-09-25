@@ -47,9 +47,11 @@ mictap hears what your mic hears, not what the meeting hears: muted side
 discussions in the room are recorded and transcribed.
 
 Control goes through an NDJSON Unix socket (like herdr and stalker):
-`status`, `subscribe`, `start [--source X]`, `stop`, `discard`, `sources`.
-The same verbs exist as CLI subcommands, plus `mictap upload <file>`.
-barbell shows the recording indicator, start/stop, discard and a mic picker.
+`status`, `subscribe`, `start [--source X]`, `stop`, `toggle`, `discard`,
+`sources`. The same verbs exist as CLI subcommands, plus `mictap upload
+<file>`. `mictap toggle` is bound to `Mod+M r` (wlr-which-key). barbell is a
+consumer: it shows the recording indicator (click stops, right-click
+discards) and `r` on an input in the audio menu starts from that mic.
 
 ## Transcription (VPS)
 
