@@ -183,7 +183,7 @@ pub(crate) fn progress(
         .max()
         .unwrap_or(0);
     let shown = match status {
-        "diarized" => "done",
+        "diarized" | "done" => "done",
         "failed" => "failed",
         _ => "transcribing",
     };
