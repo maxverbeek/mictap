@@ -7,7 +7,8 @@ use std::{
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, FromRequest, Multipart, Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -57,7 +58,43 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/recordings/{id}/finish", post(finish))
         .route("/r/{id}/audio.ogg", get(audio))
         .route("/upload", get(|| async { Html(UPLOAD_FORM) }))
+        .layer(middleware::from_fn(guard))
         .with_state(app)
+}
+
+async fn guard(req: Request, next: Next) -> Response {
+    if allowed(req.method(), req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "cross-site request").into_response()
+    }
+}
+
+/// There is no login, so keep browsers out: a page on another site may not change anything
+/// (CSRF), and a Host outside the tailnet's names is a DNS rebinding attempt. mictap's
+/// client sends neither Origin nor Sec-Fetch-Site.
+// ponytail: Host allowlist of IP literals, single-label names and *.ts.net; add an env var
+// if homeserver gets another name.
+fn allowed(method: &Method, headers: &HeaderMap) -> bool {
+    let get = |h: &str| headers.get(h).map(|v| v.to_str().unwrap_or("?"));
+    let host = get("host");
+    if let Some(host) = host {
+        let name = match host.rsplit_once(':') {
+            Some((n, port)) if port.bytes().all(|b| b.is_ascii_digit()) => n,
+            _ => host,
+        };
+        let name = name.trim_start_matches('[').trim_end_matches(']');
+        if !(name.parse::<std::net::IpAddr>().is_ok() || !name.contains('.') || name.ends_with(".ts.net")) {
+            return false;
+        }
+    }
+    if matches!(*method, Method::GET | Method::HEAD) {
+        return true;
+    }
+    if get("sec-fetch-site").is_some_and(|s| s != "same-origin" && s != "none") {
+        return false;
+    }
+    get("origin").is_none_or(|o| o.split_once("://").map(|(_, h)| h) == host)
 }
 
 const UPLOAD_FORM: &str = r#"<!doctype html>
@@ -155,6 +192,7 @@ async fn put_file(
     let skip = (size - q.offset) as usize;
     let mut size = size;
     if skip < body.len() {
+        closed(&db, &id)?;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
         f.write_all(&body[skip..])?;
         f.sync_data()?;
@@ -169,10 +207,14 @@ async fn put_meta(State(app): State<Arc<App>>, Path(id): Path<String>, body: Byt
         serde_json::from_slice(&body).map_err(|e| Error(StatusCode::BAD_REQUEST, format!("meta.json: {e}")))?;
     let db = app.db.lock().await;
     crate::db::ensure_recording(&db, &id, "laptop")?;
+    let dir = app.recording_dir(&id);
+    if std::fs::read(dir.join("meta.json")).ok().as_deref() == Some(&body[..]) {
+        return Ok(StatusCode::OK);
+    }
+    closed(&db, &id)?;
     if let Some(ms) = meta["started_ms"].as_i64() {
         crate::db::set_started(&db, &id, ms)?;
     }
-    let dir = app.recording_dir(&id);
     std::fs::create_dir_all(&dir)?;
     write_atomic(&dir.join("meta.json"), &body)?;
     Ok(StatusCode::OK)
@@ -188,6 +230,21 @@ async fn finish(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         Ok(StatusCode::OK)
     } else {
         Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")))
+    }
+}
+
+/// Refuses new data for a recording that was finished (by the client, or for a week without
+/// uploads): it would never be transcribed. The client keeps its copy on an error.
+fn closed(db: &Connection, id: &str) -> Result<()> {
+    let open: bool = db.query_row(
+        "SELECT NOT finished AND status = 'receiving' FROM recordings WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    if open {
+        Ok(())
+    } else {
+        Err(Error(StatusCode::GONE, format!("{id} is already finished")))
     }
 }
 
@@ -439,6 +496,93 @@ mod tests {
             })
             .unwrap();
         assert_eq!(row, (1727179202000, 1));
+    }
+
+    #[tokio::test]
+    async fn finished_takes_no_new_data() {
+        let (tmp, app) = app();
+        let meta = br#"{"id":"r1","started_ms":1,"segments":[]}"#;
+        send(&app, "PUT", "/recordings/r1/files/00-mic.oga?offset=0", b"abc").await;
+        send(&app, "PUT", "/recordings/r1/meta", meta).await;
+        // As windows::tick does to a recording idle for a week.
+        crate::db::finish(&*app.db.lock().await, "r1").unwrap();
+
+        let (s, b) = send(&app, "PUT", "/recordings/r1/files/00-mic.oga?offset=0", b"abc").await;
+        assert_eq!(
+            (s, b.as_slice()),
+            (StatusCode::OK, &br#"{"size":3}"#[..]),
+            "retry of what landed"
+        );
+        let (s, _) = send(&app, "PUT", "/recordings/r1/files/00-mic.oga?offset=3", b"def").await;
+        assert_eq!(s, StatusCode::GONE);
+        let (s, _) = send(&app, "PUT", "/recordings/r1/files/01-app.oga?offset=0", b"x").await;
+        assert_eq!(s, StatusCode::GONE);
+        let (s, _) = send(&app, "PUT", "/recordings/r1/meta", meta).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = send(&app, "PUT", "/recordings/r1/meta", br#"{"id":"r1","segments":[1]}"#).await;
+        assert_eq!(s, StatusCode::GONE);
+        let (s, _) = send(&app, "POST", "/recordings/r1/finish", b"").await;
+        assert_eq!(s, StatusCode::OK);
+
+        let dir = tmp.path().join("recordings/r1");
+        assert_eq!(std::fs::read(dir.join("00-mic.oga")).unwrap(), b"abc");
+        assert!(!dir.join("01-app.oga").exists());
+        assert_eq!(std::fs::read(dir.join("meta.json")).unwrap(), meta);
+    }
+
+    #[test]
+    fn keeps_browsers_out() {
+        let ok = |m: Method, h: &[(&str, &str)]| {
+            let mut headers = HeaderMap::new();
+            for (k, v) in h {
+                headers.insert(
+                    axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            allowed(&m, &headers)
+        };
+        let host = ("host", "homeserver:8765");
+        // mictap's client, curl, the upload form, a link opened from anywhere.
+        assert!(ok(Method::PUT, &[host]));
+        assert!(ok(Method::POST, &[]));
+        assert!(ok(
+            Method::POST,
+            &[
+                host,
+                ("origin", "http://homeserver:8765"),
+                ("sec-fetch-site", "same-origin")
+            ]
+        ));
+        assert!(ok(Method::GET, &[host, ("sec-fetch-site", "cross-site")]));
+        for h in [
+            "100.64.0.3:8765",
+            "[fd7a::1]:8765",
+            "127.0.0.1",
+            "homeserver.tail1234.ts.net:8765",
+        ] {
+            assert!(ok(Method::GET, &[("host", h)]), "{h}");
+        }
+        // CSRF from a page on another site, fetch no-cors or a form post.
+        assert!(!ok(Method::POST, &[host, ("sec-fetch-site", "cross-site")]));
+        assert!(!ok(Method::POST, &[host, ("sec-fetch-site", "same-site")]));
+        assert!(!ok(Method::POST, &[host, ("origin", "https://evil.example")]));
+        assert!(!ok(Method::POST, &[host, ("origin", "null")]));
+        // DNS rebinding: evil.example resolves to homeserver.
+        assert!(!ok(Method::GET, &[("host", "evil.example:8765")]));
+    }
+
+    #[tokio::test]
+    async fn guard_answers_403() {
+        let (_tmp, app) = app();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/recordings/r1/finish")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::empty())
+            .unwrap();
+        let res = router(app).oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
