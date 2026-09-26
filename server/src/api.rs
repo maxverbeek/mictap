@@ -60,6 +60,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/recordings", post(upload).layer(DefaultBodyLimit::disable()).get(list))
         .route("/recordings/{id}", get(show).delete(remove))
         .route("/recordings/{id}/speakers", put(name_speakers))
+        .route("/recordings/{id}/lines", put(name_line))
         .route(
             "/recordings/{id}/files/{name}",
             put(put_file).layer(DefaultBodyLimit::max(16 << 20)),
@@ -335,8 +336,47 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
     Ok(Json(json!({
         "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
         "total_ms": total_ms, "audio": audio, "editable": editable, "progress": progress,
-        "speakers": speakers, "lines": segs,
+        "speakers": speakers, "lines": crate::names::named(&db, &id)?,
     })))
+}
+
+/// 404 for an unknown recording, 409 unless it is done.
+fn done(db: &Connection, id: &str) -> Result<()> {
+    let status: Option<String> = db
+        .query_row("SELECT status FROM recordings WHERE id = ?1", [id], |r| r.get(0))
+        .optional()?;
+    match status.as_deref() {
+        None => Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}"))),
+        Some("done") => Ok(()),
+        Some(s) => Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done"))),
+    }
+}
+
+#[derive(Deserialize)]
+struct LineName {
+    track: String,
+    start_ms: i64,
+    end_ms: i64,
+    name: Option<String>,
+}
+
+/// Sets or clears the name of one line (see `names::name_line`) and rewrites the transcript.
+async fn name_line(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(l): Json<LineName>,
+) -> Result<Json<Value>> {
+    check_name(&id)?;
+    if !matches!(l.track.as_str(), "room" | "remote") || l.start_ms >= l.end_ms {
+        return Err(Error(StatusCode::BAD_REQUEST, "bad line".into()));
+    }
+    {
+        let db = app.db.lock().await;
+        done(&db, &id)?;
+        crate::names::name_line(&db, &id, &l.track, l.start_ms, l.end_ms, l.name.as_deref())?;
+    }
+    crate::vault::write(&app, &id).await?;
+    Ok(Json(json!({})))
 }
 
 /// Confirms speaker names (`label -> {name, heard}`, see `names::confirm`), learns their
@@ -352,14 +392,7 @@ async fn name_speakers(
     }
     let learned = {
         let db = app.db.lock().await;
-        let status: Option<String> = db
-            .query_row("SELECT status FROM recordings WHERE id = ?1", [&id], |r| r.get(0))
-            .optional()?;
-        match status.as_deref() {
-            None => return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}"))),
-            Some("done") => {}
-            Some(s) => return Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done"))),
-        }
+        done(&db, &id)?;
         crate::names::confirm(&db, &id, names)?
     };
     crate::vault::write(&app, &id).await?;
@@ -402,6 +435,7 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         "windows",
         "file_progress",
         "clusters",
+        "line_names",
         "voices",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE recording = ?1"), [&id])?;
@@ -415,8 +449,9 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
 }
 
 /// Runs sherpa and CAM++ on a finished recording's audio again (and whisper, if its segments
-/// expired). Its turns, names and voices are dropped; its lines stay until derived anew, names
-/// are pre-filled anew from other recordings' voices, and the transcript is rewritten.
+/// expired). Its turns, speaker names and voices are dropped, line names kept; its lines stay
+/// until derived anew, names are pre-filled anew from other recordings' voices, and the
+/// transcript is rewritten.
 async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
     check_name(&id)?;
     let mut db = app.db.lock().await;
@@ -899,6 +934,68 @@ mod tests {
         assert!(
             text.contains("**Max** (room, ") && text.contains("**S2** (room, "),
             "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_a_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::open(tmp.path().join("state")).unwrap();
+        app.vault = tmp.path().join("vault");
+        std::fs::create_dir(&app.vault).unwrap();
+        let app = Arc::new(app);
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                r#"INSERT INTO recordings (id, source, started_ms, status, speakers)
+                     VALUES ('r1', 'laptop', 0, 'done', '{"room/S1":"Max"}'), ('r2', 'laptop', 0, 'windowed', NULL);
+                   INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES
+                     ('r1', 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 'room', 1000, 2000, 'Ja.', 'room/S1');"#,
+            )
+            .unwrap();
+        let put = |id: &str, body: &str| {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/recordings/{id}/lines"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            router(app.clone()).oneshot(req)
+        };
+        let eva = r#"{"track":"room","start_ms":1000,"end_ms":2000,"name":"Eva"}"#;
+        assert_eq!(put("nope", eva).await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(put("r2", eva).await.unwrap().status(), StatusCode::CONFLICT);
+        let bad = r#"{"track":"x","start_ms":1000,"end_ms":2000,"name":"Eva"}"#;
+        assert_eq!(put("r1", bad).await.unwrap().status(), StatusCode::BAD_REQUEST);
+        assert_eq!(put("r1", eva).await.unwrap().status(), StatusCode::OK);
+
+        let (_, b) = send(&app, "GET", "/recordings/r1", b"").await;
+        let r: Value = serde_json::from_slice(&b).unwrap();
+        let names: Vec<(&Value, &Value)> = r["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| (&l["name"], &l["line_name"]))
+            .collect();
+        assert_eq!(names, [(&json!("Max"), &Value::Null), (&json!("Eva"), &json!("Eva"))]);
+        let note = std::fs::read_dir(&app.vault).unwrap().next().unwrap().unwrap().path();
+        let text = std::fs::read_to_string(note).unwrap();
+        assert!(text.contains("attendees: [\"[[Max]]\", \"[[Eva]]\"]\n"), "{text}");
+        assert!(text.contains("**Eva** (room, "), "{text}");
+
+        let clear = r#"{"track":"room","start_ms":1000,"end_ms":2000,"name":null}"#;
+        assert_eq!(put("r1", clear).await.unwrap().status(), StatusCode::OK);
+        let n: i64 = app
+            .db
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM line_names", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(
+            send(&app, "DELETE", "/recordings/r1", b"").await.0,
+            StatusCode::NO_CONTENT
         );
     }
 

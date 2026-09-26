@@ -10,7 +10,7 @@ use jiff::Timestamp;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::{api::App, assemble::Line, names::Names};
+use crate::{api::App, assemble::Line, names::Named};
 
 /// Base of the links in transcripts, as browsers reach this server.
 pub static URL: std::sync::LazyLock<String> =
@@ -27,31 +27,20 @@ pub(crate) fn label_order(label: &str) -> (bool, u32) {
     (track != "room", n.parse().unwrap_or(u32::MAX))
 }
 
-/// What a line of `label` shows: its name, else `S<n>`.
-fn display<'a>(label: &'a str, names: &'a Names) -> &'a str {
-    names
-        .get(label)
-        .map_or_else(|| label.split_once('/').map_or(label, |(_, n)| n), String::as_str)
-}
-
-/// The transcript: a small frontmatter, then one line per segment.
-fn render(id: &str, date: &str, segs: &[Line], names: &Names) -> String {
-    let mut labels: Vec<&String> = names.keys().collect();
-    labels.sort_by_key(|l| label_order(l));
-    let mut attendees: Vec<String> = vec![];
-    for l in labels {
-        let link = Value::from(format!("[[{}]]", names[l])).to_string();
-        if !attendees.contains(&link) {
-            attendees.push(link);
-        }
-    }
+/// The transcript: a small frontmatter, then one line per segment, by its name, else `S<n>`.
+fn render(id: &str, date: &str, lines: &[Named], attendees: &[String]) -> String {
+    let links: Vec<String> = attendees
+        .iter()
+        .map(|a| Value::from(format!("[[{a}]]")).to_string())
+        .collect();
     let mut out = format!(
         "---\nid: {id}\ndate: {date}\nattendees: [{}]\nlink: {}/#{id}\n---\n\n",
-        attendees.join(", "),
+        links.join(", "),
         *URL,
     );
-    for s in segs {
-        let name = s.speaker.as_deref().map_or("?", |l| display(l, names));
+    for Named { line: s, name, .. } in lines {
+        let label = s.speaker.as_deref().map(|l| l.split_once('/').map_or(l, |(_, n)| n));
+        let name = name.as_deref().or(label).unwrap_or("?");
         out += &format!(
             "**{name}** ({}, [{}]({}/r/{id}/audio.ogg#t={})): {}\n",
             s.track,
@@ -173,23 +162,20 @@ pub(crate) fn progress(
 /// speech gets none.
 pub async fn write(app: &App, id: &str) -> Result<()> {
     let db = app.db.lock().await;
-    let (started_ms, cached, speakers): (i64, Option<String>, Option<String>) = db.query_row(
-        "SELECT started_ms, vault_path, speakers FROM recordings WHERE id = ?1",
+    let (started_ms, cached): (i64, Option<String>) = db.query_row(
+        "SELECT started_ms, vault_path FROM recordings WHERE id = ?1",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let segs = crate::assemble::lines(&db, id)?;
+    let segs = crate::names::named(&db, id)?;
+    let attendees = crate::names::attendees(&crate::names::confirmed(&db, id)?, &segs);
     drop(db);
-    let names: Names = speakers
-        .map(|s| serde_json::from_str(&s))
-        .transpose()?
-        .unwrap_or_default();
     let target = locate(&app.vault, id, cached.as_deref())?;
     if segs.is_empty() || (target.is_none() && cached.is_some()) {
         return Ok(());
     }
     let start = Timestamp::from_millisecond(started_ms)?.to_zoned(app.tz.clone());
-    let content = render(id, &start.strftime("%Y-%m-%d %H:%M").to_string(), &segs, &names);
+    let content = render(id, &start.strftime("%Y-%m-%d %H:%M").to_string(), &segs, &attendees);
     let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
     let name = put(&app.vault, id, target.as_deref(), &base, &content)?;
     app.db
@@ -256,11 +242,21 @@ mod tests {
             seg("room", 3_726_000, "Hm.", None),
             seg("room", 3_727_000, "Ok.", Some("room/S2")),
         ];
-        let names: Names = [("remote/S1", "Jan"), ("room/S1", "Max"), ("room/S2", "Max")]
+        let names: crate::names::Names = [("remote/S1", "Jan"), ("room/S1", "Max"), ("room/S2", "Max")]
             .map(|(l, n)| (l.to_string(), n.to_string()))
             .into();
+        let lines: Vec<Named> = segs
+            .into_iter()
+            .map(|line| Named {
+                name: line.speaker.as_ref().and_then(|l| names.get(l)).cloned(),
+                line,
+                line_name: None,
+                taught: false,
+            })
+            .collect();
+        let attendees = crate::names::attendees(&names, &lines);
         assert_eq!(
-            render("r1", "2026-09-24 14:00", &segs, &names),
+            render("r1", "2026-09-24 14:00", &lines, &attendees),
             "---\nid: r1\ndate: 2026-09-24 14:00\nattendees: [\"[[Max]]\", \"[[Jan]]\"]\n\
              link: http://localhost:8765/#r1\n---\n\n\
              **Max** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\

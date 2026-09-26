@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-use crate::assemble::{bytes, cosine, floats, mixed, normalize, Tuning};
+use crate::assemble::{bytes, cosine, floats, mixed, normalize, Line, Tuning};
 
 /// Speaker label (`room/S1`) -> name.
 pub(crate) type Names = BTreeMap<String, String>;
@@ -224,6 +224,98 @@ fn snippet(db: &Connection, id: &str, track: &str, start_ms: i64, end_ms: i64) -
         normalize(&mut v);
         v
     }))
+}
+
+/// Sets the line name of `id`'s line on `track` spanning `[start_ms, end_ms)`, replacing
+/// any line name it overlaps (either holds the other's midpoint); None or `""` clears it.
+pub(crate) fn name_line(
+    db: &Connection,
+    id: &str,
+    track: &str,
+    start_ms: i64,
+    end_ms: i64,
+    name: Option<&str>,
+) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM line_names WHERE recording = ?1 AND track = ?2
+         AND ((start_ms + end_ms) / 2 >= ?3 AND (start_ms + end_ms) / 2 < ?4
+              OR (?3 + ?4) / 2 >= start_ms AND (?3 + ?4) / 2 < end_ms)",
+        params![id, track, start_ms, end_ms],
+    )?;
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        tx.execute(
+            "INSERT INTO line_names (recording, track, start_ms, end_ms, name) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, track, start_ms, end_ms, name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// A line with the name it shows: its line name, else its label's confirmed name.
+#[derive(Debug, Serialize)]
+pub(crate) struct Named {
+    #[serde(flatten)]
+    pub line: Line,
+    pub name: Option<String>,
+    pub line_name: Option<String>,
+    /// It teaches a voice: named on its own (not `?`), or heard before its label was confirmed.
+    pub taught: bool,
+}
+
+/// The derived lines of `id` with their names (see `Named`).
+pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
+    let names = confirmed(db, id)?;
+    let line_names: Vec<(String, i64, i64, String)> = db
+        .prepare("SELECT track, start_ms, end_ms, name FROM line_names WHERE recording = ?1")?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let heard: Vec<(String, i64, i64)> = db
+        .prepare("SELECT label, start_ms, end_ms FROM voices WHERE recording = ?1 AND start_ms IS NOT NULL")?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(crate::assemble::lines(db, id)?
+        .into_iter()
+        .map(|line| {
+            let mid = (line.start_ms + line.end_ms) / 2;
+            let holds = |t: &str, s: i64, e: i64| t == line.track && s <= mid && mid < e;
+            let line_name = line_names
+                .iter()
+                .find(|(t, s, e, _)| holds(t, *s, *e))
+                .map(|n| n.3.clone());
+            let taught = match &line_name {
+                Some(n) => n != "?",
+                None => heard.iter().any(|(l, s, e)| holds(track(l), *s, *e)),
+            };
+            let name = line_name
+                .clone()
+                .or_else(|| line.speaker.as_ref().and_then(|l| names.get(l)).cloned());
+            Named {
+                line,
+                name,
+                line_name,
+                taught,
+            }
+        })
+        .collect())
+}
+
+/// Who attended: the confirmed names in label order, then the line names in order, once each.
+pub(crate) fn attendees(names: &Names, lines: &[Named]) -> Vec<String> {
+    let mut labels: Vec<&String> = names.keys().collect();
+    labels.sort_by_key(|l| crate::vault::label_order(l));
+    let mut out: Vec<String> = vec![];
+    for n in labels
+        .into_iter()
+        .map(|l| &names[l])
+        .chain(lines.iter().filter_map(|l| l.line_name.as_ref()))
+    {
+        if n != "?" && !out.contains(n) {
+            out.push(n.clone());
+        }
+    }
+    out
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -531,5 +623,73 @@ mod tests {
         // The same name again without listening: nothing changes.
         confirm(&db, "r1", named(&[("room/S1", "Max")])).unwrap();
         assert_eq!(learned(&db).len(), 1);
+    }
+
+    fn lines(db: &Connection, lines: &[(i64, i64, &str)]) {
+        db.execute("DELETE FROM lines", []).unwrap();
+        for (s, e, label) in lines {
+            db.execute(
+                "INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES ('r1', 'room', ?1, ?2, '', ?3)",
+                params![s, e, label],
+            )
+            .unwrap();
+        }
+    }
+
+    fn shown(db: &Connection) -> Vec<(Option<String>, bool)> {
+        super::named(db, "r1")
+            .unwrap()
+            .into_iter()
+            .map(|l| (l.name, l.taught))
+            .collect()
+    }
+
+    #[test]
+    fn line_names_follow_lines_derived_anew() {
+        let db = db();
+        db.execute(
+            r#"UPDATE recordings SET speakers = '{"room/S1":"Max"}' WHERE id = 'r1'"#,
+            [],
+        )
+        .unwrap();
+        lines(
+            &db,
+            &[
+                (0, 2_000, "room/S1"),
+                (2_000, 5_000, "room/S1"),
+                (5_000, 6_000, "room/S2"),
+            ],
+        );
+        name_line(&db, "r1", "room", 2_000, 5_000, Some(" Eva ")).unwrap();
+        name_line(&db, "r1", "room", 5_000, 6_000, Some("?")).unwrap();
+        name_line(&db, "r1", "remote", 0, 2_000, Some("Jan")).unwrap();
+        let s = |n: Option<&str>, t| (n.map(String::from), t);
+        assert_eq!(
+            shown(&db),
+            [s(Some("Max"), false), s(Some("Eva"), true), s(Some("?"), false)]
+        );
+        // Derived anew: cut differently, the names go by midpoint.
+        lines(
+            &db,
+            &[
+                (0, 2_500, "room/S1"),
+                (2_500, 4_800, "room/S2"),
+                (4_800, 6_200, "room/S2"),
+            ],
+        );
+        assert_eq!(
+            shown(&db),
+            [s(Some("Max"), false), s(Some("Eva"), true), s(Some("?"), false)]
+        );
+        // Naming the new line replaces the name it overlaps; clearing leaves the label's.
+        name_line(&db, "r1", "room", 2_500, 4_800, Some("Bo")).unwrap();
+        name_line(&db, "r1", "room", 4_800, 6_200, None).unwrap();
+        assert_eq!(shown(&db), [s(Some("Max"), false), s(Some("Bo"), true), s(None, false)]);
+        let n: i64 = db
+            .query_row("SELECT COUNT(*) FROM line_names", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "Bo, and Jan on the remote track");
+        let got = attendees(&confirmed(&db, "r1").unwrap(), &super::named(&db, "r1").unwrap());
+        assert_eq!(got, ["Max", "Bo"]);
     }
 }

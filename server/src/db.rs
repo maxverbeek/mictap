@@ -99,6 +99,15 @@ CREATE TABLE IF NOT EXISTS voices (
     start_ms INTEGER,
     end_ms INTEGER
 );
+-- A name set for one line, kept by time since lines are derived anew; '?' when mixed or
+-- unsure. A line takes the name whose span holds its midpoint on its track.
+CREATE TABLE IF NOT EXISTS line_names (
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    track TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    name TEXT NOT NULL
+);
 ";
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
