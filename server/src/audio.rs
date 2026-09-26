@@ -230,7 +230,7 @@ mod tests {
         let dir = app.recording_dir("r1");
         std::fs::create_dir_all(&dir).unwrap();
         let fixture = |name: &str| format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        std::fs::copy(fixture("speech-60s.oga"), dir.join("00-mic.oga")).unwrap();
+        std::fs::copy(fixture("dutch-60s.oga"), dir.join("00-mic.oga")).unwrap();
         std::fs::copy(fixture("dutch-60s.oga"), dir.join("01-app-7.oga")).unwrap();
         std::fs::write(dir.join("02-mic.oga"), "").unwrap();
         std::fs::write(

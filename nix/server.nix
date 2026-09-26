@@ -8,6 +8,7 @@ self:
 let
   cfg = config.services.mictap.server;
   inherit (lib) mkOption types;
+  models = import ./models.nix pkgs;
   port = lib.last (lib.splitString ":" cfg.listen);
   tools = with pkgs; [
     whisper-cpp
@@ -73,40 +74,25 @@ in
     models = {
       whisper = mkOption {
         type = types.path;
-        default = pkgs.fetchurl {
-          url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
-          hash = "sha256-OUIhcJzVrR9AxG5gMcphvOiJMebgiMGIKUxtWlX/p+I=";
-        };
+        default = models.whisper;
         defaultText = "ggml-large-v3-turbo-q5_0.bin";
         description = "whisper.cpp model (ggml).";
       };
       vad = mkOption {
         type = types.path;
-        default = pkgs.fetchurl {
-          url = "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
-          hash = "sha256-KZQNmNQrkfvQXOSJ8+z3xy8KQvAn5IdZGaKPtMBOos8=";
-        };
+        default = models.vad;
         defaultText = "ggml-silero-v5.1.2.bin";
         description = "Voice activity detection model (ggml silero).";
       };
       segmentation = mkOption {
         type = types.path;
-        default = "${
-          pkgs.fetchzip {
-            url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
-            hash = "sha256-hqaCTZJKZp6IHxYzgVBd9Bss6wC1qg+edB/v10BT1tA=";
-          }
-        }/model.onnx";
+        default = models.segmentation;
         defaultText = "sherpa-onnx-pyannote-segmentation-3-0/model.onnx";
         description = "Speaker segmentation model (sherpa-onnx).";
       };
       embedding = mkOption {
         type = types.path;
-        # "recongition" is upstream's spelling of the release tag.
-        default = pkgs.fetchurl {
-          url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
-          hash = "sha256-qjz8FpY6EFhqk5P1A11ta1fpjTWLNH+AwqML9PAM66I=";
-        };
+        default = models.embedding;
         defaultText = "3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx";
         description = "Speaker embedding model (sherpa-onnx).";
       };

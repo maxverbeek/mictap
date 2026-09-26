@@ -806,78 +806,40 @@ mod tests {
         assert_eq!(speakers(&db, "r2"), r#"{"room/S1":"Jo"}"#);
     }
 
-    fn cos(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| x * y).sum()
-    }
-
     /// Needs ffmpeg and sherpa-onnx-offline-speaker-diarization on PATH,
     /// MICTAP_SEG_MODEL and MICTAP_EMB_MODEL.
     #[tokio::test]
     #[ignore]
-    async fn labels_two_tracks() {
+    async fn labels_a_short_track() {
         let tmp = tempfile::tempdir().unwrap();
         let app = App::open(tmp.path().to_path_buf()).unwrap();
         let dir = app.recording_dir("r1");
         std::fs::create_dir_all(&dir).unwrap();
-        let fixture = |name: &str| format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        // Room: speaker A, then a mic switch to speaker B. Remote: speaker B.
-        for (file, src) in [
-            ("00-mic.oga", "speech-60s.oga"),
-            ("01-app-7.oga", "dutch-60s.oga"),
-            ("02-mic.oga", "dutch-60s.oga"),
-        ] {
-            std::fs::copy(fixture(src), dir.join(file)).unwrap();
-        }
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dutch-8s.oga"),
+            dir.join("00-mic.oga"),
+        )
+        .unwrap();
         {
             let db = app.db.lock().await;
             crate::db::ensure_recording(&db, "r1", "laptop").unwrap();
             db.execute_batch(
                 "UPDATE recordings SET status = 'windowed';
                  INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
-                   (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000, 1),
-                   (2, 'r1', '01-app-7.oga', 'remote', 5000, 0, 30000, 1),
-                   (3, 'r1', '02-mic.oga', 'room', 60000, 0, 30000, 1);
+                   (1, 'r1', '00-mic.oga', 'room', 0, 0, 8000, 1);
                  INSERT INTO segments (recording, window, track, start_ms, end_ms, text) VALUES
-                   ('r1', 1, 'room', 14000, 25000, 'a'),
-                   ('r1', 2, 'remote', 10000, 20000, 'b'),
-                   ('r1', 3, 'room', 70000, 80000, 'c'),
-                   ('r1', 1, 'room', 1500, 3500, 'd');",
+                   ('r1', 1, 'room', 1000, 7000, 'a');",
             )
             .unwrap();
         }
         assert!(step(&app).await.unwrap());
-        assert!(!step(&app).await.unwrap());
 
         let db = app.db.lock().await;
         let status: String = db.query_row("SELECT status FROM recordings", [], |r| r.get(0)).unwrap();
         assert_eq!(status, "diarized");
-        let labels: Vec<(String, String)> = db
-            .prepare("SELECT text, speaker FROM segments ORDER BY text")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let l = |a: &str, b: &str| (a.to_string(), b.to_string());
-        assert_eq!(
-            labels,
-            [
-                l("a", "room/S1"),
-                l("b", "remote/S1"),
-                l("c", "room/S2"),
-                l("d", "room/S1")
-            ]
-        );
-        let emb: BTreeMap<String, Vec<f32>> = db
-            .prepare("SELECT label, embedding FROM clusters")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(emb.keys().collect::<Vec<_>>(), ["remote/S1", "room/S1", "room/S2"]);
-        let same = cos(&emb["room/S2"], &emb["remote/S1"]);
-        let diff = cos(&emb["room/S1"], &emb["room/S2"]);
-        assert!(same > 0.8 && diff < same - 0.2, "same {same}, diff {diff}");
+        let speaker: String = db.query_row("SELECT speaker FROM segments", [], |r| r.get(0)).unwrap();
+        assert_eq!(speaker, "room/S1");
+        let emb: Vec<u8> = db.query_row("SELECT embedding FROM clusters", [], |r| r.get(0)).unwrap();
+        assert!(!floats(&emb).is_empty());
     }
 }

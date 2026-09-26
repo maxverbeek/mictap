@@ -1,3 +1,3 @@
 dutch-60s.oga: first 60 s of https://commons.wikimedia.org/wiki/File:Nl-Westerwald-article.ogg (wikivoicenl, CC BY-SA 3.0 nl).
+dutch-8s.oga: dutch-60s.oga 0 to 8 s.
 echo-remote.oga: dutch-60s.oga 0 to 25 s.
-echo-room.oga: speech-60s.oga 0 to 24 s, then echo-remote.oga delayed to 26.15 s at volume 0.4 (ffmpeg amix).

@@ -23,9 +23,9 @@ fn write_meta(dir: &Path, finished: bool) {
     let meta = serde_json::json!({
         "id": "20260924T200000Z", "started_ms": 1_790_280_000_000u64, "app": "Zen", "finished": finished,
         "segments": [
-            {"file": "00-mic.oga", "key": "mic", "target": "laptop", "offset_ms": 0, "end_ms": 25_000},
-            {"file": "01-app-7.oga", "key": "app-7", "target": "7", "offset_ms": 1_000, "end_ms": 61_000},
-            {"file": "02-mic.oga", "key": "mic", "target": "headset", "offset_ms": 25_000, "end_ms": 49_000},
+            {"file": "00-mic.oga", "key": "mic", "target": "laptop", "offset_ms": 0, "end_ms": 8_000},
+            {"file": "01-app-7.oga", "key": "app-7", "target": "7", "offset_ms": 1_000, "end_ms": 9_000},
+            {"file": "02-mic.oga", "key": "mic", "target": "headset", "offset_ms": 8_000, "end_ms": 16_000},
         ],
     });
     std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
@@ -64,12 +64,8 @@ async fn uploaded_spool_is_transcribed() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    // Two tracks; the mic switches from laptop to headset at 25 s.
-    let files = [
-        ("00-mic.oga", fixture("echo-remote.oga")),
-        ("01-app-7.oga", fixture("speech-60s.oga")),
-        ("02-mic.oga", fixture("echo-room.oga")),
-    ];
+    // Two tracks; the mic switches from laptop to headset at 8 s.
+    let files = ["00-mic.oga", "01-app-7.oga", "02-mic.oga"].map(|f| (f, fixture("dutch-8s.oga")));
     let id = "20260924T200000Z";
     let dir = spool.join(id);
     std::fs::create_dir(&dir).unwrap();

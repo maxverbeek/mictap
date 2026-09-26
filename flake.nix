@@ -28,10 +28,26 @@
       });
 
       devShells = forAllSystems (pkgs: {
-        default = pkgs.mkShell {
-          packages = with pkgs; [ cargo rustc clippy rustfmt rust-analyzer ];
-          buildInputs = [ pkgs.sherpa-onnx ];
-        };
+        default =
+          let
+            models = import ./nix/models.nix pkgs;
+          in
+          pkgs.mkShell {
+            packages = with pkgs; [
+              cargo
+              rustc
+              clippy
+              rustfmt
+              rust-analyzer
+              whisper-cpp
+              ffmpeg-headless
+            ];
+            buildInputs = [ pkgs.sherpa-onnx ];
+            MICTAP_WHISPER_MODEL = models.whisper;
+            MICTAP_VAD_MODEL = models.vad;
+            MICTAP_SEG_MODEL = models.segmentation;
+            MICTAP_EMB_MODEL = models.embedding;
+          };
       });
     };
 }

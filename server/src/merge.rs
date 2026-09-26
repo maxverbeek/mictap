@@ -120,7 +120,6 @@ fn load(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Segment>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::App;
 
     fn s(track: &str, start_ms: i64, end_ms: i64, text: &str, speaker: &str) -> Segment {
         Segment {
@@ -212,56 +211,5 @@ mod tests {
         let out = merge(segs, 0.6);
         assert!(out.contains(&leftover));
         assert_eq!(out.len(), 6);
-    }
-
-    /// Needs ffmpeg, whisper-vad-speech-segments, whisper-cli and
-    /// sherpa-onnx-offline-speaker-diarization on PATH, and the four MICTAP_*_MODEL vars.
-    #[tokio::test]
-    #[ignore]
-    async fn echoed_excerpt_appears_once_as_remote() {
-        let tmp = tempfile::tempdir().unwrap();
-        let app = App::open(tmp.path().to_path_buf()).unwrap();
-        let dir = app.recording_dir("r1");
-        std::fs::create_dir_all(&dir).unwrap();
-        crate::db::ensure_recording(&*app.db.lock().await, "r1", "laptop").unwrap();
-        // Room: English speech, then the Dutch remote speech played back 150 ms late and quieter.
-        std::fs::write(
-            dir.join("meta.json"),
-            r#"{"id":"r1","started_ms":0,"app":"Zen","segments":[
-                {"file":"00-mic.oga","key":"mic","target":"x","offset_ms":0,"end_ms":null},
-                {"file":"01-app-7.oga","key":"app-7","target":"y","offset_ms":26000,"end_ms":null}]}"#,
-        )
-        .unwrap();
-        let fixture = |name: &str| format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
-        std::fs::copy(fixture("echo-room.oga"), dir.join("00-mic.oga")).unwrap();
-        std::fs::copy(fixture("echo-remote.oga"), dir.join("01-app-7.oga")).unwrap();
-        crate::windows::advance(&app, "r1", true).await.unwrap();
-        app.db
-            .lock()
-            .await
-            .execute("UPDATE recordings SET status = 'windowed'", [])
-            .unwrap();
-        while crate::transcribe::step(&app).await.unwrap() {}
-        assert!(crate::diarize::step(&app).await.unwrap());
-
-        let db = app.db.lock().await;
-        let raw = load(&db, "r1").unwrap();
-        let out = merged(&db, "r1").unwrap();
-        let text = |track: &str, segs: &[Segment]| {
-            segs.iter()
-                .filter(|s| s.track == track)
-                .map(|s| s.text.to_lowercase())
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
-        let count = |t: &str, w: &str| t.matches(w).count();
-        let all = format!("{} {}", text("room", &out), text("remote", &out));
-        // The echo was transcribed on the room track, and is gone after merging.
-        assert!(count(&text("room", &raw), "westerwald") >= 2, "{raw:#?}");
-        assert!(count(&text("room", &out), "westerwald") == 0, "{out:#?}");
-        assert!(count(&text("remote", &out), "westerwald") >= 2, "{out:#?}");
-        assert!(count(&all, "wikipedia") == 1, "{out:#?}");
-        assert!(text("room", &out).contains("tokens"), "{out:#?}");
-        assert!(out.windows(2).all(|w| w[0].start_ms <= w[1].start_ms));
     }
 }

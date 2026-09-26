@@ -387,7 +387,7 @@ mod tests {
                 {"file":"01-app-427.oga","key":"app-427","target":"y","offset_ms":5000,"end_ms":null}]}"#,
         )
         .unwrap();
-        let full = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/speech-60s.oga")).unwrap();
+        let full = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dutch-60s.oga")).unwrap();
 
         // App file not uploaded yet, mic file about 36 s in.
         std::fs::write(dir.join("00-mic.oga"), &full[..110_000]).unwrap();
