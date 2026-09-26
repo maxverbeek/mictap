@@ -27,7 +27,7 @@ pub(crate) fn label_order(label: &str) -> (bool, u32) {
     (track != "room", n.parse().unwrap_or(u32::MAX))
 }
 
-/// The transcript: a small frontmatter, then one line per segment, by its name, else `S<n>`.
+/// The transcript: a small frontmatter, then one line per segment, by its name, else `?`.
 fn render(id: &str, date: &str, lines: &[Named], attendees: &[String]) -> String {
     let links: Vec<String> = attendees
         .iter()
@@ -39,8 +39,7 @@ fn render(id: &str, date: &str, lines: &[Named], attendees: &[String]) -> String
         *URL,
     );
     for Named { line: s, name, .. } in lines {
-        let label = s.speaker.as_deref().map(|l| l.split_once('/').map_or(l, |(_, n)| n));
-        let name = name.as_deref().or(label).unwrap_or("?");
+        let name = name.as_deref().unwrap_or("?");
         out += &format!(
             "**{name}** ({}, [{}]({}/r/{id}/audio.ogg#t={})): {}\n",
             s.track,
@@ -217,6 +216,7 @@ async fn done(app: &App, id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::State;
 
     fn seg(track: &str, start_ms: i64, text: &str, speaker: Option<&str>) -> Line {
         Line {
@@ -247,11 +247,15 @@ mod tests {
             .into();
         let lines: Vec<Named> = segs
             .into_iter()
-            .map(|line| Named {
-                name: line.speaker.as_ref().and_then(|l| names.get(l)).cloned(),
-                line,
-                line_name: None,
-                taught: false,
+            .map(|line| {
+                let name = line.speaker.as_ref().and_then(|l| names.get(l)).cloned();
+                let state = if name.is_some() { State::Guessed } else { State::Unknown };
+                Named {
+                    name,
+                    line,
+                    line_name: None,
+                    state,
+                }
             })
             .collect();
         let attendees = crate::names::attendees(&names, &lines);
@@ -261,7 +265,7 @@ mod tests {
              link: http://localhost:8765/#r1\n---\n\n\
              **Max** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
              **Jan** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
-             **S10** (room, [01:02:05](http://localhost:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
+             **?** (room, [01:02:05](http://localhost:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
              **?** (room, [01:02:06](http://localhost:8765/r/r1/audio.ogg#t=3726)): Hm.\n\
              **Max** (room, [01:02:07](http://localhost:8765/r/r1/audio.ogg#t=3727)): Ok.\n"
         );
@@ -330,7 +334,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("**Max** (room, [00:00:01]"), "{text}");
-        assert!(text.contains("**S1** (remote, [00:01:01]"), "{text}");
+        assert!(text.contains("**?** (remote, [00:01:01]"), "{text}");
         assert_eq!(one(&app, "SELECT status FROM recordings").await, "done");
 
         // Renamed in Obsidian: the next write lands there.
@@ -344,6 +348,17 @@ mod tests {
         let text = std::fs::read_to_string(app.vault.join("Kickoff.md")).unwrap();
         assert!(text.contains("attendees: [\"[[Jan]]\"]\n"), "{text}");
         assert!(text.contains("**Jan** (remote, [00:01:01]"), "{text}");
+
+        // A suggestion is written as a guess.
+        app.db
+            .lock()
+            .await
+            .execute(r#"UPDATE recordings SET suggested = '{"room/S1":"Eva"}'"#, [])
+            .unwrap();
+        write(&app, "r1").await.unwrap();
+        let text = std::fs::read_to_string(app.vault.join("Kickoff.md")).unwrap();
+        assert!(text.contains("attendees: [\"[[Jan]]\", \"[[Eva]]\"]\n"), "{text}");
+        assert!(text.contains("**Eva** (room, [00:00:01]"), "{text}");
 
         // Moved out: left alone, not recreated.
         std::fs::remove_file(app.vault.join("Kickoff.md")).unwrap();

@@ -321,8 +321,8 @@ fn date(app: &App, started_ms: Option<i64>) -> Option<String> {
     Some(t.to_zoned(app.tz.clone()).strftime("%Y-%m-%d %H:%M").to_string())
 }
 
-/// One recording with its lines and speaker names. `editable` once its names can be set,
-/// `teachable` while naming can learn voices.
+/// One recording with its lines and speaker names, and how many lines are in each state.
+/// `editable` once its names can be set, `teachable` while naming can learn voices.
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>> {
     check_name(&id)?;
     let db = app.db.lock().await;
@@ -342,10 +342,14 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
     let progress = step(&app, &db, &id, &status, &segs)?;
     let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
     let speakers = crate::names::speakers(&db, &id, segs.iter().filter_map(|l| l.speaker.as_deref()))?;
+    let lines = crate::names::named(&db, &id)?;
+    use crate::names::State::*;
+    let count = |s| lines.iter().filter(|l| l.state == s).count();
+    let counts = json!({ "taught": count(Taught), "guessed": count(Guessed), "unknown": count(Unknown) });
     Ok(Json(json!({
         "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
         "total_ms": total_ms, "audio": audio, "editable": editable, "progress": progress,
-        "speakers": speakers, "lines": crate::names::named(&db, &id)?,
+        "speakers": speakers, "lines": lines, "counts": counts,
         "teachable": crate::names::teachable(&db, &id)?,
     })))
 }
@@ -973,7 +977,7 @@ mod tests {
         let text = std::fs::read_to_string(note).unwrap();
         assert!(text.contains("attendees: [\"[[Max]]\"]\n"), "{text}");
         assert!(
-            text.contains("**Max** (room, ") && text.contains("**S2** (room, "),
+            text.contains("**Max** (room, ") && text.contains("**?** (room, "),
             "{text}"
         );
     }
@@ -1023,6 +1027,9 @@ mod tests {
             .map(|l| (&l["name"], &l["line_name"]))
             .collect();
         assert_eq!(names, [(&json!("Max"), &Value::Null), (&json!("Eva"), &json!("Eva"))]);
+        let states: Vec<&Value> = r["lines"].as_array().unwrap().iter().map(|l| &l["state"]).collect();
+        assert_eq!(states, [&json!("guessed"), &json!("taught")]);
+        assert_eq!(r["counts"], json!({"taught": 1, "guessed": 1, "unknown": 0}));
         assert_eq!(r["teachable"], false);
         let (_, b) = send(&app, "GET", "/recordings", b"").await;
         let list: Value = serde_json::from_slice(&b).unwrap();

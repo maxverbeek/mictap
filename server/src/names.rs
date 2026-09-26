@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::assemble::{bytes, cosine, floats, mixed, normalize, Line, Tuning};
@@ -60,10 +60,24 @@ pub(crate) struct Matching {
 impl Matching {
     /// `MICTAP_MATCH_THRESHOLD` (default 0.75) and `MICTAP_MATCH_MARGIN` (default 0.05).
     pub fn from_env() -> Self {
-        let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
+        Self::env("MICTAP_MATCH", 0.75, 0.05)
+    }
+
+    /// For a line's own voice: `MICTAP_LINE_THRESHOLD` (default 0.55) and `MICTAP_LINE_MARGIN`
+    /// (default 0.1).
+    pub fn lines_from_env() -> Self {
+        Self::env("MICTAP_LINE", 0.55, 0.1)
+    }
+
+    fn env(prefix: &str, threshold: f32, margin: f32) -> Self {
+        let var = |k: &str| {
+            std::env::var(format!("{prefix}_{k}"))
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+        };
         Self {
-            threshold: var("MICTAP_MATCH_THRESHOLD").unwrap_or(0.75),
-            margin: var("MICTAP_MATCH_MARGIN").unwrap_or(0.05),
+            threshold: var("THRESHOLD").unwrap_or(threshold),
+            margin: var("MARGIN").unwrap_or(margin),
         }
     }
 }
@@ -201,7 +215,7 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Namin
         let n = learned.entry(label.clone()).or_default();
         if !heard.is_empty() {
             for h in heard.iter().filter(|h| h.correct) {
-                if let Some(v) = snippet(&tx, id, track(label), h.start_ms, h.end_ms)? {
+                if let Some(v) = line_voice(&tx, id, track(label), h.start_ms, h.end_ms)? {
                     *n += tx.execute(
                         "INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -226,6 +240,23 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Namin
     tx.commit()?;
     learned.retain(|l, _| changes.contains_key(l));
     Ok(learned)
+}
+
+/// The line voice of `id`'s line on `track` spanning `[start_ms, end_ms)`, found by its
+/// midpoint, else the turns' `snippet`.
+fn line_voice(db: &Connection, id: &str, track: &str, start_ms: i64, end_ms: i64) -> Result<Option<Vec<f32>>> {
+    let own: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT embedding FROM line_voices WHERE recording = ?1 AND track = ?2
+             AND start_ms <= ?3 AND ?3 < end_ms",
+            params![id, track, (start_ms + end_ms) / 2],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match own {
+        Some(b) => Ok(Some(floats(&b))),
+        None => snippet(db, id, track, start_ms, end_ms),
+    }
 }
 
 /// The normalized mean of the embeddings of `id`'s `track` turns overlapping
@@ -257,8 +288,8 @@ fn snippet(db: &Connection, id: &str, track: &str, start_ms: i64, end_ms: i64) -
 
 /// Sets the line name of `id`'s line on `track` spanning `[start_ms, end_ms)`, replacing
 /// any line name it overlaps (either holds the other's midpoint) and its voice; None or `""`
-/// clears it. A name other than `?` learns a voice from the turns under the line, stored
-/// under the track as label; returns how many (none once the turns expired).
+/// clears it. A name other than `?` learns a voice (see `line_voice`), stored under the track
+/// as label; returns how many (none without a line voice once the turns expired).
 pub(crate) fn name_line(
     db: &Connection,
     id: &str,
@@ -289,7 +320,7 @@ pub(crate) fn name_line(
             "INSERT INTO line_names (recording, track, start_ms, end_ms, name) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, track, start_ms, end_ms, name],
         )?;
-        if let Some(v) = snippet(&tx, id, track, start_ms, end_ms)?.filter(|_| name != "?") {
+        if let Some(v) = line_voice(&tx, id, track, start_ms, end_ms)?.filter(|_| name != "?") {
             learned = tx.execute(
                 "INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -301,37 +332,80 @@ pub(crate) fn name_line(
     Ok(learned)
 }
 
-/// Whether `id`'s turns are kept, so naming can still learn voices from its lines.
+/// Whether `id` has line voices or its turns are kept, so naming can still learn voices from its
+/// lines.
 pub(crate) fn teachable(db: &Connection, id: &str) -> Result<bool> {
     Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM turns WHERE recording = ?1 AND embedding IS NOT NULL)",
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE recording = ?1 AND embedding IS NOT NULL)
+             OR EXISTS(SELECT 1 FROM line_voices WHERE recording = ?1)",
         [id],
         |r| r.get(0),
     )?)
 }
 
-/// A line with the name it shows: its line name, else its label's confirmed name.
+/// How sure a line's name is (see CONTEXT.md).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum State {
+    Taught,
+    Guessed,
+    Unknown,
+}
+
+/// A line with the name it shows, None when unknown.
 #[derive(Debug, Serialize)]
 pub(crate) struct Named {
     #[serde(flatten)]
     pub line: Line,
     pub name: Option<String>,
     pub line_name: Option<String>,
-    /// It teaches a voice: named on its own (not `?`), or heard before its label was confirmed.
-    pub taught: bool,
+    pub state: State,
 }
 
-/// The derived lines of `id` with their names (see `Named`).
+/// The guess for a line not taught, from `g` (its label's confirmed name or suggestion) and
+/// the name `voices` give its own `emb`: either one alone, None where they disagree.
+pub(crate) fn guess<'a>(
+    g: Option<&'a str>,
+    emb: Option<&[f32]>,
+    voices: impl IntoIterator<Item = &'a (String, Vec<f32>)>,
+    m: &Matching,
+) -> Option<&'a str> {
+    match (emb.and_then(|e| best(e, voices, m)).map(|b| b.0), g) {
+        (Some(own), Some(g)) if own != g => None,
+        (Some(own), _) => Some(own),
+        (None, g) => g,
+    }
+}
+
+/// The derived lines of `id` with their names: taught by a line name or a heard voice over
+/// it, else guessed anew from the voices known now (see `guess`).
 pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
-    let names = confirmed(db, id)?;
+    let (names, suggested) = (confirmed(db, id)?, column(db, id, "suggested")?);
     let line_names: Vec<(String, i64, i64, String)> = db
         .prepare("SELECT track, start_ms, end_ms, name FROM line_names WHERE recording = ?1")?
         .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let heard: Vec<(String, i64, i64)> = db
-        .prepare("SELECT label, start_ms, end_ms FROM voices WHERE recording = ?1 AND start_ms IS NOT NULL")?
-        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let line_voices: Vec<(String, i64, i64, Vec<f32>)> = db
+        .prepare("SELECT track, start_ms, end_ms, embedding FROM line_voices WHERE recording = ?1")?
+        .query_map([id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, floats(&r.get::<_, Vec<u8>>(3)?)))
+        })?
         .collect::<rusqlite::Result<_>>()?;
+    // (recording, label, span if taught from a line, (name, embedding))
+    type Voice = (String, String, Option<(i64, i64)>, (String, Vec<f32>));
+    let voices: Vec<Voice> = db
+        .prepare("SELECT recording, label, start_ms, end_ms, name, embedding FROM voices")?
+        .query_map([], |r| {
+            let span = r.get::<_, Option<i64>>(2)?.zip(r.get::<_, Option<i64>>(3)?);
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                span,
+                (r.get(4)?, floats(&r.get::<_, Vec<u8>>(5)?)),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let m = Matching::lines_from_env();
     Ok(crate::assemble::lines(db, id)?
         .into_iter()
         .map(|line| {
@@ -341,24 +415,37 @@ pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
                 .iter()
                 .find(|(t, s, e, _)| holds(t, *s, *e))
                 .map(|n| n.3.clone());
-            let taught = match &line_name {
-                Some(n) => n != "?",
-                None => heard.iter().any(|(l, s, e)| holds(track(l), *s, *e)),
+            let own = |(r, l, span, _): &&Voice| r == id && span.is_some_and(|(s, e)| holds(track(l), s, e));
+            let heard = voices.iter().find(own).map(|v| v.3 .0.clone());
+            let (state, name) = match line_name.as_deref() {
+                Some("?") => (State::Unknown, None),
+                Some(n) => (State::Taught, Some(n.to_string())),
+                None if heard.is_some() => (State::Taught, heard),
+                None => {
+                    let g = line.speaker.as_ref().and_then(|l| match names.get(l) {
+                        Some(n) => Some(n).filter(|n| *n != "?"),
+                        None => suggested.get(l),
+                    });
+                    let emb = line_voices.iter().find(|(t, s, e, _)| holds(t, *s, *e));
+                    let others = voices.iter().filter(|v| !own(v)).map(|v| &v.3);
+                    match guess(g.map(String::as_str), emb.map(|v| &v.3[..]), others, &m) {
+                        Some(n) => (State::Guessed, Some(n.to_string())),
+                        None => (State::Unknown, None),
+                    }
+                }
             };
-            let name = line_name
-                .clone()
-                .or_else(|| line.speaker.as_ref().and_then(|l| names.get(l)).cloned());
             Named {
                 line,
                 name,
                 line_name,
-                taught,
+                state,
             }
         })
         .collect())
 }
 
-/// Who attended: the confirmed names in label order, then the line names in order, once each.
+/// Who attended: the confirmed names in label order, then the names lines show in order, once
+/// each.
 pub(crate) fn attendees(names: &Names, lines: &[Named]) -> Vec<String> {
     let mut labels: Vec<&String> = names.keys().collect();
     labels.sort_by_key(|l| crate::vault::label_order(l));
@@ -366,7 +453,7 @@ pub(crate) fn attendees(names: &Names, lines: &[Named]) -> Vec<String> {
     for n in labels
         .into_iter()
         .map(|l| &names[l])
-        .chain(lines.iter().filter_map(|l| l.line_name.as_ref()))
+        .chain(lines.iter().filter_map(|l| l.name.as_ref()))
     {
         if n != "?" && !out.contains(n) {
             out.push(n.clone());
@@ -729,11 +816,11 @@ mod tests {
         }
     }
 
-    fn shown(db: &Connection) -> Vec<(Option<String>, bool)> {
+    fn shown(db: &Connection) -> Vec<(Option<String>, State)> {
         super::named(db, "r1")
             .unwrap()
             .into_iter()
-            .map(|l| (l.name, l.taught))
+            .map(|l| (l.name, l.state))
             .collect()
     }
 
@@ -757,9 +844,10 @@ mod tests {
         name_line(&db, "r1", "room", 5_000, 6_000, Some("?")).unwrap();
         name_line(&db, "r1", "remote", 0, 2_000, Some("Jan")).unwrap();
         let s = |n: Option<&str>, t| (n.map(String::from), t);
+        use State::*;
         assert_eq!(
             shown(&db),
-            [s(Some("Max"), false), s(Some("Eva"), true), s(Some("?"), false)]
+            [s(Some("Max"), Guessed), s(Some("Eva"), Taught), s(None, Unknown)]
         );
         // Derived anew: cut differently, the names go by midpoint.
         lines(
@@ -772,12 +860,15 @@ mod tests {
         );
         assert_eq!(
             shown(&db),
-            [s(Some("Max"), false), s(Some("Eva"), true), s(Some("?"), false)]
+            [s(Some("Max"), Guessed), s(Some("Eva"), Taught), s(None, Unknown)]
         );
         // Naming the new line replaces the name it overlaps; clearing leaves the label's.
         name_line(&db, "r1", "room", 2_500, 4_800, Some("Bo")).unwrap();
         name_line(&db, "r1", "room", 4_800, 6_200, None).unwrap();
-        assert_eq!(shown(&db), [s(Some("Max"), false), s(Some("Bo"), true), s(None, false)]);
+        assert_eq!(
+            shown(&db),
+            [s(Some("Max"), Guessed), s(Some("Bo"), Taught), s(None, Unknown)]
+        );
         let n: i64 = db
             .query_row("SELECT COUNT(*) FROM line_names", [], |r| r.get(0))
             .unwrap();
@@ -845,8 +936,126 @@ mod tests {
             Some("?")
         );
         let lines = super::named(&db, "r1").unwrap();
-        assert_eq!(lines[0].name.as_deref(), Some("?"));
+        assert_eq!((lines[0].name.as_deref(), lines[0].state), (None, State::Unknown));
         assert!(attendees(&confirmed(&db, "r1").unwrap(), &lines).is_empty());
+    }
+
+    const L: Matching = Matching {
+        threshold: 0.55,
+        margin: 0.1,
+    };
+
+    #[test]
+    fn guesses_from_the_label_and_the_line_s_own_voice() {
+        let voices = [("Max".to_string(), vec![1.0, 0.0]), ("Eva".to_string(), vec![0.0, 1.0])];
+        let max = Some(&[0.9, 0.1][..]);
+        let unclear = Some(&[0.7, 0.7][..]);
+        assert_eq!(guess(None, max, &voices, &L), Some("Max"), "own alone");
+        assert_eq!(guess(Some("Max"), max, &voices, &L), Some("Max"), "both agree");
+        assert_eq!(guess(Some("Eva"), max, &voices, &L), None, "they disagree");
+        assert_eq!(guess(Some("Eva"), unclear, &voices, &L), Some("Eva"), "own not sure");
+        assert_eq!(guess(Some("Eva"), None, &voices, &L), Some("Eva"), "no line voice");
+        assert_eq!(guess(None, unclear, &voices, &L), None);
+        assert_eq!(guess(None, None, &voices, &L), None);
+        assert_eq!(guess(Some("Jan"), max, &[], &L), Some("Jan"), "no voices");
+    }
+
+    fn line_voice(db: &Connection, s: i64, e: i64, v: &[f32]) {
+        db.execute(
+            "INSERT INTO line_voices (recording, track, start_ms, end_ms, embedding) VALUES ('r1', 'room', ?1, ?2, ?3)",
+            params![s, e, bytes(v)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_line_is_taught_guessed_or_unknown() {
+        use State::*;
+        let db = db();
+        voice(&db, "Max", "room/S1", &[1.0, 0.0, 0.0]);
+        voice(&db, "Eva", "room/S2", &[0.0, 1.0, 0.0]);
+        db.execute(
+            r#"UPDATE recordings SET speakers = '{"room/S1":"Max","room/S3":"?"}', suggested = '{"room/S2":"Eva"}' WHERE id = 'r1'"#,
+            [],
+        )
+        .unwrap();
+        lines(
+            &db,
+            &[
+                (0, 1_000, "room/S1"),     // Max's label, own voice Max
+                (1_000, 2_000, "room/S1"), // Max's label, own voice Eva: check it
+                (2_000, 3_000, "room/S1"), // own voice unclear: the label's
+                (3_000, 4_000, "room/S2"), // suggested Eva, no line voice
+                (4_000, 5_000, "room/S3"), // answered ?, own voice Eva
+                (5_000, 6_000, "room/S3"), // answered ?, no line voice
+                (6_000, 7_000, "room/S4"), // unnamed, own voice Eva
+                (7_000, 8_000, "room/S1"), // named Bo on its own, own voice Eva
+                (8_000, 9_000, "room/S1"), // named ?, own voice Max
+            ],
+        );
+        for (s, v) in [
+            (0, [0.9, 0.1, 0.0]),
+            (1_000, [0.1, 0.9, 0.0]),
+            (2_000, [0.6, 0.6, 0.5]),
+            (4_000, [0.0, 1.0, 0.0]),
+            (6_000, [0.0, 1.0, 0.0]),
+            (7_000, [0.0, 1.0, 0.0]),
+            (8_000, [1.0, 0.0, 0.0]),
+        ] {
+            line_voice(&db, s, s + 1_000, &v);
+        }
+        db.execute_batch(
+            "INSERT INTO line_names (recording, track, start_ms, end_ms, name) VALUES
+               ('r1', 'room', 7000, 8000, 'Bo'), ('r1', 'room', 8000, 9000, '?');",
+        )
+        .unwrap();
+        let s = |n: Option<&str>, t| (n.map(String::from), t);
+        assert_eq!(
+            shown(&db),
+            [
+                s(Some("Max"), Guessed),
+                s(None, Unknown),
+                s(Some("Max"), Guessed),
+                s(Some("Eva"), Guessed),
+                s(Some("Eva"), Guessed),
+                s(None, Unknown),
+                s(Some("Eva"), Guessed),
+                s(Some("Bo"), Taught),
+                s(None, Unknown),
+            ]
+        );
+        // Heard before its label was confirmed: taught, whatever its own voice says.
+        db.execute(
+            "INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms)
+             VALUES ('Max', ?1, 'r1', 'room/S1', 1000, 2000)",
+            [bytes(&[0.0, 0.0, 1.0])],
+        )
+        .unwrap();
+        assert_eq!(shown(&db)[1], s(Some("Max"), Taught));
+        // Guessed anew on every read: a voice learned later that the line's own voice matches
+        // better than its label's name makes it one to check.
+        voice(&db, "Jan", "remote/S9", &[0.6, 0.6, 0.5]);
+        assert_eq!(shown(&db)[2], s(None, Unknown));
+        // Derived anew, cut differently: line voices go by midpoint.
+        lines(&db, &[(0, 1_200, "room/S1"), (1_200, 1_600, "room/S2")]);
+        assert_eq!(shown(&db), [s(Some("Max"), Guessed), s(Some("Max"), Taught)]);
+    }
+
+    #[test]
+    fn teaching_a_line_learns_its_line_voice_over_the_turns() {
+        let db = db();
+        cluster(&db, "room/S1", &[0.6, 0.8]);
+        turns(&db, &[(0, 8_000, &[1.0, 0.0])]);
+        line_voice(&db, 0, 4_000, &[0.0, 1.0]);
+        name_line(&db, "r1", "room", 0, 4_000, Some("Eva")).unwrap();
+        name_line(&db, "r1", "room", 4_000, 8_000, Some("Jan")).unwrap();
+        confirm(&db, "r1", heard("Max", &[(0, 4_000, true), (4_000, 8_000, true)])).unwrap();
+        let got: Vec<Vec<f32>> = learned(&db).into_iter().map(|v| v.2).collect();
+        assert_eq!(got, [vec![0.0, 1.0], vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 0.0]]);
+        // Its turns expired, a line voice still teaches.
+        db.execute("DELETE FROM turns", []).unwrap();
+        assert!(teachable(&db, "r1").unwrap());
+        assert_eq!(name_line(&db, "r1", "room", 0, 4_000, Some("Bo")).unwrap(), 1);
     }
 
     fn learned_count(db: &Connection) -> i64 {
