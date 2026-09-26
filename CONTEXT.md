@@ -37,8 +37,9 @@ Domain terms used across the code and docs.
 - **Voice**: an embedding learned for a confirmed name: a cluster's core, or a snippet of
   it that was heard. A cluster can teach several; a person confirmed in five recordings
   has at least five.
-- **Suggestion**: a name proposed for a cluster by matching it against the voices of other
-  recordings; only when one name clearly wins, else the cluster stays unknown. Part of
+- **Suggestion**: a name proposed for a cluster by matching it against every voice except the
+  ones it taught itself (so other recordings, and other clusters and named lines of its own);
+  recomputed whenever a voice is learned; only when one name clearly wins, else the cluster stays unknown. Part of
   name storage, not of assembly. Never learned or written to the transcript.
 - **Confirmed name**: a name typed, or a suggestion accepted. Only confirmed names teach
   voices and appear in the transcript. A label can also be answered `?` (several people,

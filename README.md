@@ -145,8 +145,9 @@ when the line is renamed and dropped when it is cleared or set to `?`; once the
 turns have expired the name is kept but nothing is learned. A label answered
 `?` teaches nothing and is never suggested a name.
 
-After diarizing a new recording, each cluster's core is matched against the
-voices of other recordings (cosine, per name its most similar voice), and the
+After diarizing a new recording, and in every recording whenever a voice is
+learned, each cluster's core is matched against all voices except the ones it
+taught itself (cosine, per name its most similar voice), and the
 best name is **suggested** only when it is at least `MICTAP_MATCH_THRESHOLD`
 (0.75) alike and more than `MICTAP_MATCH_MARGIN` (0.05) ahead of every other
 name. Otherwise the cluster stays unknown, as a guest should. No name is

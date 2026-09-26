@@ -70,7 +70,11 @@ impl Matching {
 
 /// The name whose most similar voice is at least `threshold` alike to `emb` and more than
 /// `margin` ahead of every other name's, with that similarity.
-fn best<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], m: &Matching) -> Option<(&'a str, f32)> {
+fn best<'a>(
+    emb: &[f32],
+    voices: impl IntoIterator<Item = &'a (String, Vec<f32>)>,
+    m: &Matching,
+) -> Option<(&'a str, f32)> {
     let mut by_name: HashMap<&str, f32> = HashMap::new();
     for (name, v) in voices {
         let c = cosine(emb, v);
@@ -86,7 +90,8 @@ fn best<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], m: &Matching) -> Opti
     (first >= m.threshold && first - second > m.margin).then_some((name, first))
 }
 
-/// Suggests names for the unconfirmed clusters of `id` from the voices of other recordings.
+/// Suggests names for the unconfirmed clusters of `id` from the voices of other recordings, and
+/// of its other clusters and named lines.
 /// A mixed cluster, or one without a clear match, stays unknown, and no name is suggested twice within a
 /// track or for a track where it is already confirmed; the most similar cluster gets it.
 pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
@@ -95,15 +100,25 @@ pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
         .prepare("SELECT label, COALESCE(core, embedding) FROM clusters WHERE recording = ?1")?
         .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
         .collect::<rusqlite::Result<_>>()?;
-    let voices: Vec<(String, Vec<f32>)> = db
-        .prepare("SELECT name, embedding FROM voices WHERE recording != ?1")?
-        .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
+    // Every voice but the ones this very cluster taught: voices from its own recording (other
+    // clusters, named lines) count too, so naming one speaker helps guess the others.
+    let voices: Vec<(String, String, (String, Vec<f32>))> = db
+        .prepare("SELECT recording, label, name, embedding FROM voices")?
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, (r.get(2)?, floats(&r.get::<_, Vec<u8>>(3)?))))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     let mixed = mixed_labels(db, id)?;
     let mut candidates: Vec<(f32, &str, &str)> = clusters
         .iter()
         .filter(|(label, _)| !confirmed.contains_key(label) && !mixed.contains(label))
-        .filter_map(|(label, emb)| best(emb, &voices, m).map(|(name, c)| (c, label.as_str(), name)))
+        .filter_map(|(label, emb)| {
+            let others = voices
+                .iter()
+                .filter(|(r, l, _)| !(r == id && l == label))
+                .map(|(_, _, v)| v);
+            best(emb, others, m).map(|(name, c)| (c, label.as_str(), name))
+        })
         .collect();
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut taken: HashSet<(&str, &str)> = confirmed.iter().map(|(l, n)| (track(l), n.as_str())).collect();
@@ -484,6 +499,24 @@ mod tests {
         assert_eq!(best(&[0.0, 0.0, 1.0], &voices, &M), None, "alike to no one");
         assert_eq!(best(&[1.0, 0.0], &voices, &M), None, "other model's dimension");
         assert_eq!(best(&[1.0, 0.0, 0.0], &[], &M), None);
+    }
+
+    #[test]
+    fn suggests_from_the_same_recording_but_not_from_the_cluster_itself() {
+        let db = db();
+        cluster(&db, "room/S1", &[1.0, 0.0, 0.0]);
+        cluster(&db, "room/S2", &[0.0, 1.0, 0.0]);
+        for (name, label, v) in [("Max", "room/S1", [0.0, 1.0, 0.0]), ("Eva", "room/S2", [1.0, 0.0, 0.0])] {
+            db.execute(
+                "INSERT INTO voices (name, embedding, recording, label) VALUES (?1, ?2, 'r1', ?3)",
+                params![name, bytes(&v), label],
+            )
+            .unwrap();
+        }
+        suggest(&db, "r1", &M).unwrap();
+        let got = speakers(&db, "r1", ["room/S1", "room/S2"]).unwrap();
+        assert_eq!(got["room/S1"].suggested.as_deref(), Some("Eva"));
+        assert_eq!(got["room/S2"].suggested.as_deref(), Some("Max"));
     }
 
     #[test]
