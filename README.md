@@ -130,24 +130,33 @@ link: http://homeserver:8765/#01J8X...
 
 ## Learning names
 
-A name you type, or a suggestion you confirm, stores a voice embedding for it:
-the cluster's **core**, the mean of its turns most alike to its mean covering
-70% of its speech, so stray turns and folded fragments are left out. After diarizing a new recording, each cluster is matched against
-the stored voices of other recordings (cosine between its core and each voice,
-per name its most similar voice), and the best name is **suggested** only when it is at least
-`MICTAP_MATCH_THRESHOLD` (0.75) alike and more than `MICTAP_MATCH_MARGIN`
-(0.05) ahead of every other name. Otherwise the cluster stays unknown, as a
-guest should. No name is suggested twice within a track, nor where it is
-already confirmed for that track. Suggestions are never learned and never
-reach the vault until confirmed; a name you set is never overwritten. Accuracy
-is modest (see `local/learning-names.md`).
+A name you type, or a suggestion you confirm, stores **voices**: embeddings of
+that speaker to recognize them by later. Lines you listened to before
+confirming are the evidence: each one you kept as only that speaker becomes a
+voice of its own (from the turns under it), and one you marked wrong teaches
+nothing; if you marked all of them wrong, no voice is stored. Without heard
+lines, or once their turns have expired, the voice is the cluster's **core**:
+the mean of its turns most alike to its mean covering 70% of its speech, so
+stray turns and folded fragments are left out. Listening to a confirmed
+speaker again and saving replaces its voices.
+
+After diarizing a new recording, each cluster's core is matched against the
+voices of other recordings (cosine, per name its most similar voice), and the
+best name is **suggested** only when it is at least `MICTAP_MATCH_THRESHOLD`
+(0.75) alike and more than `MICTAP_MATCH_MARGIN` (0.05) ahead of every other
+name. Otherwise the cluster stays unknown, as a guest should. No name is
+suggested twice within a track, nor where it is already confirmed for that
+track. Suggestions are never learned and never reach the vault until
+confirmed; a name you set is never overwritten. Accuracy is modest (see
+`local/learning-names.md`).
 
 A cluster can hold more than one voice: two people sherpa lumped together, or
 a far meeting room where several people share one mic. Assembly splits each
 cluster's turns into its two most different halves; when both carry at least
 20% of the speech and are less alike than `MICTAP_MERGE_THRESHOLD`, the
 cluster is **mixed**. A mixed cluster gets no suggestion, and naming it keeps
-the name but learns no voice, so a room's sound never becomes someone's voice.
+the name but learns no voice from its core, only from lines you heard and kept,
+so a room's sound never becomes someone's voice.
 
 ## Audio
 
@@ -211,9 +220,12 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
 - `GET /recordings/{id}`: one recording, its `lines` and `speakers`
   (per label its confirmed `name` or else its `suggested` one); `editable`
   once names can be set.
-- `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` confirms speaker
-  names (`""` leaves a label unnamed and rejects its suggestion), learns
-  their voices and rewrites the transcript. 409 until the recording is done.
+- `PUT /recordings/{id}/speakers`: confirms speaker names, learns their
+  voices and rewrites the transcript. 409 until the recording is done. Body,
+  per label: `{"room/S1": {"name": "Max", "heard": [{"start_ms": 1000,
+  "end_ms": 4000, "correct": true}]}}`. `name: ""` leaves the label unnamed
+  and rejects its suggestion; `heard` (optional) lists the lines listened to,
+  `correct` when only that speaker is in it (see Learning names).
 - `GET /recordings/{id}/outputs`: its model outputs per track (whisper
   segments, sherpa turns with their embeddings), until they expire.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409

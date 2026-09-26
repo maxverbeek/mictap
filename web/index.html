@@ -37,6 +37,8 @@
   .who { flex: 0 0 7rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .track { font-weight: normal; font-size: .8em; }
   .suggested { font-style: italic; font-weight: normal; }
+  .picks { white-space: nowrap; }
+  .pick { padding: .1rem .35rem; font-size: .8em; }
   .mixed { font-size: .75em; color: #b45309; border: 1px solid currentColor; border-radius: 3px; padding: 0 .25em; cursor: help; }
   audio { position: fixed; bottom: 0; left: 0; width: 100%; }
   #msg { margin-left: .6rem; }
@@ -140,6 +142,16 @@ async function show(id) {
   };
 
   const inputs = {};
+  // Per label, its sample lines; a sample's checkbox shows once it has been played.
+  const picks = Object.fromEntries(labels.map(l => [l, samples(l).map(seg => ({
+    seg,
+    box: h("input", { type: "checkbox", checked: true, hidden: true, disabled: !r.editable,
+      title: "Checked: this line is only this speaker and teaches their voice. Unchecked: ignored." }),
+  }))]));
+  const hear = (l, ps) => { ps.forEach(p => { p.box.hidden = false; }); play(...ps.map(p => p.seg)); };
+  const heard = l => picks[l].filter(p => !p.box.hidden)
+    .map(p => ({ start_ms: p.seg.start_ms, end_ms: p.seg.end_ms, correct: p.box.checked }));
+  const naming = (l, name) => heard(l).length ? { name, heard: heard(l) } : { name };
   const msg = h("span", { id: "msg", className: "muted" });
   const save = async names => {
     if (!Object.keys(names).length) return;
@@ -155,14 +167,19 @@ async function show(id) {
     labels.map(l => {
       const { name: confirmed, suggested } = sp(l);
       return [
-        h("button", { type: "button", disabled: !audio, title: "Play three of their lines", onclick: () => play(...samples(l)) }, "▶"),
+        h("div", { className: "picks" },
+          h("button", { type: "button", disabled: !audio, title: "Play three of their lines", onclick: () => hear(l, picks[l]) }, "▶"),
+          picks[l].map((p, i) => [
+            " ", h("button", { type: "button", className: "pick", disabled: !audio, title: `Play line ${i + 1}`, onclick: () => hear(l, [p]) }, String(i + 1)),
+            p.box,
+          ])),
         h("span", {}, short(l), " ", h("span", { className: "track muted" }, l.split("/")[0]),
           sp(l).mixed ? [" ", h("span", { className: "mixed", title: "These lines sound like more than one voice (two people, or a room). A name is kept, but no voice is learned from it." }, "mixed?")] : null),
         h("div", {},
           inputs[l] = h("input", { value: confirmed ?? "", placeholder: suggested ? `${suggested}?` : "name", disabled: !r.editable }),
           suggested && r.editable ? [
-            " ", h("button", { type: "button", title: `Confirm ${suggested}`, onclick: () => save({ [l]: suggested }) }, "✓"),
-            " ", h("button", { type: "button", title: "Not them", onclick: () => save({ [l]: "" }) }, "✗"),
+            " ", h("button", { type: "button", title: `Confirm ${suggested}`, onclick: () => save({ [l]: naming(l, suggested) }) }, "✓"),
+            " ", h("button", { type: "button", title: "Not them", onclick: () => save({ [l]: { name: "" } }) }, "✗"),
           ] : null),
       ];
     }),
@@ -172,7 +189,10 @@ async function show(id) {
   form.onsubmit = e => {
     e.preventDefault();
     const names = {};
-    for (const l of labels) if (inputs[l].value.trim() !== (sp(l).name ?? "")) names[l] = inputs[l].value.trim();
+    for (const l of labels) {
+      const v = inputs[l].value.trim();
+      if (v !== (sp(l).name ?? "") || (v && heard(l).length)) names[l] = naming(l, v);
+    }
     save(names);
   };
 

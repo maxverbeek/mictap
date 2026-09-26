@@ -22,7 +22,10 @@ Domain terms used across the code and docs.
   fragments and merging alike ones. Its mean embedding is kept.
 - **Mixed cluster**: a cluster whose turns split into two halves that both carry real
   speech and are less alike than clusters assembly would merge: two people, or a room
-  sharing one mic. Gets no suggestion and teaches no voice.
+  sharing one mic. Gets no suggestion, and its core teaches no voice (heard snippets
+  still can).
+- **Heard snippet**: a line of a label that was listened to before confirming its name,
+  kept (only that speaker) or marked wrong. Each kept one becomes a voice.
 - **Label**: a cluster's name within its recording, `room/S1`, numbered by first
   appearance.
 - **Line**: a segment, or part of one, attributed to one label; what the transcript shows.

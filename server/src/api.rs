@@ -22,8 +22,6 @@ use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::names::Names;
-
 pub struct App {
     dir: PathBuf,
     // ponytail: one lock for the db and all file appends; per-recording locks if uploads contend.
@@ -341,12 +339,12 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
     })))
 }
 
-/// Confirms speaker names (`label -> name`; `""` leaves a label unnamed, rejecting its
-/// suggestion), learns their voices and rewrites the transcript.
+/// Confirms speaker names (`label -> {name, heard}`, see `names::confirm`), learns their
+/// voices and rewrites the transcript.
 async fn name_speakers(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
-    Json(names): Json<Names>,
+    Json(names): Json<std::collections::BTreeMap<String, crate::names::Naming>>,
 ) -> Result<StatusCode> {
     check_name(&id)?;
     if let Some(l) = names.keys().find(|l| !crate::names::is_label(l)) {
@@ -849,7 +847,9 @@ mod tests {
                    INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES
                      ('r1', 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 'room', 1000, 2000, 'Ja.', 'room/S2');
                    INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'01'), ('r1', 'room/S2', x'02');
-                   INSERT INTO voices (name, embedding, recording, label) VALUES ('Eva', x'02', 'r1', 'room/S2');"#,
+                   INSERT INTO voices (name, embedding, recording, label) VALUES ('Eva', x'02', 'r1', 'room/S2');
+                   INSERT INTO turns (recording, track, start_ms, end_ms, speaker, embedding)
+                     VALUES ('r1', 'room', 0, 1000, 0, x'0000803f');"#,
             )
             .unwrap();
         let put = |id: &str, body: &str| {
@@ -862,13 +862,13 @@ mod tests {
             let res = router(app.clone()).oneshot(req);
             async move { res.await.unwrap().status() }
         };
-        assert_eq!(put("r1", r#"{"bad":"x"}"#).await, StatusCode::BAD_REQUEST);
-        assert_eq!(put("r2", r#"{"room/S1":"Max"}"#).await, StatusCode::CONFLICT);
-        assert_eq!(put("nope", r#"{"room/S1":"Max"}"#).await, StatusCode::NOT_FOUND);
-        assert_eq!(
-            put("r1", r#"{"room/S1":" Max ","room/S2":""}"#).await,
-            StatusCode::NO_CONTENT
-        );
+        let max = r#"{"room/S1":{"name":"Max"}}"#;
+        assert_eq!(put("r1", r#"{"bad":{"name":"x"}}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(put("r2", max).await, StatusCode::CONFLICT);
+        assert_eq!(put("nope", max).await, StatusCode::NOT_FOUND);
+        let heard = r#"{"room/S1":{"name":" Max ","heard":[{"start_ms":0,"end_ms":1000,"correct":true}]},
+                        "room/S2":{"name":""}}"#;
+        assert_eq!(put("r1", heard).await, StatusCode::NO_CONTENT);
 
         let db = app.db.lock().await;
         let one = |sql: &str| -> String { db.query_row(sql, [], |r| r.get(0)).unwrap() };
@@ -877,8 +877,9 @@ mod tests {
             r#"{"room/S1":"Max"}"#
         );
         assert_eq!(
-            one("SELECT group_concat(name || ':' || hex(embedding)) FROM voices"),
-            "Max:01"
+            one("SELECT group_concat(name || ':' || hex(embedding) || ':' || start_ms || '-' || end_ms) FROM voices"),
+            "Max:0000803F:0-1000",
+            "one voice per correct heard snippet"
         );
         let note = std::fs::read_dir(&app.vault).unwrap().next().unwrap().unwrap().path();
         let text = std::fs::read_to_string(note).unwrap();
