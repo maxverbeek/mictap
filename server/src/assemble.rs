@@ -1,20 +1,224 @@
-//! Interpreting model outputs: folding sherpa's clusters into speakers, splitting whisper
-//! segments into lines, and dropping echoes across tracks.
-use std::collections::{HashMap, HashSet};
+//! Assembly: derives a recording's lines and clusters from its model outputs (see
+//! CONTEXT.md). `assemble` is pure; `derive` loads the outputs and stores what it returns.
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 
 const NEAR_MS: i64 = 1_000;
 const SLICE_MS: i64 = 250;
 const DROP_CLUSTER: f64 = 0.7;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+/// What the models produced for a recording, per track (`room`, `remote`).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Outputs {
+    pub tracks: BTreeMap<String, Track>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Track {
+    /// whisper's, within the recording.
+    pub segments: Vec<Segment>,
+    /// sherpa's, within the recording; empty until diarized.
+    pub turns: Vec<Turn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Segment {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Turn {
+    pub start_ms: i64,
+    pub end_ms: i64,
+    /// sherpa's cluster, numbered by first appearance; during assembly, the speaker it was
+    /// folded or merged into.
+    pub speaker: usize,
+    /// CAM++'s, normalized; None when the turn is too short.
+    pub embedding: Option<Vec<f32>>,
+}
+
+/// A segment, or part of one, attributed to a label (`room/S1`) once diarized.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Line {
     pub track: String,
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
     pub speaker: Option<String>,
+}
+
+pub struct Tuning {
+    /// Clusters whose means are at least this alike are merged.
+    pub merge_threshold: f32,
+    /// A room line at least this alike (token Jaccard) to nearby remote speech is an echo.
+    pub echo_jaccard: f64,
+}
+
+impl Tuning {
+    /// `MICTAP_MERGE_THRESHOLD` (default 0.75) and `MICTAP_ECHO_JACCARD` (default 0.6).
+    pub fn from_env() -> Self {
+        let var = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok());
+        Self {
+            merge_threshold: var("MICTAP_MERGE_THRESHOLD").unwrap_or(0.75) as f32,
+            echo_jaccard: var("MICTAP_ECHO_JACCARD").unwrap_or(0.6),
+        }
+    }
+}
+
+pub struct Assembled {
+    /// Chronological, echoes dropped.
+    pub lines: Vec<Line>,
+    /// Each label's mean embedding, for the labels that have lines.
+    pub clusters: Vec<(String, Vec<f32>)>,
+}
+
+/// Per track, folds and merges sherpa's clusters into speakers and splits each segment into
+/// lines where the speaker changes (segments of an undiarized track stay unlabeled); then
+/// merges the tracks and drops room echoes of remote speech.
+pub fn assemble(outputs: &Outputs, tuning: &Tuning) -> Assembled {
+    let mut lines = vec![];
+    let mut clusters = vec![];
+    for (track, t) in &outputs.tracks {
+        let mut turns = t.turns.clone();
+        cluster(&mut turns, tuning.merge_threshold);
+        let label = |k: usize| format!("{track}/S{}", k + 1);
+        for s in &t.segments {
+            let parts = split(&turns, s.start_ms, s.end_ms, &s.text);
+            if parts.is_empty() {
+                lines.push(Line {
+                    track: track.clone(),
+                    start_ms: s.start_ms,
+                    end_ms: s.end_ms,
+                    text: s.text.clone(),
+                    speaker: None,
+                });
+            }
+            lines.extend(parts.into_iter().map(|(start_ms, end_ms, text, k)| Line {
+                track: track.clone(),
+                start_ms,
+                end_ms,
+                text,
+                speaker: Some(label(k)),
+            }));
+        }
+        clusters.extend(
+            means(&turns)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(k, v)| Some((label(k), v?))),
+        );
+    }
+    let lines = drop_echoes(lines, tuning.echo_jaccard);
+    clusters.retain(|(l, _)| lines.iter().any(|x| x.speaker.as_ref() == Some(l)));
+    Assembled { lines, clusters }
+}
+
+/// The model outputs stored for `id`.
+pub fn outputs(db: &Connection, id: &str) -> rusqlite::Result<Outputs> {
+    let mut out = Outputs::default();
+    let mut st = db.prepare("SELECT track, start_ms, end_ms, text FROM segments WHERE recording = ?1 ORDER BY id")?;
+    for r in st.query_map([id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Segment {
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                text: r.get(3)?,
+            },
+        ))
+    })? {
+        let (track, s) = r?;
+        out.tracks.entry(track).or_default().segments.push(s);
+    }
+    let mut st =
+        db.prepare("SELECT track, start_ms, end_ms, speaker, embedding FROM turns WHERE recording = ?1 ORDER BY id")?;
+    for r in st.query_map([id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Turn {
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                speaker: r.get(3)?,
+                embedding: r.get::<_, Option<Vec<u8>>>(4)?.map(|b| floats(&b)),
+            },
+        ))
+    })? {
+        let (track, t) = r?;
+        out.tracks.entry(track).or_default().turns.push(t);
+    }
+    Ok(out)
+}
+
+/// Replaces the stored turns of `id`'s `track`.
+pub fn store_turns(db: &Connection, id: &str, track: &str, turns: &[Turn]) -> rusqlite::Result<()> {
+    db.execute(
+        "DELETE FROM turns WHERE recording = ?1 AND track = ?2",
+        params![id, track],
+    )?;
+    for t in turns {
+        db.execute(
+            "INSERT INTO turns (recording, track, start_ms, end_ms, speaker, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                id,
+                track,
+                t.start_ms,
+                t.end_ms,
+                t.speaker,
+                t.embedding.as_deref().map(bytes)
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Assembles `id` from its stored outputs and replaces its lines and clusters. Run it in a
+/// transaction with the change to the outputs.
+pub fn derive(db: &Connection, id: &str) -> rusqlite::Result<()> {
+    let a = assemble(&outputs(db, id)?, &Tuning::from_env());
+    db.execute("DELETE FROM lines WHERE recording = ?1", [id])?;
+    for l in &a.lines {
+        db.execute(
+            "INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, l.track, l.start_ms, l.end_ms, l.text, l.speaker],
+        )?;
+    }
+    db.execute("DELETE FROM clusters WHERE recording = ?1", [id])?;
+    for (label, emb) in &a.clusters {
+        db.execute(
+            "INSERT INTO clusters (recording, label, embedding) VALUES (?1, ?2, ?3)",
+            params![id, label, bytes(emb)],
+        )?;
+    }
+    Ok(())
+}
+
+/// The derived lines of `id`, chronological.
+pub fn lines(db: &Connection, id: &str) -> rusqlite::Result<Vec<Line>> {
+    db.prepare("SELECT track, start_ms, end_ms, text, speaker FROM lines WHERE recording = ?1 ORDER BY id")?
+        .query_map([id], |r| {
+            Ok(Line {
+                track: r.get(0)?,
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                text: r.get(3)?,
+                speaker: r.get(4)?,
+            })
+        })?
+        .collect()
+}
+
+pub(crate) fn bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+pub(crate) fn floats(b: &[u8]) -> Vec<f32> {
+    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
 }
 
 fn words(text: &str) -> Vec<String> {
@@ -34,7 +238,7 @@ fn jaccard(a: &HashSet<&str>, b: &HashSet<&str>) -> f64 {
 }
 
 /// The words of `r` spoken within `[s, e]` +- `SLICE_MS`, spreading them evenly over its span.
-fn slice<'a>(r: &Segment, words: &'a [String], s: i64, e: i64) -> impl Iterator<Item = &'a str> {
+fn slice<'a>(r: &Line, words: &'a [String], s: i64, e: i64) -> impl Iterator<Item = &'a str> {
     let step = (r.end_ms - r.start_ms) as f64 / words.len().max(1) as f64;
     let (r0, s, e) = (r.start_ms as f64, (s - SLICE_MS) as f64, (e + SLICE_MS) as f64);
     words.iter().enumerate().filter_map(move |(i, w)| {
@@ -46,7 +250,7 @@ fn slice<'a>(r: &Segment, words: &'a [String], s: i64, e: i64) -> impl Iterator<
 /// Whether room segment `s` echoes the remote segments within `NEAR_MS` of it: token Jaccard
 /// at least `threshold` with one of them whole, or with the remote words spoken in its time
 /// span, since whisper splits the same speech differently on each track.
-fn is_echo(s: &Segment, remote: &[(&Segment, Vec<String>)], threshold: f64) -> bool {
+fn is_echo(s: &Line, remote: &[(&Line, Vec<String>)], threshold: f64) -> bool {
     let words = words(&s.text);
     let own: HashSet<&str> = words.iter().map(String::as_str).collect();
     let near: Vec<_> = remote
@@ -65,9 +269,9 @@ fn is_echo(s: &Segment, remote: &[(&Segment, Vec<String>)], threshold: f64) -> b
 
 /// Sorts `segs` chronologically and drops `room` echoes of `remote` speech (see `is_echo`),
 /// and every segment of a room cluster that lost more than 70% of its segments that way.
-pub fn drop_echoes(mut segs: Vec<Segment>, threshold: f64) -> Vec<Segment> {
+pub fn drop_echoes(mut segs: Vec<Line>, threshold: f64) -> Vec<Line> {
     segs.sort_by_key(|s| (s.start_ms, s.end_ms));
-    let remote: Vec<(&Segment, Vec<String>)> = segs
+    let remote: Vec<(&Line, Vec<String>)> = segs
         .iter()
         .filter(|s| s.track == "remote")
         .map(|s| (s, words(&s.text)))
@@ -94,37 +298,6 @@ pub fn drop_echoes(mut segs: Vec<Segment>, threshold: f64) -> Vec<Segment> {
         .filter(|(s, e)| !e && !s.speaker.as_ref().is_some_and(|k| dropped.contains(k)))
         .map(|(s, _)| s)
         .collect()
-}
-
-/// The recording's segments, merged with `MICTAP_ECHO_JACCARD` (default 0.6).
-pub fn merged(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Segment>> {
-    let threshold = std::env::var("MICTAP_ECHO_JACCARD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.6);
-    Ok(drop_echoes(load(conn, id)?, threshold))
-}
-
-fn load(conn: &Connection, id: &str) -> rusqlite::Result<Vec<Segment>> {
-    conn.prepare("SELECT track, start_ms, end_ms, text, speaker FROM segments WHERE recording = ?1")?
-        .query_map([id], |r| {
-            Ok(Segment {
-                track: r.get(0)?,
-                start_ms: r.get(1)?,
-                end_ms: r.get(2)?,
-                text: r.get(3)?,
-                speaker: r.get(4)?,
-            })
-        })?
-        .collect()
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) struct Turn {
-    pub start_ms: i64,
-    pub end_ms: i64,
-    /// Index in order of first appearance: 0 is `S1`.
-    pub speaker: usize,
 }
 
 /// The speaker with the most overlap with `[s, e)`, else the one of the nearest turn.
@@ -158,7 +331,7 @@ const SNAP_WORDS: usize = 2;
 /// its share of the segment overlaps most.
 // ponytail: words spread evenly over the segment, as drop_echoes does; whisper-cli's token
 // timestamps (-ojf) would place cuts better if they land mid-phrase.
-pub(crate) fn split(turns: &[Turn], s: i64, e: i64, text: &str) -> Vec<(i64, i64, String, usize)> {
+fn split(turns: &[Turn], s: i64, e: i64, text: &str) -> Vec<(i64, i64, String, usize)> {
     let Some(whole) = assign(turns, s, e) else {
         return vec![];
     };
@@ -213,11 +386,11 @@ pub(crate) fn normalize(v: &mut [f32]) {
 }
 
 /// Per speaker, the normalized mean of its turns' embeddings, weighted by turn length.
-pub(crate) fn means(turns: &[Turn], embs: &[Option<Vec<f32>>]) -> Vec<Option<Vec<f32>>> {
+fn means(turns: &[Turn]) -> Vec<Option<Vec<f32>>> {
     let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
     let mut sums: Vec<Option<Vec<f32>>> = vec![None; n];
-    for (t, v) in turns.iter().zip(embs) {
-        let Some(v) = v else { continue };
+    for t in turns {
+        let Some(v) = &t.embedding else { continue };
         let w = (t.end_ms - t.start_ms) as f32;
         match &mut sums[t.speaker] {
             Some(sum) => sum.iter_mut().zip(v).for_each(|(a, b)| *a += w * b),
@@ -235,7 +408,7 @@ const MIN_CLUSTER_MS: i64 = 10_000;
 /// S3; a 3-person meeting got 39). Folds the fragments into the most similar larger cluster,
 /// then merges the most similar pair while their means are at least `threshold` alike, and
 /// renumbers speakers by first appearance. Never splits a cluster.
-pub(crate) fn cluster(turns: &mut [Turn], embs: &[Option<Vec<f32>>], threshold: f32) {
+fn cluster(turns: &mut [Turn], threshold: f32) {
     let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
     let mut len = vec![0; n];
     for t in turns.iter() {
@@ -248,7 +421,7 @@ pub(crate) fn cluster(turns: &mut [Turn], embs: &[Option<Vec<f32>>], threshold: 
             .for_each(|t| t.speaker = to);
     };
 
-    let m = means(turns, embs);
+    let m = means(turns);
     let big: Vec<usize> = (0..n).filter(|&i| len[i] >= MIN_CLUSTER_MS && m[i].is_some()).collect();
     for small in (0..n).filter(|&i| len[i] < MIN_CLUSTER_MS) {
         let Some(v) = &m[small] else { continue };
@@ -263,7 +436,7 @@ pub(crate) fn cluster(turns: &mut [Turn], embs: &[Option<Vec<f32>>], threshold: 
     }
 
     loop {
-        let m = means(turns, embs);
+        let m = means(turns);
         let live: Vec<usize> = (0..m.len()).filter(|&i| m[i].is_some()).collect();
         let best = live
             .iter()
@@ -303,11 +476,17 @@ mod tests {
             start_ms,
             end_ms,
             speaker,
+            embedding: None,
         }
     }
 
-    fn s(track: &str, start_ms: i64, end_ms: i64, text: &str, speaker: &str) -> Segment {
-        Segment {
+    fn with(mut turns: Vec<Turn>, embs: impl IntoIterator<Item = Option<Vec<f32>>>) -> Vec<Turn> {
+        turns.iter_mut().zip(embs).for_each(|(t, e)| t.embedding = e);
+        turns
+    }
+
+    fn s(track: &str, start_ms: i64, end_ms: i64, text: &str, speaker: &str) -> Line {
+        Line {
             track: track.into(),
             start_ms,
             end_ms,
@@ -446,7 +625,7 @@ mod tests {
 
     #[test]
     fn folds_fragments_and_merges_alike_clusters() {
-        let mut turns = [
+        let turns = vec![
             t(0, 20_000, 0),
             t(20_000, 35_000, 1),
             t(35_000, 40_000, 2),
@@ -471,21 +650,138 @@ mod tests {
             // A fragment alike to nothing big still goes to the nearest.
             unit([0.0, 0.0, -1.0]),
         ];
-        cluster(&mut turns, &embs, 0.9);
+        let mut turns = with(turns, embs);
+        cluster(&mut turns, 0.9);
         let speakers: Vec<usize> = turns.iter().map(|t| t.speaker).collect();
         assert_eq!(speakers, [0, 0, 1, 1, 2, 0]);
 
-        let mut two = [t(0, 20_000, 0), t(20_000, 40_000, 1)];
-        cluster(&mut two, &[unit([1.0, 0.0, 0.0]), unit([0.6, 0.8, 0.0])], 0.7);
-        assert_eq!(two.map(|t| t.speaker), [0, 1], "0.6 < 0.7 stays apart");
+        let mut two = with(
+            vec![t(0, 20_000, 0), t(20_000, 40_000, 1)],
+            [unit([1.0, 0.0, 0.0]), unit([0.6, 0.8, 0.0])],
+        );
+        cluster(&mut two, 0.7);
+        assert_eq!(
+            two.iter().map(|t| t.speaker).collect::<Vec<_>>(),
+            [0, 1],
+            "0.6 < 0.7 stays apart"
+        );
     }
 
     #[test]
     fn weights_means_by_turn_length() {
         let turns = [t(0, 3_000, 0), t(3_000, 4_000, 0), t(4_000, 5_000, 2)];
-        let m = means(&turns, &[Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0]), None]);
+        let turns = with(turns.into(), [Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0]), None]);
+        let m = means(&turns);
         let s = m[0].as_ref().unwrap();
         assert!((s[0] - 0.9487).abs() < 1e-3 && (s[1] - 0.3162).abs() < 1e-3, "{s:?}");
         assert_eq!(m[1..], [None, None]);
+    }
+
+    /// A track: its name, its segments as (start, end, text), its turns.
+    type Spec<'a> = (&'a str, Vec<(i64, i64, &'a str)>, Vec<Turn>);
+
+    fn fixture(tracks: &[Spec]) -> Outputs {
+        Outputs {
+            tracks: tracks
+                .iter()
+                .map(|(track, segs, turns)| {
+                    let segments = segs
+                        .iter()
+                        .map(|&(start_ms, end_ms, text)| Segment {
+                            start_ms,
+                            end_ms,
+                            text: text.into(),
+                        })
+                        .collect();
+                    (
+                        track.to_string(),
+                        Track {
+                            segments,
+                            turns: turns.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    const TUNING: Tuning = Tuning {
+        merge_threshold: 0.75,
+        echo_jaccard: 0.6,
+    };
+
+    #[test]
+    fn assembles_labeled_lines_and_the_clusters_that_kept_any() {
+        let e = |v: [f32; 2]| Some(v.to_vec());
+        let room = with(
+            vec![t(0, 12_000, 0), t(12_000, 24_000, 1), t(30_000, 42_000, 2)],
+            [e([1.0, 0.0]), e([0.0, 1.0]), e([-1.0, 0.0])],
+        );
+        let o = fixture(&[
+            (
+                "room",
+                vec![
+                    (1_000, 23_000, "een twee drie vier vijf zes zeven acht negen tien elf"),
+                    (31_000, 33_000, "precies wat hij zei"),
+                ],
+                room,
+            ),
+            ("remote", vec![(30_900, 33_100, "precies wat hij zei")], vec![]),
+        ]);
+        let a = assemble(&o, &TUNING);
+        let got: Vec<(i64, &str, Option<&str>)> = a
+            .lines
+            .iter()
+            .map(|l| (l.start_ms, l.text.as_str(), l.speaker.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (1_000, "een twee drie vier vijf zes", Some("room/S1")),
+                (13_000, "zeven acht negen tien elf", Some("room/S2")),
+                // Undiarized track: unlabeled. Its room echo is dropped.
+                (30_900, "precies wat hij zei", None),
+            ]
+        );
+        // S3, alike to nothing, only had the echo: no lines left, so no cluster.
+        let labels: Vec<&str> = a.clusters.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["room/S1", "room/S2"]);
+    }
+
+    #[test]
+    fn derives_from_stored_outputs() {
+        let db = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        crate::db::ensure_recording(&db, "r1", "laptop").unwrap();
+        db.execute_batch(
+            "INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms)
+               VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000);
+             INSERT INTO segments (recording, window, track, start_ms, end_ms, text)
+               VALUES ('r1', 1, 'room', 0, 8000, 'a b'), ('r1', 1, 'room', 9000, 9500, 'c');",
+        )
+        .unwrap();
+        derive(&db, "r1").unwrap();
+        let speakers = |db: &Connection| -> Vec<Option<String>> {
+            lines(db, "r1").unwrap().into_iter().map(|l| l.speaker).collect()
+        };
+        assert_eq!(speakers(&db), [None, None], "before diarization");
+
+        let turns = with(vec![t(0, 9_600, 0)], [Some(vec![0.6, 0.8])]);
+        store_turns(&db, "r1", "room", &turns).unwrap();
+        assert_eq!(super::outputs(&db, "r1").unwrap().tracks["room"].turns, turns);
+        derive(&db, "r1").unwrap();
+        assert_eq!(speakers(&db), [Some("room/S1".into()), Some("room/S1".into())]);
+        let emb: Vec<u8> = db
+            .query_row("SELECT embedding FROM clusters WHERE label = 'room/S1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let emb = floats(&emb);
+        assert!((emb[0] - 0.6).abs() < 1e-6 && (emb[1] - 0.8).abs() < 1e-6, "{emb:?}");
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM segments", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2,
+            "outputs untouched"
+        );
     }
 }

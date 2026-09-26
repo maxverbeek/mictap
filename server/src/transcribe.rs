@@ -175,6 +175,7 @@ pub async fn step(app: &App) -> Result<bool> {
         )?;
     }
     tx.execute("UPDATE windows SET done = 1 WHERE id = ?1", [wid])?;
+    crate::assemble::derive(&tx, &id)?;
     tx.execute(
         "UPDATE recordings SET lang = ?2, attempts = 0 WHERE id = ?1",
         params![id, lang],

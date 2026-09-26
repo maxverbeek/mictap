@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::{api::App, assemble::Segment};
+use crate::{api::App, assemble::Line};
 
 /// Base of the links in transcripts, as browsers reach this server.
 pub static URL: std::sync::LazyLock<String> =
@@ -48,7 +48,7 @@ fn display<'a>(label: &'a str, names: &'a Names) -> &'a str {
 }
 
 /// The transcript: a small frontmatter, then one line per segment.
-fn render(id: &str, date: &str, segs: &[Segment], names: &Names) -> String {
+fn render(id: &str, date: &str, segs: &[Line], names: &Names) -> String {
     let mut labels: Vec<&String> = names.keys().collect();
     labels.sort_by_key(|l| label_order(l));
     let mut attendees: Vec<String> = vec![];
@@ -136,7 +136,7 @@ pub(crate) fn progress(
     db: &Connection,
     id: &str,
     status: &str,
-    segs: &[Segment],
+    segs: &[Line],
 ) -> Result<(&'static str, i64, i64)> {
     // Where the earliest untranscribed window starts, else where the last transcribed one ends.
     let transcribed_ms: i64 = db.query_row(
@@ -191,7 +191,7 @@ pub async fn write(app: &App, id: &str) -> Result<()> {
         [id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let segs = crate::assemble::merged(&db, id)?;
+    let segs = crate::assemble::lines(&db, id)?;
     drop(db);
     let names: Names = speakers
         .map(|s| serde_json::from_str(&s))
@@ -212,8 +212,7 @@ pub async fn write(app: &App, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Writes the transcript of each newly diarized recording, which makes it done. Names
-/// matched at diarization are kept only for the labels that survived the echo dedupe.
+/// Writes the transcript of each newly diarized recording, which makes it done.
 pub async fn run(app: Arc<App>) {
     loop {
         let ids: rusqlite::Result<Vec<String>> = {
@@ -234,21 +233,6 @@ pub async fn run(app: Arc<App>) {
 }
 
 async fn done(app: &App, id: &str) -> Result<()> {
-    {
-        let db = app.db.lock().await;
-        let segs = crate::assemble::merged(&db, id)?;
-        let speakers: Option<String> =
-            db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
-        let mut names: Names = speakers
-            .map(|s| serde_json::from_str(&s))
-            .transpose()?
-            .unwrap_or_default();
-        names.retain(|l, _| segs.iter().any(|s| s.speaker.as_ref() == Some(l)));
-        db.execute(
-            "UPDATE recordings SET speakers = ?2 WHERE id = ?1",
-            params![id, serde_json::to_string(&names)?],
-        )?;
-    }
     write(app, id).await?;
     app.db
         .lock()
@@ -261,8 +245,8 @@ async fn done(app: &App, id: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn seg(track: &str, start_ms: i64, text: &str, speaker: Option<&str>) -> Segment {
-        Segment {
+    fn seg(track: &str, start_ms: i64, text: &str, speaker: Option<&str>) -> Line {
+        Line {
             track: track.into(),
             start_ms,
             end_ms: start_ms + 2_000,
@@ -336,13 +320,13 @@ mod tests {
             .await
             .execute_batch(
                 r#"INSERT INTO recordings (id, source, started_ms, status, speakers)
-                     VALUES ('r1', 'laptop', 1790431200000, 'diarized', '{"room/S1":"Max","room/S9":"Echo"}');
+                     VALUES ('r1', 'laptop', 1790431200000, 'diarized', '{"room/S1":"Max"}');
                    INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
                      (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000, 1),
                      (2, 'r1', '01-app-7.oga', 'remote', 60000, 0, 30000, 1);
-                   INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker) VALUES
-                     ('r1', 1, 'room', 1000, 3000, 'Goedemorgen allemaal.', 'room/S1'),
-                     ('r1', 2, 'remote', 61000, 64000, 'Hoi!', 'remote/S1');"#,
+                   INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES
+                     ('r1', 'room', 1000, 3000, 'Goedemorgen allemaal.', 'room/S1'),
+                     ('r1', 'remote', 61000, 64000, 'Hoi!', 'remote/S1');"#,
             )
             .unwrap();
         (tmp, app)
@@ -364,11 +348,7 @@ mod tests {
         );
         assert!(text.contains("**Max** (room, [00:00:01]"), "{text}");
         assert!(text.contains("**S1** (remote, [00:01:01]"), "{text}");
-        assert_eq!(
-            one(&app, "SELECT status || ' ' || speakers FROM recordings").await,
-            r#"done {"room/S1":"Max"}"#,
-            "labels not shown are dropped"
-        );
+        assert_eq!(one(&app, "SELECT status FROM recordings").await, "done");
 
         // Renamed in Obsidian: the next write lands there.
         std::fs::rename(app.vault.join(name), app.vault.join("Kickoff.md")).unwrap();
@@ -391,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn no_speech_no_note() {
         let (_tmp, app) = setup().await;
-        app.db.lock().await.execute("DELETE FROM segments", []).unwrap();
+        app.db.lock().await.execute("DELETE FROM lines", []).unwrap();
         done(&app, "r1").await.unwrap();
         assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
         assert_eq!(one(&app, "SELECT status FROM recordings").await, "done");

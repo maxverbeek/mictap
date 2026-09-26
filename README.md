@@ -86,6 +86,10 @@ meeting instead of after it.
   kept in SQLite. No pyannote Python: its models are gated.
 - Tracks are merged chronologically and each line is tagged `room` or
   `remote`.
+- The models' outputs (whisper's segments, sherpa's turns, one embedding per
+  turn) are stored as produced and never modified; lines, clusters and their
+  mean embeddings are derived from them (`server/src/assemble.rs`) after every
+  transcribed window and after diarization. See `CONTEXT.md` for the terms.
 - **Echo dedupe.** Remote voices coming out of a speaker get picked up by the
   mic. Mic segments that overlap remote speech within about 1 s and match
   its text are dropped. A room speaker cluster that is mostly echo (the
@@ -186,8 +190,8 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   progress. `progress` is `null` once done or failed, else
   `{"step": "unstarted"}`, `{"step": "transcribing", "percent": 42}` or
   `{"step": "diarizing", "since_ms": ...}` (`null` while queued).
-- `GET /recordings/{id}`: one recording, its lines (`segments`) and speaker
-  `names`; `editable` once names can be set.
+- `GET /recordings/{id}`: one recording, its `lines` and speaker `names`;
+  `editable` once names can be set.
 - `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` sets speaker names
   (`""` clears one) and rewrites the transcript. 409 until the recording is
   done.

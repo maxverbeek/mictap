@@ -12,7 +12,7 @@ use tokio::process::Command;
 
 use crate::{
     api::App,
-    assemble::{cluster, cosine, means, normalize, split, Turn},
+    assemble::{cosine, derive, floats, normalize, store_turns, Turn},
 };
 
 const RATE: usize = 16_000;
@@ -39,6 +39,7 @@ fn parse_turns(out: &str) -> Vec<Turn> {
                 start_ms,
                 end_ms,
                 speaker,
+                embedding: None,
             }
         })
         .collect()
@@ -194,22 +195,19 @@ impl Drop for Extractor {
     }
 }
 
-/// Each turn's normalized embedding, or None when it is too short.
-fn turn_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Vec<Option<Vec<f32>>>> {
+/// Sets each turn's normalized embedding, or None when it is too short.
+fn embed_turns(model: &str, samples: &[f32], turns: &mut [Turn]) -> Result<()> {
     let ex = Extractor::new(model)?;
     let at = |ms: i64| (ms.max(0) as usize * RATE / 1000).min(samples.len());
-    Ok(turns
-        .iter()
-        .map(|t| {
-            let mut v = ex.embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))])?;
-            normalize(&mut v);
-            Some(v)
-        })
-        .collect())
-}
-
-fn floats(b: &[u8]) -> Vec<f32> {
-    b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
+    for t in turns {
+        t.embedding = ex
+            .embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))])
+            .map(|mut v| {
+                normalize(&mut v);
+                v
+            });
+    }
+    Ok(())
 }
 
 /// The name of the voice most similar to `emb`, if at least `threshold` similar.
@@ -224,10 +222,10 @@ fn best_match<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], threshold: f32)
         .map(|(name, _)| name.as_str())
 }
 
-/// Diarizes the oldest windowed recording whose windows are all transcribed: labels its
-/// segments `track/S<n>`, stores each cluster's embedding and names the clusters that match a
-/// known voice. Returns false when there is none,
-/// or when it failed and will be retried after a pause.
+/// Diarizes the oldest windowed recording whose windows are all transcribed: stores each
+/// track's turns and their embeddings, derives its lines and pre-fills names from known
+/// voices. Returns false when there is none, or when it failed and will be retried after a
+/// pause.
 pub async fn step(app: &App) -> Result<bool> {
     let next: Option<String> = app
         .db
@@ -244,59 +242,57 @@ pub async fn step(app: &App) -> Result<bool> {
     let Some(id) = next else {
         return Ok(false);
     };
-    let db = || app.db.lock();
     *app.diarizing.lock().unwrap() = Some((id.clone(), crate::db::now_ms()));
-    let res = label(app, &id).await;
+    let res = turns(app, &id).await;
     *app.diarizing.lock().unwrap() = None;
-    match res {
-        Ok(()) => {
-            db().await.execute(
-                "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
-                [&id],
-            )?;
-            Ok(true)
-        }
+    let mut db = app.db.lock().await;
+    let tracks = match res {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("{id}: diarizing: {e:#}");
-            Ok(crate::db::fail(&*db().await, &id, &format!("diarizing: {e:#}"))?)
+            return Ok(crate::db::fail(&db, &id, &format!("diarizing: {e:#}"))?);
         }
+    };
+    let tx = db.transaction()?;
+    for (track, turns) in &tracks {
+        store_turns(&tx, &id, track, turns)?;
+    }
+    derive(&tx, &id)?;
+    lookup_names(&tx, &id, match_threshold()?)?;
+    tx.execute(
+        "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
+        [&id],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn match_threshold() -> Result<f32> {
+    match std::env::var("MICTAP_MATCH_THRESHOLD") {
+        Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD"),
+        Err(_) => Ok(0.75),
     }
 }
 
-async fn label(app: &App, id: &str) -> Result<()> {
+/// sherpa's turns of each track of `id`, with their embeddings.
+async fn turns(app: &App, id: &str) -> Result<BTreeMap<String, Vec<Turn>>> {
     let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
-    let threshold: f32 = match std::env::var("MICTAP_MATCH_THRESHOLD") {
-        Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD")?,
-        Err(_) => 0.75,
-    };
-    let merge_threshold: f32 = match std::env::var("MICTAP_MERGE_THRESHOLD") {
-        Ok(v) => v.parse().context("MICTAP_MERGE_THRESHOLD")?,
-        Err(_) => 0.75,
-    };
-    let mut tracks: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
-    let mut segments: BTreeMap<String, Vec<(i64, i64, i64, String)>> = BTreeMap::new();
+    let mut files: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     {
         let db = app.db.lock().await;
         let mut st =
             db.prepare("SELECT DISTINCT track, file, offset_ms FROM windows WHERE recording = ?1 ORDER BY file")?;
         for r in st.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
             let (track, file, offset): (String, String, i64) = r?;
-            tracks.entry(track).or_default().push((file, offset));
-        }
-        let mut st = db.prepare("SELECT track, id, start_ms, end_ms, text FROM segments WHERE recording = ?1")?;
-        for r in st.query_map([id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))))? {
-            let (track, seg): (String, _) = r?;
-            segments.entry(track).or_default().push(seg);
+            files.entry(track).or_default().push((file, offset));
         }
     }
-
     let dir = app.recording_dir(id);
-    let mut labels: Vec<(i64, Vec<Line>)> = vec![];
-    let mut clusters: Vec<(String, Vec<f32>)> = vec![];
-    for (track, files) in &tracks {
+    let mut out = BTreeMap::new();
+    for (track, files) in files {
         let wav = dir.join(format!(".{track}.wav"));
         let res = async {
-            timeline(&dir, files, &wav).await?;
+            timeline(&dir, &files, &wav).await?;
             let turns = diarize(&wav).await?;
             let samples = read_wav(&wav)?;
             anyhow::Ok((turns, samples))
@@ -305,73 +301,24 @@ async fn label(app: &App, id: &str) -> Result<()> {
         let _ = std::fs::remove_file(&wav);
         let (mut turns, samples) = res?;
         let model = model.clone();
-        let (turns, embeddings) = tokio::task::spawn_blocking(move || {
-            let embs = turn_embeddings(&model, &samples, &turns)?;
-            cluster(&mut turns, &embs, merge_threshold);
-            let m = means(&turns, &embs);
-            anyhow::Ok((turns, m))
+        let turns = tokio::task::spawn_blocking(move || {
+            embed_turns(&model, &samples, &mut turns)?;
+            anyhow::Ok(turns)
         })
         .await??;
-        let name = |i: usize| format!("{track}/S{}", i + 1);
-        for (sid, s, e, text) in segments.get(track).into_iter().flatten() {
-            let lines = split(&turns, *s, *e, text);
-            if !lines.is_empty() {
-                labels.push((*sid, lines.into_iter().map(|(s, e, t, k)| (s, e, t, name(k))).collect()));
-            }
-        }
-        clusters.extend(
-            embeddings
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, v)| Some((name(i), v?))),
-        );
+        out.insert(track, turns);
     }
-
-    save(&mut *app.db.lock().await, id, &labels, &clusters, threshold)
+    Ok(out)
 }
 
-/// `(start_ms, end_ms, text, label)` of a segment, or of a part of one after `split`.
-type Line = (i64, i64, String, String);
-
-/// Labels each segment, replacing it by its lines when it was split, stores the clusters'
-/// embeddings, and pre-fills the speakers map with the clusters that match a voice of
-/// another recording.
-fn save(
-    db: &mut rusqlite::Connection,
-    id: &str,
-    labels: &[(i64, Vec<Line>)],
-    clusters: &[(String, Vec<f32>)],
-    threshold: f32,
-) -> Result<()> {
-    let tx = db.transaction()?;
-    for (sid, lines) in labels {
-        let Some(((_, end, text, label), rest)) = lines.split_first() else {
-            continue;
-        };
-        if rest.is_empty() {
-            tx.execute("UPDATE segments SET speaker = ?2 WHERE id = ?1", params![sid, label])?;
-            continue;
-        }
-        tx.execute(
-            "UPDATE segments SET end_ms = ?2, text = ?3, speaker = ?4 WHERE id = ?1",
-            params![sid, end, text, label],
-        )?;
-        for (s, e, text, label) in rest {
-            tx.execute(
-                "INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker)
-                 SELECT recording, window, track, ?2, ?3, ?4, ?5 FROM segments WHERE id = ?1",
-                params![sid, s, e, text, label],
-            )?;
-        }
-    }
-    for (label, emb) in clusters {
-        let bytes: Vec<u8> = emb.iter().flat_map(|x| x.to_le_bytes()).collect();
-        tx.execute(
-            "INSERT OR REPLACE INTO clusters (recording, label, embedding) VALUES (?1, ?2, ?3)",
-            params![id, label, bytes],
-        )?;
-    }
-    let voices: Vec<(String, Vec<f32>)> = tx
+/// Name lookup: pre-fills the names of `id` (unless any are set) with the known voice of
+/// another recording most similar to each cluster, if at least `threshold` alike.
+fn lookup_names(db: &rusqlite::Connection, id: &str, threshold: f32) -> Result<()> {
+    let clusters: Vec<(String, Vec<f32>)> = db
+        .prepare("SELECT label, embedding FROM clusters WHERE recording = ?1")?
+        .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
+        .collect::<rusqlite::Result<_>>()?;
+    let voices: Vec<(String, Vec<f32>)> = db
         .prepare("SELECT name, embedding FROM voices WHERE recording != ?1")?
         .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
         .collect::<rusqlite::Result<_>>()?;
@@ -379,12 +326,10 @@ fn save(
         .iter()
         .filter_map(|(label, emb)| Some((label.as_str(), best_match(emb, &voices, threshold)?)))
         .collect();
-    // Never replaces names already set.
-    tx.execute(
+    db.execute(
         "UPDATE recordings SET speakers = ?2 WHERE id = ?1 AND speakers IS NULL",
         params![id, serde_json::to_string(&names)?],
     )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -409,6 +354,7 @@ mod tests {
             start_ms,
             end_ms,
             speaker,
+            embedding: None,
         }
     }
 
@@ -429,43 +375,6 @@ mod tests {
             ]
         );
         assert_eq!(parse_turns("Started\n"), vec![]);
-    }
-
-
-
-    #[test]
-    fn saves_split_segments_as_lines() {
-        let mut db = crate::db::open(Path::new(":memory:")).unwrap();
-        crate::db::ensure_recording(&db, "r1", "laptop").unwrap();
-        db.execute_batch(
-            "INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms)
-               VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000);
-             INSERT INTO segments (id, recording, window, track, start_ms, end_ms, text)
-               VALUES (1, 'r1', 1, 'room', 0, 8000, 'a b'), (2, 'r1', 1, 'room', 9000, 9500, 'c');",
-        )
-        .unwrap();
-        let l = |s: i64, e: i64, text: &str, label: &str| (s, e, text.to_string(), label.to_string());
-        let labels = [
-            (1, vec![l(0, 4_000, "a", "room/S1"), l(4_000, 8_000, "b", "room/S2")]),
-            (2, vec![l(9_000, 9_500, "c", "room/S2")]),
-        ];
-        save(&mut db, "r1", &labels, &[], 0.75).unwrap();
-        let rows: Vec<(i64, i64, i64, String, String)> = db
-            .prepare("SELECT window, start_ms, end_ms, text, speaker FROM segments ORDER BY start_ms")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let row = |s: i64, e: i64, text: &str, spk: &str| (1, s, e, text.to_string(), spk.to_string());
-        assert_eq!(
-            rows,
-            [
-                row(0, 4_000, "a", "room/S1"),
-                row(4_000, 8_000, "b", "room/S2"),
-                row(9_000, 9_500, "c", "room/S2")
-            ]
-        );
     }
 
 
@@ -502,8 +411,8 @@ mod tests {
 
     #[test]
     fn prefills_matched_clusters_but_keeps_names_set() {
-        let mut db = crate::db::open(Path::new(":memory:")).unwrap();
-        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let db = crate::db::open(Path::new(":memory:")).unwrap();
+        let bytes = crate::assemble::bytes;
         for id in ["old", "r1", "r2"] {
             crate::db::ensure_recording(&db, id, "laptop").unwrap();
         }
@@ -517,37 +426,39 @@ mod tests {
             ],
         )
         .unwrap();
-        let clusters = |xs: &[(&str, [f32; 3])]| -> Vec<(String, Vec<f32>)> {
-            xs.iter().map(|(l, v)| (l.to_string(), v.to_vec())).collect()
+        let clusters = |id: &str, xs: &[(&str, [f32; 3])]| {
+            for (l, v) in xs {
+                db.execute(
+                    "INSERT INTO clusters (recording, label, embedding) VALUES (?1, ?2, ?3)",
+                    params![id, l, bytes(v)],
+                )
+                .unwrap();
+            }
         };
-        let speakers = |db: &rusqlite::Connection, id: &str| -> String {
+        let speakers = |id: &str| -> String {
             db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))
                 .unwrap()
         };
-        let r1 = clusters(&[
-            ("room/S1", [0.1, 0.9, 0.0]),
-            ("room/S2", [0.7, 0.7, 0.1]),
-            ("room/S3", [0.0, 0.1, 1.0]),
-            ("remote/S1", [0.95, 0.0, 0.1]),
-        ]);
-        save(&mut db, "r1", &[], &r1, 0.9).unwrap();
-        assert_eq!(speakers(&db, "r1"), r#"{"remote/S1":"Max","room/S1":"Eva"}"#);
-        let stored: Vec<f32> = db
-            .query_row(
-                "SELECT embedding FROM clusters WHERE recording = 'r1' AND label = 'room/S2'",
-                [],
-                |r| Ok(floats(&r.get::<_, Vec<u8>>(0)?)),
-            )
-            .unwrap();
-        assert_eq!(stored, [0.7, 0.7, 0.1]);
+        clusters(
+            "r1",
+            &[
+                ("room/S1", [0.1, 0.9, 0.0]),
+                ("room/S2", [0.7, 0.7, 0.1]),
+                ("room/S3", [0.0, 0.1, 1.0]),
+                ("remote/S1", [0.95, 0.0, 0.1]),
+            ],
+        );
+        lookup_names(&db, "r1", 0.9).unwrap();
+        assert_eq!(speakers("r1"), r#"{"remote/S1":"Max","room/S1":"Eva"}"#);
 
         db.execute(
             "UPDATE recordings SET speakers = '{\"room/S1\":\"Jo\"}' WHERE id = 'r2'",
             [],
         )
         .unwrap();
-        save(&mut db, "r2", &[], &clusters(&[("room/S1", [0.0, 1.0, 0.0])]), 0.6).unwrap();
-        assert_eq!(speakers(&db, "r2"), r#"{"room/S1":"Jo"}"#);
+        clusters("r2", &[("room/S1", [0.0, 1.0, 0.0])]);
+        lookup_names(&db, "r2", 0.6).unwrap();
+        assert_eq!(speakers("r2"), r#"{"room/S1":"Jo"}"#);
     }
 
     /// Needs ffmpeg and sherpa-onnx-offline-speaker-diarization on PATH,
@@ -581,7 +492,7 @@ mod tests {
         let db = app.db.lock().await;
         let status: String = db.query_row("SELECT status FROM recordings", [], |r| r.get(0)).unwrap();
         assert_eq!(status, "diarized");
-        let speaker: String = db.query_row("SELECT speaker FROM segments", [], |r| r.get(0)).unwrap();
+        let speaker: String = db.query_row("SELECT speaker FROM lines", [], |r| r.get(0)).unwrap();
         assert_eq!(speaker, "room/S1");
         let emb: Vec<u8> = db.query_row("SELECT embedding FROM clusters", [], |r| r.get(0)).unwrap();
         assert!(!floats(&emb).is_empty());

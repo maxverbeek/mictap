@@ -41,11 +41,31 @@ CREATE TABLE IF NOT EXISTS windows (
     end_ms INTEGER NOT NULL,
     done INTEGER NOT NULL DEFAULT 0
 );
--- start_ms/end_ms are within the recording.
+-- Model outputs (CONTEXT.md), never modified. start_ms/end_ms are within the recording.
+-- whisper's.
 CREATE TABLE IF NOT EXISTS segments (
     id INTEGER PRIMARY KEY,
     recording TEXT NOT NULL REFERENCES recordings(id),
     window INTEGER NOT NULL REFERENCES windows(id),
+    track TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    text TEXT NOT NULL
+);
+-- sherpa's, with speaker its cluster and embedding CAM++'s (L2-normalized f32 little-endian).
+CREATE TABLE IF NOT EXISTS turns (
+    id INTEGER PRIMARY KEY,
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    track TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    speaker INTEGER NOT NULL,
+    embedding BLOB
+);
+-- Derived from the model outputs by assemble::derive.
+CREATE TABLE IF NOT EXISTS lines (
+    id INTEGER PRIMARY KEY,
+    recording TEXT NOT NULL REFERENCES recordings(id),
     track TEXT NOT NULL,
     start_ms INTEGER NOT NULL,
     end_ms INTEGER NOT NULL,
@@ -75,7 +95,44 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if conn.prepare("SELECT retry_at FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0")?;
     }
+    if conn.prepare("SELECT speaker FROM segments").is_ok() {
+        lines_from_labeled_segments(&conn)?;
+    }
     Ok(conn)
+}
+
+/// Before model outputs were kept, diarization split and labeled the segments in place:
+/// they become the lines, echoes dropped as reads used to.
+fn lines_from_labeled_segments(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    let ids: Vec<String> = tx
+        .prepare("SELECT DISTINCT recording FROM segments")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let echo = crate::assemble::Tuning::from_env().echo_jaccard;
+    for id in ids {
+        let segs: Vec<crate::assemble::Line> = tx
+            .prepare("SELECT track, start_ms, end_ms, text, speaker FROM segments WHERE recording = ?1")?
+            .query_map([&id], |r| {
+                Ok(crate::assemble::Line {
+                    track: r.get(0)?,
+                    start_ms: r.get(1)?,
+                    end_ms: r.get(2)?,
+                    text: r.get(3)?,
+                    speaker: r.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for l in crate::assemble::drop_echoes(segs, echo) {
+            tx.execute(
+                "INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, l.track, l.start_ms, l.end_ms, l.text, l.speaker],
+            )?;
+        }
+    }
+    tx.execute_batch("ALTER TABLE segments DROP COLUMN speaker")?;
+    tx.commit()
 }
 
 pub fn ensure_recording(conn: &Connection, id: &str, source: &str) -> rusqlite::Result<()> {
@@ -148,6 +205,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!(row, ("failed".into(), "last".into()));
+    }
+
+    #[test]
+    fn turns_labeled_segments_into_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL);
+                 INSERT INTO recordings VALUES ('r1', 'laptop');
+                 CREATE TABLE segments (id INTEGER PRIMARY KEY, recording TEXT NOT NULL,
+                   window INTEGER NOT NULL, track TEXT NOT NULL, start_ms INTEGER NOT NULL,
+                   end_ms INTEGER NOT NULL, text TEXT NOT NULL, speaker TEXT);
+                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker) VALUES
+                   ('r1', 1, 'room', 0, 1000, 'hoi', 'room/S1'),
+                   ('r1', 1, 'remote', 2000, 3000, 'precies wat hij zei', 'remote/S1'),
+                   ('r1', 1, 'room', 2100, 3100, 'precies wat hij zei', 'room/S2');",
+            )
+            .unwrap();
+        let conn = super::open(&path).unwrap();
+        let lines = crate::assemble::lines(&conn, "r1").unwrap();
+        let got: Vec<(&str, Option<&str>)> = lines.iter().map(|l| (l.text.as_str(), l.speaker.as_deref())).collect();
+        assert_eq!(
+            got,
+            [("hoi", Some("room/S1")), ("precies wat hij zei", Some("remote/S1"))]
+        );
+        assert!(conn.prepare("SELECT speaker FROM segments").is_err());
+        super::open(&path).unwrap();
+        assert_eq!(crate::assemble::lines(&conn, "r1").unwrap().len(), 2, "once");
     }
 
     #[test]

@@ -122,10 +122,10 @@ async function show(id) {
   }
   player.hidden = !audio;
 
-  const labels = [...new Set(r.segments.map(s => s.speaker).filter(Boolean))]
+  const labels = [...new Set(r.lines.map(s => s.speaker).filter(Boolean))]
     .sort((a, b) => (a.startsWith("remote") - b.startsWith("remote")) || short(a).slice(1) - short(b).slice(1));
   const name = label => label ? r.names[label] || short(label) : "?";
-  const longest = label => r.segments.filter(s => s.speaker === label)
+  const longest = label => r.lines.filter(s => s.speaker === label)
     .reduce((a, b) => (b.end_ms - b.start_ms > a.end_ms - a.start_ms ? b : a));
 
   const inputs = {};
@@ -153,7 +153,7 @@ async function show(id) {
     } catch (err) { msg.textContent = err.message; }
   };
 
-  lines = r.segments.map(seg => ({ seg, el: h("div", { className: "line" },
+  lines = r.lines.map(seg => ({ seg, el: h("div", { className: "line" },
     h("button", { disabled: !audio, onclick: () => play(seg) }, h("time", {}, hms(seg.start_ms))),
     h("span", { className: "who", title: seg.speaker ?? "" }, name(seg.speaker),
       " ", h("span", { className: "track muted" }, seg.track)),

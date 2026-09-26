@@ -268,7 +268,7 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
         .collect::<rusqlite::Result<_>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for (id, source, started_ms, status, audio, transcript) in rows {
-        let segs = crate::assemble::merged(&db, &id)?;
+        let segs = crate::assemble::lines(&db, &id)?;
         let progress = step(&app, &db, &id, &status, &segs)?;
         let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
         out.push(json!({
@@ -281,7 +281,7 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
 
 /// What a recording that isn't done or failed is at: `unstarted`, `transcribing` with a
 /// `percent`, or `diarizing` with the Unix ms it started at, if it has.
-fn step(app: &App, db: &Connection, id: &str, status: &str, segs: &[crate::assemble::Segment]) -> Result<Value> {
+fn step(app: &App, db: &Connection, id: &str, status: &str, segs: &[crate::assemble::Line]) -> Result<Value> {
     if matches!(status, "diarized" | "done" | "failed") {
         return Ok(Value::Null);
     }
@@ -328,7 +328,7 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
     let Some((started_ms, status, audio, speakers)) = row else {
         return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")));
     };
-    let segs = crate::assemble::merged(&db, &id)?;
+    let segs = crate::assemble::lines(&db, &id)?;
     let editable = status == "done";
     let progress = step(&app, &db, &id, &status, &segs)?;
     let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
@@ -336,7 +336,7 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
     Ok(Json(json!({
         "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
         "total_ms": total_ms, "audio": audio, "editable": editable, "progress": progress,
-        "names": names, "segments": segs,
+        "names": names, "lines": segs,
     })))
 }
 
@@ -408,7 +408,7 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         Some("done" | "failed") => {}
         Some(_) => return Err(Error(StatusCode::CONFLICT, format!("{id} is still being transcribed"))),
     }
-    for table in ["segments", "windows", "file_progress", "clusters"] {
+    for table in ["segments", "turns", "lines", "windows", "file_progress", "clusters"] {
         db.execute(&format!("DELETE FROM {table} WHERE recording = ?1"), [&id])?;
     }
     db.execute("DELETE FROM recordings WHERE id = ?1", [&id])?;
@@ -439,8 +439,8 @@ async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Resul
         _ => {}
     }
     let tx = db.transaction()?;
-    tx.execute("UPDATE segments SET speaker = NULL WHERE recording = ?1", [&id])?;
-    tx.execute("DELETE FROM clusters WHERE recording = ?1", [&id])?;
+    tx.execute("DELETE FROM turns WHERE recording = ?1", [&id])?;
+    crate::assemble::derive(&tx, &id)?;
     tx.execute("DELETE FROM voices WHERE recording = ?1", [&id])?;
     tx.execute(
         "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, speakers = NULL
@@ -766,8 +766,12 @@ mod tests {
                    ('r3', 'laptop', 'done', 'expired', NULL);
                  INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done)
                    VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 1000, 1);
-                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker)
-                   VALUES ('r1', 1, 'room', 0, 1000, 'a', 'room/S1');
+                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text)
+                   VALUES ('r1', 1, 'room', 0, 1000, 'a');
+                 INSERT INTO turns (recording, track, start_ms, end_ms, speaker)
+                   VALUES ('r1', 'room', 0, 1000, 0);
+                 INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker)
+                   VALUES ('r1', 'room', 0, 1000, 'a', 'room/S1');
                  INSERT INTO clusters VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
                  INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');",
             )
@@ -789,7 +793,11 @@ mod tests {
             one("SELECT status || '/' || attempts || '/' || COALESCE(speakers, '-') FROM recordings WHERE id = 'r1'"),
             "windowed/0/-"
         );
-        assert_eq!(one("SELECT COALESCE(speaker, '-') FROM segments"), "-");
+        assert_eq!(
+            one("SELECT COUNT(*) || '/' || COALESCE(MAX(speaker), '-') FROM lines"),
+            "1/-"
+        );
+        assert_eq!(one("SELECT CAST(COUNT(*) AS TEXT) FROM turns"), "0");
         assert_eq!(one("SELECT group_concat(recording) FROM clusters"), "r3");
         assert_eq!(one("SELECT group_concat(recording) FROM voices"), "r3");
     }
@@ -809,8 +817,8 @@ mod tests {
                      VALUES ('r1', 'laptop', 0, 'done', '{"room/S2":"Eva"}'), ('r2', 'laptop', 0, 'windowed', NULL);
                    INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done)
                      VALUES (1, 'r1', 'a', 'room', 0, 0, 9000, 1);
-                   INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker) VALUES
-                     ('r1', 1, 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 1, 'room', 1000, 2000, 'Ja.', 'room/S2');
+                   INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES
+                     ('r1', 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 'room', 1000, 2000, 'Ja.', 'room/S2');
                    INSERT INTO clusters VALUES ('r1', 'room/S1', x'01'), ('r1', 'room/S2', x'02');
                    INSERT INTO voices VALUES ('Eva', x'02', 'r1', 'room/S2');"#,
             )
