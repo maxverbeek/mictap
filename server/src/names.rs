@@ -119,6 +119,19 @@ pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
     Ok(())
 }
 
+/// Suggests anew for every done recording, since a voice learned in one recording can name
+/// speakers in all the others.
+pub(crate) fn suggest_all(db: &Connection, m: &Matching) -> Result<()> {
+    let ids: Vec<String> = db
+        .prepare("SELECT id FROM recordings WHERE status = 'done'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for id in ids {
+        suggest(db, &id, m)?;
+    }
+    Ok(())
+}
+
 /// What the page sends per label: the name, and the snippets of it that were heard.
 #[derive(Deserialize)]
 pub(crate) struct Naming {
@@ -471,6 +484,24 @@ mod tests {
         assert_eq!(best(&[0.0, 0.0, 1.0], &voices, &M), None, "alike to no one");
         assert_eq!(best(&[1.0, 0.0], &voices, &M), None, "other model's dimension");
         assert_eq!(best(&[1.0, 0.0, 0.0], &[], &M), None);
+    }
+
+    #[test]
+    fn suggests_in_every_done_recording_again() {
+        let db = db();
+        db.execute("UPDATE recordings SET status = 'done' WHERE id = 'r1'", [])
+            .unwrap();
+        cluster(&db, "room/S1", &[1.0, 0.0, 0.0]);
+        suggest_all(&db, &M).unwrap();
+        assert!(speakers(&db, "r1", ["room/S1"]).unwrap()["room/S1"].suggested.is_none());
+        voice(&db, "Max", "room/S1", &[1.0, 0.0, 0.0]);
+        suggest_all(&db, &M).unwrap();
+        assert_eq!(
+            speakers(&db, "r1", ["room/S1"]).unwrap()["room/S1"]
+                .suggested
+                .as_deref(),
+            Some("Max")
+        );
     }
 
     #[test]

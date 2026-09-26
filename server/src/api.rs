@@ -384,7 +384,9 @@ async fn name_line(
     let voices = {
         let db = app.db.lock().await;
         done(&db, &id)?;
-        crate::names::name_line(&db, &id, &l.track, l.start_ms, l.end_ms, l.name.as_deref())?
+        let learned = crate::names::name_line(&db, &id, &l.track, l.start_ms, l.end_ms, l.name.as_deref())?;
+        crate::names::suggest_all(&db, &crate::names::Matching::from_env())?;
+        learned
     };
     crate::vault::write(&app, &id).await?;
     Ok(Json(json!({ "voices": voices })))
@@ -404,7 +406,9 @@ async fn name_speakers(
     let learned = {
         let db = app.db.lock().await;
         done(&db, &id)?;
-        crate::names::confirm(&db, &id, names)?
+        let learned = crate::names::confirm(&db, &id, names)?;
+        crate::names::suggest_all(&db, &crate::names::Matching::from_env())?;
+        learned
     };
     crate::vault::write(&app, &id).await?;
     let learned: serde_json::Map<String, Value> =
