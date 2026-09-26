@@ -150,10 +150,11 @@ opens at that moment. Expired recordings return an "expired" page.
 whether the audio is still kept) plus anything not uploaded yet.
 `mictap download <id> [file]` saves the audio; `mictap delete <id>` removes a
 finished recording's audio and state from the server, leaving the transcript.
-`mictap rediarize <id>` diarizes a finished recording again while its audio is
-kept (after a diarization change): its speaker names and their voices are
-dropped, names are pre-filled anew from other recordings, and the transcript
-is rewritten.
+`mictap rediarize <id>` runs sherpa and CAM++ on a finished recording again
+while its audio is kept (after a diarization change), and whisper too once its
+segments have expired: its turns, speaker names and their voices are dropped,
+the lines are derived anew, names are pre-filled anew from other recordings,
+and the transcript is rewritten.
 
 ## Web page
 

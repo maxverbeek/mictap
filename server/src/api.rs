@@ -432,7 +432,8 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
     }
 }
 
-/// Diarizes a finished recording again. Its labels, names and voices are dropped, the names
+/// Runs sherpa and CAM++ on a finished recording's audio again (and whisper, if its segments
+/// expired). Its turns, names and voices are dropped; its lines stay until derived anew, names
 /// are pre-filled anew from other recordings' voices, and the transcript is rewritten.
 async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
     check_name(&id)?;
@@ -454,11 +455,16 @@ async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Resul
     }
     let tx = db.transaction()?;
     tx.execute("DELETE FROM turns WHERE recording = ?1", [&id])?;
-    crate::assemble::derive(&tx, &id)?;
+    // whisper's segments expired: transcribe the audio again too.
+    tx.execute(
+        "UPDATE windows SET done = 0 WHERE recording = ?1
+         AND NOT EXISTS (SELECT 1 FROM segments WHERE recording = ?1)",
+        [&id],
+    )?;
     tx.execute("DELETE FROM voices WHERE recording = ?1", [&id])?;
     tx.execute(
-        "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, speakers = NULL
-         WHERE id = ?1",
+        "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, speakers = NULL,
+         done_ms = NULL WHERE id = ?1",
         [&id],
     )?;
     tx.commit()?;
@@ -777,9 +783,9 @@ mod tests {
                 "INSERT INTO recordings (id, source, status, audio, speakers) VALUES
                    ('r1', 'laptop', 'done', 'ready', '{\"room/S1\":\"Max\"}'),
                    ('r2', 'laptop', 'transcribing', 'ready', NULL),
-                   ('r3', 'laptop', 'done', 'expired', NULL);
-                 INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done)
-                   VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 1000, 1);
+                   ('r3', 'laptop', 'done', 'expired', NULL), ('r4', 'laptop', 'done', 'ready', NULL);
+                 INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
+                   (1, 'r1', '00-mic.oga', 'room', 0, 0, 1000, 1), (2, 'r4', '00-mic.oga', 'room', 0, 0, 1000, 1);
                  INSERT INTO segments (recording, window, track, start_ms, end_ms, text)
                    VALUES ('r1', 1, 'room', 0, 1000, 'a');
                  INSERT INTO turns (recording, track, start_ms, end_ms, speaker)
@@ -796,6 +802,7 @@ mod tests {
             ("r3", StatusCode::GONE),
             ("nope", StatusCode::NOT_FOUND),
             ("r1", StatusCode::ACCEPTED),
+            ("r4", StatusCode::ACCEPTED),
         ] {
             let (s, _) = send(&app, "POST", &format!("/recordings/{id}/rediarize"), b"").await;
             assert_eq!(s, want, "{id}");
@@ -808,11 +815,21 @@ mod tests {
             "windowed/0/-"
         );
         assert_eq!(
-            one("SELECT COUNT(*) || '/' || COALESCE(MAX(speaker), '-') FROM lines"),
-            "1/-"
+            one("SELECT group_concat(speaker) FROM lines"),
+            "room/S1",
+            "until derived anew"
+        );
+        assert_eq!(
+            one("SELECT group_concat(recording || ':' || done) FROM windows"),
+            "r1:1,r4:0",
+            "r4's segments expired: transcribed again"
         );
         assert_eq!(one("SELECT CAST(COUNT(*) AS TEXT) FROM turns"), "0");
-        assert_eq!(one("SELECT group_concat(recording) FROM clusters"), "r3");
+        assert_eq!(
+            one("SELECT group_concat(recording) FROM clusters"),
+            "r1,r3",
+            "until derived anew"
+        );
         assert_eq!(one("SELECT group_concat(recording) FROM voices"), "r3");
     }
 
