@@ -261,13 +261,27 @@ function shown(seg) {
 
 function fail(err) { cur.err.textContent = err.message; }
 
-async function nameLine(seg, name) {
+async function nameLine(seg, name, then) {
   closeMenu();
+  const clear = seg.line_name === name;
   try {
     await put(`/recordings/${encodeURIComponent(cur.id)}/lines`,
-      { track: seg.track, start_ms: seg.start_ms, end_ms: seg.end_ms, name: seg.line_name === name ? null : name });
+      { track: seg.track, start_ms: seg.start_ms, end_ms: seg.end_ms, name: clear ? null : name });
     await show(cur.id);
+    if (!clear) then?.();
   } catch (err) { fail(err); }
+}
+
+// After naming a line from its menu: play the next one (in the transcript, or on the card) and
+// open its menu, so a run of lines is named without clicking each.
+function openNext(seg, card) {
+  const pool = card ? lines.filter(x => !x.transcript) : cur.transcript;
+  const i = pool.findIndex(x => x.seg.track === seg.track && x.seg.start_ms === seg.start_ms);
+  const next = i >= 0 && pool[i + 1];
+  if (!next) return;
+  if (cur.audio) start(next.seg, card);
+  else next.el.scrollIntoView({ block: "nearest" });
+  openMenu(next.el, next.seg, card);
 }
 
 function newName(done) {
@@ -280,15 +294,16 @@ function newName(done) {
   return input;
 }
 
-function openMenu(host, seg) {
+function openMenu(host, seg, card) {
   const again = menu?.parentNode === host;
   closeMenu();
   if (again || !cur.r.editable) return;
-  const input = newName(n => nameLine(seg, n));
-  input.onchange = () => input.value.trim() && nameLine(seg, input.value.trim());
+  const then = () => openNext(seg, card);
+  const input = newName(n => nameLine(seg, n, then));
+  input.onchange = () => input.value.trim() && nameLine(seg, input.value.trim(), then);
   menu = h("div", { className: "menu", onclick: e => e.stopPropagation() },
     choices().map((c, k) => h("button", { className: "chip", ariaPressed: String(seg.line_name === c),
-      title: c === "?" ? "Mixed or unsure" : c, onclick: () => nameLine(seg, c) }, c, k < 9 ? h("kbd", {}, String(k + 1)) : null)),
+      title: c === "?" ? "Mixed or unsure" : c, onclick: () => nameLine(seg, c, then) }, c, k < 9 ? h("kbd", {}, String(k + 1)) : null)),
     input);
   host.append(menu);
 }
@@ -307,7 +322,10 @@ function drawAsk() {
   cur.ask.hidden = !cur.r.editable || !queue.length;
   if (cur.ask.hidden) return [];
   const l = queue[0], s = cur.sp(l);
-  const group = pick[l] ?? s.suggested;
+  const segs = samples(l);
+  // Every sample named on its own: their name if they agree, else several people.
+  const own = segs.every(x => x.line_name) && new Set(segs.map(x => x.line_name));
+  const group = pick[l] ?? s.suggested ?? (own && (own.size === 1 ? [...own][0] : "?"));
   const choose = n => { pick[l] = n; paint(); };
   const input = newName(choose);
   input.onchange = () => input.value.trim() && choose(input.value.trim());
@@ -315,11 +333,10 @@ function drawAsk() {
   const chips = [...new Set([s.suggested, ...people()].filter(Boolean)), "?"].map(n =>
     h("button", { className: "chip" + (n === s.suggested && pick[l] == null ? " guess" : ""), ariaPressed: String(n === group),
       title: n === "?" ? "Several people, or not sure" : n, onclick: () => choose(n) }, n));
-  const segs = samples(l);
   const rows = segs.map(seg => {
     const slot = h("span", { className: "slot" + (seg.line_name ? (seg.taught ? " set" : "") : pick[l] == null && s.suggested ? " sugg" : "") },
       seg.line_name ?? group ?? "?");
-    const li = h("li", { onclick: e => { e.stopPropagation(); if (cur.audio) start(seg, true); openMenu(li, seg); } },
+    const li = h("li", { onclick: e => { e.stopPropagation(); if (cur.audio) start(seg, true); openMenu(li, seg, true); } },
       h("button", { className: "play", title: "Play", disabled: !cur.audio,
         onclick: e => { e.stopPropagation(); closeMenu(); start(seg, true); } }, "▶"),
       h("span", {}, seg.text), slot);
@@ -389,7 +406,7 @@ async function show(id) {
   const transcript = r.lines.map(seg => {
     const who = h("b");
     const el = h("div", { className: "line" + (audio ? " audio" : "") + (r.editable ? " named" : ""),
-      onclick: e => { e.stopPropagation(); if (audio) start(seg); openMenu(el, seg); } },
+      onclick: e => { e.stopPropagation(); if (audio) start(seg); openMenu(el, seg, false); } },
       h("time", { title: audio ? "Play from here" : "", onclick: e => { e.stopPropagation(); closeMenu(); if (audio) start(seg); } },
         clock(seg.start_ms)),
       who, h("span", {}, seg.text));
