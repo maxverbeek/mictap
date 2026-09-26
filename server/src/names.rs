@@ -135,7 +135,8 @@ pub(crate) struct Heard {
     pub correct: bool,
 }
 
-/// Confirms `changes` (`""` leaves the label unnamed, rejecting its suggestion) and learns
+/// Confirms `changes` (`""` leaves the label unnamed, rejecting its suggestion; `?` answers
+/// several people or unsure: confirmed, but no name and no voice) and learns
 /// voices for each label whose name changed or that was heard: one per correct heard
 /// snippet, none if every heard snippet was wrong, else (or when the snippets' turns
 /// expired) the cluster's core unless the cluster is mixed. Returns how many voices each
@@ -167,7 +168,7 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Namin
         )?;
     }
     let mut learned: BTreeMap<String, usize> = changes.keys().map(|l| (l.clone(), 0)).collect();
-    for (label, name) in names.iter().filter(|(l, _)| relearn(l)) {
+    for (label, name) in names.iter().filter(|(l, n)| relearn(l) && *n != "?") {
         let heard = heard(label);
         let n = learned.entry(label.clone()).or_default();
         if !heard.is_empty() {
@@ -759,5 +760,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM line_names", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn a_label_answered_unsure_is_confirmed_without_a_name_or_voice() {
+        let db = db();
+        voice(&db, "Max", "room/S1", &[1.0, 0.0]);
+        cluster(&db, "room/S1", &[1.0, 0.0]);
+        turns(&db, &[(0, 4_000, &[1.0, 0.0])]);
+        lines(&db, &[(0, 4_000, "room/S1")]);
+        suggest(&db, "r1", &M).unwrap();
+        assert_eq!(get(&db, "suggested")["room/S1"], "Max");
+        let learned = confirm(&db, "r1", heard("?", &[(0, 4_000, true)])).unwrap();
+        assert_eq!(learned["room/S1"], 0);
+        assert_eq!(learned_count(&db), 0);
+        suggest(&db, "r1", &M).unwrap();
+        assert_eq!(get(&db, "suggested"), Names::new(), "not suggested again");
+        assert_eq!(
+            speakers(&db, "r1", ["room/S1"]).unwrap()["room/S1"].name.as_deref(),
+            Some("?")
+        );
+        let lines = super::named(&db, "r1").unwrap();
+        assert_eq!(lines[0].name.as_deref(), Some("?"));
+        assert!(attendees(&confirmed(&db, "r1").unwrap(), &lines).is_empty());
+    }
+
+    fn learned_count(db: &Connection) -> i64 {
+        db.query_row("SELECT COUNT(*) FROM voices WHERE recording = 'r1'", [], |r| r.get(0))
+            .unwrap()
     }
 }
