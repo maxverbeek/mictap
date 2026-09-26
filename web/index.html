@@ -92,8 +92,7 @@
   .line.taught b { font-weight: 600; color: var(--fg); }
   .line.unknown { background: var(--warnbg); }
   .line.unknown b { color: var(--warn); }
-  .line.same b { visibility: hidden; }
-  .line.same:hover b, .line.playing b { visibility: visible; }
+  .line.same b { opacity: .5; }
   .line.playing, .line.named:hover { background: var(--hl); }
 
   .player { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bar); border-top: 1px solid var(--line);
@@ -108,7 +107,6 @@
     .line { grid-template-columns: 3.6rem 1fr; row-gap: 0; }
     .line b, .line span { grid-column: 2; }
     .line time { grid-row: span 2; }
-    .line.same b { display: none; }
     .menu { left: 4rem; flex-wrap: wrap; }
     .counts { flex-wrap: wrap; gap: .4rem 1.2rem; }
   }
