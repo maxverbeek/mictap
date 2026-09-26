@@ -74,6 +74,8 @@
   .menu { position: absolute; z-index: 3; left: 5.3rem; top: calc(100% - .2rem); display: flex; gap: .3rem; padding: .4rem;
     background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 4px 14px rgba(0, 0, 0, .12); cursor: default; }
   .line, .ask li { scroll-margin: 4rem 0 8rem; }
+  .answers { transition: opacity .15s; }
+  .ask:has(.menu) .answers { opacity: .2; pointer-events: none; }
   .ask .menu { left: auto; right: 0; top: calc(100% - .1rem); flex-wrap: wrap; width: max-content; max-width: 17rem; }
 
   .line { position: relative; display: grid; grid-template-columns: 4.2rem 6.5rem 1fr; gap: .7rem; padding: .2rem .4rem; border-radius: 4px; }
