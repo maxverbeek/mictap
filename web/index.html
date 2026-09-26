@@ -48,8 +48,7 @@
   .meta:has(+ [hidden]) { margin-bottom: 1.8rem; }
   .counts { display: flex; gap: 1.4rem; align-items: baseline; font-size: .9em; margin: 0 0 1.6rem; padding: .45rem 0;
     border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); color: var(--muted); }
-  .counts b { margin-right: .35em; font-weight: 400; }
-  .counts .taught b { font-weight: 600; color: var(--fg); }
+  .counts .taught { font-weight: 600; color: var(--fg); }
   .counts button { margin-left: auto; color: var(--warn); border: 1px solid var(--warn); border-radius: 999px; padding: 0 .7rem; }
   .counts button:disabled { color: var(--muted); border-color: var(--line); cursor: default; }
   .cols { display: grid; grid-template-columns: minmax(0, 44rem) 19rem; justify-content: space-between; gap: 4rem; align-items: start; }
@@ -420,12 +419,12 @@ function paint() {
     !cur.audio ? (cur.r.audio === "expired" ? " · audio deleted after 30 days" : " · no audio yet") : null,
     cur.err,
   ]));
-  const c = cur.r.counts, example = names[0] ?? "Name";
+  const c = cur.r.counts;
   const first = cur.transcript.find(x => x.seg.state === "unknown");
   cur.counts.hidden = !cur.r.lines.length;
   cur.counts.replaceChildren(
-    h("span", { className: "taught" }, h("b", {}, example), `taught ${c.taught}`),
-    h("span", {}, h("b", {}, example), `guessed ${c.guessed}`),
+    h("span", { className: "taught" }, `${c.taught.toLocaleString("en")} taught`),
+    h("span", {}, `${c.guessed.toLocaleString("en")} guessed`),
     h("button", { disabled: !first || !cur.r.editable, title: "Name the first unknown line",
       onclick: e => { e.stopPropagation(); focusLine(first.seg, false, false); } }, `? ${c.unknown} unknown`));
   player.dispatchEvent(new Event("timeupdate"));
