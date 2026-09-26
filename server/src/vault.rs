@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -10,29 +11,14 @@ use jiff::Timestamp;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::{
-    api::App,
-    merge::Segment,
-    speakers::{attendees, display, Names},
-};
+use crate::{api::App, merge::Segment};
 
-/// Base of the timestamp links, as browsers reach this server.
+/// Base of the links in transcripts, as browsers reach this server.
 pub static URL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| std::env::var("MICTAP_URL").unwrap_or_else(|_| "http://localhost:8765".into()));
 
-struct Header<'a> {
-    id: &'a str,
-    date: String,
-    source: &'a str,
-    status: &'a str,
-    done_ms: i64,
-    total_ms: i64,
-    error: Option<&'a str>,
-}
-
-fn minutes(ms: i64) -> i64 {
-    (ms + 30_000) / 60_000
-}
+/// Speaker label (`room/S1`) -> name.
+pub(crate) type Names = BTreeMap<String, String>;
 
 fn hms(ms: i64) -> String {
     let s = ms / 1000;
@@ -45,37 +31,45 @@ pub(crate) fn label_order(label: &str) -> (bool, u32) {
     (track != "room", n.parse().unwrap_or(u32::MAX))
 }
 
-/// The transcript as README specifies it, lines labeled with `names` where set.
-fn render(h: &Header, segs: &[Segment], names: &Names) -> String {
-    let (done, total) = (minutes(h.done_ms), minutes(h.total_ms));
-    let mut out = format!(
-        "---\nid: {}\ndate: {}\nduration: {total}m\nsource: {}\nstatus: {}\nprogress: {}/{total} min\n",
-        h.id,
-        h.date,
-        h.source,
-        h.status,
-        done.min(total),
-    );
-    if let Some(e) = h.error {
-        out += &format!("error: {}\n", Value::from(e));
-    }
-    let mut labels: Vec<&str> = segs.iter().filter_map(|s| s.speaker.as_deref()).collect();
+/// A speaker label: `room/S<n>` or `remote/S<n>`.
+pub(crate) fn is_label(k: &str) -> bool {
+    k.split_once('/').is_some_and(|(track, n)| {
+        matches!(track, "room" | "remote")
+            && n.strip_prefix('S')
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+/// What a line of `label` shows: its name, else `S<n>`.
+fn display<'a>(label: &'a str, names: &'a Names) -> &'a str {
+    names
+        .get(label)
+        .map_or_else(|| label.split_once('/').map_or(label, |(_, n)| n), String::as_str)
+}
+
+/// The transcript: a small frontmatter, then one line per segment.
+fn render(id: &str, date: &str, segs: &[Segment], names: &Names) -> String {
+    let mut labels: Vec<&String> = names.keys().collect();
     labels.sort_by_key(|l| label_order(l));
-    labels.dedup();
-    out += &attendees(names);
-    // One flat property per speaker: Obsidian can only edit flat values.
+    let mut attendees: Vec<String> = vec![];
     for l in labels {
-        out += &format!("{l}: {}\n", Value::from(names.get(l).map_or("", String::as_str)));
+        let link = Value::from(format!("[[{}]]", names[l])).to_string();
+        if !attendees.contains(&link) {
+            attendees.push(link);
+        }
     }
-    out += "---\n\n";
+    let mut out = format!(
+        "---\nid: {id}\ndate: {date}\nattendees: [{}]\nlink: {}/#{id}\n---\n\n",
+        attendees.join(", "),
+        *URL,
+    );
     for s in segs {
         let name = s.speaker.as_deref().map_or("?", |l| display(l, names));
         out += &format!(
-            "**{name}** ({}, [{}]({}/r/{}/audio.ogg#t={})): {}\n",
+            "**{name}** ({}, [{}]({}/r/{id}/audio.ogg#t={})): {}\n",
             s.track,
             hms(s.start_ms),
             *URL,
-            h.id,
             s.start_ms / 1000,
             s.text
         );
@@ -98,7 +92,7 @@ fn has_id(path: &Path, id: &str) -> bool {
 
 /// The transcript of `id` in `vault`: the cached file name if it still holds it, else a
 /// rescan of `*.md`.
-pub(crate) fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::Result<Option<PathBuf>> {
+fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::Result<Option<PathBuf>> {
     if let Some(p) = cached.map(|c| vault.join(c)).filter(|p| has_id(p, id)) {
         return Ok(Some(p));
     }
@@ -113,7 +107,7 @@ pub(crate) fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::R
 
 /// Writes `content` to a temp file in `vault`, then renames it over `target`, or links it to
 /// the first free `<base>.md`, `<base> 2.md`, ... Returns the file name.
-pub(crate) fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, content: &str) -> Result<String> {
+fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, content: &str) -> Result<String> {
     let tmp = vault.join(format!(".mictap-{id}.tmp"));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(content.as_bytes())?;
@@ -136,10 +130,7 @@ pub(crate) fn put(vault: &Path, id: &str, target: Option<&Path>, base: &str, con
     Ok(res?)
 }
 
-/// Missed syncs (5 s apart) before a transcript that vanished from the folder is given up.
-const GONE_AFTER: u32 = 60;
-
-/// What the note shows for `id`: its status, and how much of how much audio is transcribed.
+/// How much of how much audio of `id` is transcribed, and its status as the API shows it.
 pub(crate) fn progress(
     app: &App,
     db: &Connection,
@@ -190,115 +181,80 @@ pub(crate) fn progress(
     Ok((shown, done_ms, total_ms))
 }
 
-/// Brings the vault file of `id` up to date with the database.
-pub async fn sync(app: &App, id: &str) -> Result<()> {
+/// Writes the transcript of `id`, over its note wherever it was renamed to in the vault
+/// folder. A note that was moved out or deleted is left alone, and a recording without
+/// speech gets none.
+pub async fn write(app: &App, id: &str) -> Result<()> {
     let db = app.db.lock().await;
-    let (source, started_ms, status, error, cached, written): (
-        String,
-        i64,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    ) = db.query_row(
-        "SELECT source, started_ms, status, error, vault_path, written FROM recordings WHERE id = ?1",
+    let (started_ms, cached, speakers): (i64, Option<String>, Option<String>) = db.query_row(
+        "SELECT started_ms, vault_path, speakers FROM recordings WHERE id = ?1",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    if matches!(written.as_deref(), Some("done" | "failed" | "gone")) {
-        return Ok(());
-    }
     let segs = crate::merge::merged(&db, id)?;
-    // Names matched at diarization, for the labels that survived the echo dedupe.
-    let speakers: Option<String> = db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
-    let mut names: Names = speakers
+    drop(db);
+    let names: Names = speakers
         .map(|s| serde_json::from_str(&s))
         .transpose()?
         .unwrap_or_default();
-    names.retain(|l, _| segs.iter().any(|s| s.speaker.as_ref() == Some(l)));
-    let (shown, done_ms, total_ms) = progress(app, &db, id, &status, &segs)?;
-    // No note until there is speech; a recording that ends without any never gets one.
-    if cached.is_none() && segs.is_empty() && shown != "failed" {
-        if shown == "done" {
-            db.execute(
-                "UPDATE recordings SET written = 'done', status = 'done' WHERE id = ?1",
-                [id],
-            )?;
-        }
-        return Ok(());
-    }
-    let key = match shown {
-        "transcribing" => format!("transcribing {done_ms}/{total_ms} {}", segs.len()),
-        s => s.to_string(),
-    };
-    if written.as_deref() == Some(&key) {
-        return Ok(());
-    }
-    drop(db);
-
-    let start = Timestamp::from_millisecond(started_ms)?.to_zoned(app.tz.clone());
-    let header = Header {
-        id,
-        date: start.strftime("%Y-%m-%d %H:%M").to_string(),
-        source: &source,
-        status: shown,
-        done_ms,
-        total_ms,
-        error: error.as_deref().filter(|_| shown == "failed"),
-    };
     let target = locate(&app.vault, id, cached.as_deref())?;
-    let (name, key) = if target.is_none() && cached.is_some() {
-        // A rename synced as delete plus upload leaves a gap: only a long absence counts.
-        let misses = 1 + written
-            .as_deref()
-            .and_then(|w| w.strip_prefix("missing "))
-            .and_then(|n| n.parse::<u32>().ok())
-            .unwrap_or(0);
-        if misses < GONE_AFTER {
-            (cached, format!("missing {misses}"))
-        } else {
-            eprintln!("{id}: transcript moved out of the vault folder, no longer writing it");
-            (cached, "gone".to_string())
-        }
-    } else {
-        let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
-        let content = render(&header, &segs, &names);
-        (Some(put(&app.vault, id, target.as_deref(), &base, &content)?), key)
-    };
-    // The lock was released for the file IO, so the status read above may be stale: only
-    // 'done' is written back, never the old value. With it, the names shown become the ones
-    // C7 compares the file against.
-    let done = (shown == "done" && !key.starts_with("missing")).then_some("done");
-    app.db.lock().await.execute(
-        "UPDATE recordings SET vault_path = ?2, written = ?3, status = COALESCE(?4, status),
-         speakers = CASE WHEN ?4 IS NULL THEN speakers ELSE ?5 END
-         WHERE id = ?1",
-        params![id, name, key, done, serde_json::to_string(&names)?],
-    )?;
+    if segs.is_empty() || (target.is_none() && cached.is_some()) {
+        return Ok(());
+    }
+    let start = Timestamp::from_millisecond(started_ms)?.to_zoned(app.tz.clone());
+    let content = render(id, &start.strftime("%Y-%m-%d %H:%M").to_string(), &segs, &names);
+    let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
+    let name = put(&app.vault, id, target.as_deref(), &base, &content)?;
+    app.db
+        .lock()
+        .await
+        .execute("UPDATE recordings SET vault_path = ?2 WHERE id = ?1", params![id, name])?;
     Ok(())
 }
 
-/// Keeps every unfinished recording's transcript current.
+/// Writes the transcript of each newly diarized recording, which makes it done. Names
+/// matched at diarization are kept only for the labels that survived the echo dedupe.
 pub async fn run(app: Arc<App>) {
     loop {
         let ids: rusqlite::Result<Vec<String>> = {
             let db = app.db.lock().await;
-            db.prepare(
-                "SELECT id FROM recordings WHERE started_ms IS NOT NULL
-                 AND COALESCE(written, '') NOT IN ('done', 'failed', 'gone')",
-            )
-            .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
+            db.prepare("SELECT id FROM recordings WHERE status = 'diarized'")
+                .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
         };
         for id in ids.unwrap_or_else(|e| {
             eprintln!("vault: {e}");
             vec![]
         }) {
-            if let Err(e) = sync(&app, &id).await {
+            if let Err(e) = done(&app, &id).await {
                 eprintln!("{id}: vault: {e:#}");
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
+}
+
+async fn done(app: &App, id: &str) -> Result<()> {
+    {
+        let db = app.db.lock().await;
+        let segs = crate::merge::merged(&db, id)?;
+        let speakers: Option<String> =
+            db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
+        let mut names: Names = speakers
+            .map(|s| serde_json::from_str(&s))
+            .transpose()?
+            .unwrap_or_default();
+        names.retain(|l, _| segs.iter().any(|s| s.speaker.as_ref() == Some(l)));
+        db.execute(
+            "UPDATE recordings SET speakers = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(&names)?],
+        )?;
+    }
+    write(app, id).await?;
+    app.db
+        .lock()
+        .await
+        .execute("UPDATE recordings SET status = 'done' WHERE id = ?1", [id])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -316,16 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_readme_format() {
-        let h = Header {
-            id: "r1",
-            date: "2026-09-24 14:00".into(),
-            source: "laptop",
-            status: "done",
-            done_ms: 3_119_000,
-            total_ms: 3_119_000,
-            error: None,
-        };
+    fn renders_named_attendees_and_lines() {
         let segs = [
             seg(
                 "room",
@@ -338,28 +285,18 @@ mod tests {
             seg("room", 3_726_000, "Hm.", None),
             seg("room", 3_727_000, "Ok.", Some("room/S2")),
         ];
+        let names: Names = [("remote/S1", "Jan"), ("room/S1", "Max"), ("room/S2", "Max")]
+            .map(|(l, n)| (l.to_string(), n.to_string()))
+            .into();
         assert_eq!(
-            render(&h, &segs, &Names::new()),
-            "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
-             status: done\nprogress: 52/52 min\nattendees: []\nroom/S1: \"\"\n\
-             room/S2: \"\"\nroom/S10: \"\"\nremote/S1: \"\"\n---\n\n\
-             **S1** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
-             **S1** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
+            render("r1", "2026-09-24 14:00", &segs, &names),
+            "---\nid: r1\ndate: 2026-09-24 14:00\nattendees: [\"[[Max]]\", \"[[Jan]]\"]\n\
+             link: http://localhost:8765/#r1\n---\n\n\
+             **Max** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
+             **Jan** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
              **S10** (room, [01:02:05](http://localhost:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
              **?** (room, [01:02:06](http://localhost:8765/r/r1/audio.ogg#t=3726)): Hm.\n\
-             **S2** (room, [01:02:07](http://localhost:8765/r/r1/audio.ogg#t=3727)): Ok.\n"
-        );
-        let h = Header {
-            status: "failed",
-            done_ms: 100_000,
-            error: Some("whisper-cli: \"model\" missing"),
-            ..h
-        };
-        assert_eq!(
-            render(&h, &[], &Names::new()),
-            "---\nid: r1\ndate: 2026-09-24 14:00\nduration: 52m\nsource: laptop\n\
-             status: failed\nprogress: 2/52 min\nerror: \"whisper-cli: \\\"model\\\" missing\"\n\
-             attendees: []\n---\n\n"
+             **Max** (room, [01:02:07](http://localhost:8765/r/r1/audio.ogg#t=3727)): Ok.\n"
         );
     }
 
@@ -394,220 +331,69 @@ mod tests {
         app.vault = tmp.path().join("vault");
         app.tz = jiff::tz::TimeZone::get("Europe/Amsterdam").unwrap();
         std::fs::create_dir_all(&app.vault).unwrap();
-        let dir = app.recording_dir("r1");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("meta.json"),
-            r#"{"id":"r1","started_ms":1790431200000,"app":"Zen","segments":[
-                {"file":"00-mic.oga","key":"mic","target":"x","offset_ms":0,"end_ms":null},
-                {"file":"01-app-7.oga","key":"app-7","target":"y","offset_ms":60000,"end_ms":null}]}"#,
-        )
-        .unwrap();
         app.db
             .lock()
             .await
             .execute_batch(
-                "INSERT INTO recordings (id, source, started_ms) VALUES ('r1', 'laptop', 1790431200000);
-                 INSERT INTO file_progress (recording, file, done_ms) VALUES
-                   ('r1', '00-mic.oga', 240000), ('r1', '01-app-7.oga', 150000);
-                 INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
-                   (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000, 1),
-                   (2, 'r1', '01-app-7.oga', 'remote', 60000, 0, 30000, 1),
-                   (3, 'r1', '00-mic.oga', 'room', 0, 150000, 170000, 0);
-                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text) VALUES
-                   ('r1', 1, 'room', 1000, 3000, 'Goedemorgen allemaal.'),
-                   ('r1', 2, 'remote', 61000, 64000, 'Hoi!');",
+                r#"INSERT INTO recordings (id, source, started_ms, status, speakers)
+                     VALUES ('r1', 'laptop', 1790431200000, 'diarized', '{"room/S1":"Max","room/S9":"Echo"}');
+                   INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
+                     (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000, 1),
+                     (2, 'r1', '01-app-7.oga', 'remote', 60000, 0, 30000, 1);
+                   INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker) VALUES
+                     ('r1', 1, 'room', 1000, 3000, 'Goedemorgen allemaal.', 'room/S1'),
+                     ('r1', 2, 'remote', 61000, 64000, 'Hoi!', 'remote/S1');"#,
             )
             .unwrap();
         (tmp, app)
     }
 
-    fn read(app: &App, name: &str) -> String {
-        std::fs::read_to_string(app.vault.join(name)).unwrap()
+    async fn one(app: &App, sql: &str) -> String {
+        app.db.lock().await.query_row(sql, [], |r| r.get(0)).unwrap()
     }
 
     #[tokio::test]
-    async fn writes_progressively_then_done() {
+    async fn done_writes_the_note_then_rewrites_it_where_it_went() {
         let (_tmp, app) = setup().await;
+        done(&app, "r1").await.unwrap();
         let name = "2026-09-26 1600 Meeting.md";
-        sync(&app, "r1").await.unwrap();
-        let text = read(&app, name);
+        let text = std::fs::read_to_string(app.vault.join(name)).unwrap();
         assert!(
-            text.contains(
-                "\ndate: 2026-09-26 16:00\nduration: 4m\nsource: laptop\n\
-                               status: transcribing\nprogress: 3/4 min\n"
-            ),
-            "{text}"
-        );
-        assert!(text.contains("attendees: []\n---\n"), "{text}");
-        assert!(text.contains("**?** (remote, [00:01:01]"), "{text}");
-
-        // The user renames it; the next window lands there.
-        std::fs::rename(app.vault.join(name), app.vault.join("Kickoff.md")).unwrap();
-        app.db
-            .lock()
-            .await
-            .execute_batch(
-                "UPDATE windows SET done = 1 WHERE id = 3;
-                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text)
-                   VALUES ('r1', 3, 'room', 151000, 153000, 'Laatste punt.');",
-            )
-            .unwrap();
-        sync(&app, "r1").await.unwrap();
-        let text = read(&app, "Kickoff.md");
-        assert!(text.contains("progress: 3/4 min\n"), "{text}");
-        assert!(text.contains("Laatste punt."), "{text}");
-        assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 1);
-
-        app.db
-            .lock()
-            .await
-            .execute_batch(
-                "UPDATE recordings SET status = 'diarized', finished = 1;
-                 UPDATE segments SET speaker = track || '/S1';",
-            )
-            .unwrap();
-        sync(&app, "r1").await.unwrap();
-        let text = read(&app, "Kickoff.md");
-        assert!(text.contains("status: done\nprogress: 4/4 min\n"), "{text}");
-        assert!(
-            text.contains("attendees: []\nroom/S1: \"\"\nremote/S1: \"\"\n---\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "**S1** (room, [00:00:01](http://localhost:8765/r/r1/audio.ogg#t=1)): Goedemorgen allemaal.\n"
-            ),
-            "{text}"
-        );
-        let status: String = app
-            .db
-            .lock()
-            .await
-            .query_row("SELECT status FROM recordings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(status, "done");
-
-        // The body is the user's now.
-        std::fs::write(app.vault.join("Kickoff.md"), "---\nid: r1\n---\nmine\n").unwrap();
-        sync(&app, "r1").await.unwrap();
-        assert_eq!(read(&app, "Kickoff.md"), "---\nid: r1\n---\nmine\n");
-    }
-
-    #[tokio::test]
-    async fn prefilled_names_label_lines() {
-        let (_tmp, app) = setup().await;
-        app.db
-            .lock()
-            .await
-            .execute_batch(
-                r#"UPDATE recordings SET status = 'diarized', finished = 1,
-                     speakers = '{"room/S1":"Max","room/S9":"Echo"}';
-                   UPDATE windows SET done = 1;
-                   UPDATE segments SET speaker = track || '/S1';"#,
-            )
-            .unwrap();
-        sync(&app, "r1").await.unwrap();
-        let text = read(&app, "2026-09-26 1600 Meeting.md");
-        assert!(
-            text.contains("attendees: [\"[[Max]]\"]\nroom/S1: \"Max\"\nremote/S1: \"\"\n---\n"),
+            text.starts_with("---\nid: r1\ndate: 2026-09-26 16:00\nattendees: [\"[[Max]]\"]\n"),
             "{text}"
         );
         assert!(text.contains("**Max** (room, [00:00:01]"), "{text}");
         assert!(text.contains("**S1** (remote, [00:01:01]"), "{text}");
-        let speakers: String = app
-            .db
-            .lock()
-            .await
-            .query_row("SELECT speakers FROM recordings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(speakers, r#"{"room/S1":"Max"}"#, "labels not shown are dropped");
-    }
-
-    #[tokio::test]
-    async fn failed_gets_an_error_line() {
-        let (_tmp, app) = setup().await;
-        for _ in 0..crate::db::ATTEMPTS {
-            crate::db::fail(&*app.db.lock().await, "r1", "transcribing: whisper-cli: boom").unwrap();
-        }
-        sync(&app, "r1").await.unwrap();
-        let text = read(&app, "2026-09-26 1600 Meeting.md");
-        assert!(
-            text.contains(
-                "status: failed\nprogress: 3/4 min\n\
-                               error: \"transcribing: whisper-cli: boom\"\n"
-            ),
-            "{text}"
+        assert_eq!(
+            one(&app, "SELECT status || ' ' || speakers FROM recordings").await,
+            r#"done {"room/S1":"Max"}"#,
+            "labels not shown are dropped"
         );
-    }
 
-    #[tokio::test]
-    async fn stops_when_moved_out() {
-        let (tmp, app) = setup().await;
-        sync(&app, "r1").await.unwrap();
-        std::fs::rename(
-            app.vault.join("2026-09-26 1600 Meeting.md"),
-            tmp.path().join("elsewhere.md"),
-        )
-        .unwrap();
-        app.db.lock().await.execute("UPDATE windows SET done = 1", []).unwrap();
-        let written = || async {
-            app.db
-                .lock()
-                .await
-                .query_row("SELECT written FROM recordings", [], |r| r.get::<_, String>(0))
-                .unwrap()
-        };
-        sync(&app, "r1").await.unwrap();
-        assert_eq!(written().await, "missing 1");
-
-        // Back under a new name (a rename synced as delete plus upload): writing resumes.
-        std::fs::rename(tmp.path().join("elsewhere.md"), app.vault.join("Kickoff.md")).unwrap();
-        sync(&app, "r1").await.unwrap();
-        assert!(read(&app, "Kickoff.md").contains("status: transcribing"));
-        assert!(written().await.starts_with("transcribing"));
-
-        std::fs::rename(app.vault.join("Kickoff.md"), tmp.path().join("elsewhere.md")).unwrap();
+        // Renamed in Obsidian: the next write lands there.
+        std::fs::rename(app.vault.join(name), app.vault.join("Kickoff.md")).unwrap();
         app.db
             .lock()
             .await
-            .execute("UPDATE recordings SET status = 'diarized', finished = 1", [])
+            .execute(r#"UPDATE recordings SET speakers = '{"remote/S1":"Jan"}'"#, [])
             .unwrap();
-        for _ in 0..GONE_AFTER {
-            sync(&app, "r1").await.unwrap();
-        }
+        write(&app, "r1").await.unwrap();
+        let text = std::fs::read_to_string(app.vault.join("Kickoff.md")).unwrap();
+        assert!(text.contains("attendees: [\"[[Jan]]\"]\n"), "{text}");
+        assert!(text.contains("**Jan** (remote, [00:01:01]"), "{text}");
+
+        // Moved out: left alone, not recreated.
+        std::fs::remove_file(app.vault.join("Kickoff.md")).unwrap();
+        write(&app, "r1").await.unwrap();
         assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
-        assert_eq!(written().await, "gone");
-        let status: String = app
-            .db
-            .lock()
-            .await
-            .query_row("SELECT status FROM recordings", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(status, "done");
     }
 
     #[tokio::test]
     async fn no_speech_no_note() {
         let (_tmp, app) = setup().await;
         app.db.lock().await.execute("DELETE FROM segments", []).unwrap();
-        sync(&app, "r1").await.unwrap();
+        done(&app, "r1").await.unwrap();
         assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
-        app.db
-            .lock()
-            .await
-            .execute_batch("UPDATE windows SET done = 1; UPDATE recordings SET status = 'diarized', finished = 1;")
-            .unwrap();
-        sync(&app, "r1").await.unwrap();
-        assert_eq!(std::fs::read_dir(&app.vault).unwrap().count(), 0);
-        let row: (String, String) = app
-            .db
-            .lock()
-            .await
-            .query_row("SELECT status, written FROM recordings", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(row, ("done".into(), "done".into()));
+        assert_eq!(one(&app, "SELECT status FROM recordings").await, "done");
     }
 }

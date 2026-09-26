@@ -98,12 +98,9 @@ async fn uploaded_spool_is_transcribed() {
             .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
             .filter_map(|e| std::fs::read_to_string(e.path()).ok())
             .collect();
-        assert!(!text.contains("status: failed"), "{text}");
-        if text.contains("status: done") {
-            assert!(
-                text.contains(&format!("id: {id}")) && text.contains("remote/S1"),
-                "{text}"
-            );
+        // Written once diarized.
+        if text.contains(&format!("id: {id}")) {
+            assert!(text.contains("(remote, "), "{text}");
             break;
         }
         assert!(Instant::now() < deadline, "not done: {text}");

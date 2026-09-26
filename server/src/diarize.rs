@@ -417,7 +417,10 @@ pub async fn step(app: &App) -> Result<bool> {
         return Ok(false);
     };
     let db = || app.db.lock();
-    match label(app, &id).await {
+    *app.diarizing.lock().unwrap() = Some((id.clone(), crate::db::now_ms()));
+    let res = label(app, &id).await;
+    *app.diarizing.lock().unwrap() = None;
+    match res {
         Ok(()) => {
             db().await.execute(
                 "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",

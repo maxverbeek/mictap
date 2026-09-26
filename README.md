@@ -1,9 +1,9 @@
 # mictap
 
 Self-hosted meeting transcription. The laptop records, the VPS transcribes,
-transcripts land in Obsidian. The vault's markdown is the source of truth; a
-small web page (`web/`, static files over the JSON API) makes naming speakers
-and replaying lines easier than Obsidian's property editor.
+you name speakers and replay lines on a small web page served by the VPS, and
+finished transcripts land in Obsidian. The server only writes to the vault; it
+never reads your edits back.
 
 ```text
 laptop (mictap daemon) --byte ranges over tailnet--> homeserver (mictap server)
@@ -94,57 +94,40 @@ meeting instead of after it.
 ## Transcripts (Obsidian)
 
 Written to `/srv/vault/mictap/`, which Remotely Save syncs like
-any other folder.
+any other folder, once a recording is done (transcribed and diarized).
 
 ```markdown
 ---
 id: 01J8X...
 date: 2026-09-24 14:00
-duration: 52m
-source: laptop            # or upload
-status: done              # transcribing | done | failed
-progress: 52/52 min
 attendees: ["[[Max]]", "[[Jan]]", "[[Eva]]"]
-room/S1: Max
-room/S2: Eva
-remote/S1: Jan
-remote/S2: ""             # fill in to name
+link: http://homeserver:8765/#01J8X...
 ---
 
 **Max** (room, [00:14:02](http://homeserver:8765/r/01J8X.../audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?
 **Eva** (room, [00:14:05](http://homeserver:8765/r/01J8X.../audio.ogg#t=845)): Ja, prima.
-**Jan** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
+**S2** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
 ```
 
-- The file appears with the first transcribed speech and fills in as
-  transcription progresses. A recording without any speech gets no file.
-  `status: failed` comes with an `error:` line. Writes go to a temp file in
-  `mictap/` that is renamed over the transcript.
-- Every speaker is its own property, named after its label (`room/S1`,
-  `remote/S2`): Obsidian's property editor only edits flat values. Other
-  properties you add are left alone.
+- `attendees` are the named speakers; unnamed ones only show up as `S<n>`
+  in the lines. `link` opens the recording on the web page.
+- The whole file is the server's: it is rewritten whenever you name a
+  speaker on the web page, and edits made in Obsidian are lost then. A
+  recording without any speech, or one that failed, gets no file. Writes go
+  to a temp file in `mictap/` that is renamed over the transcript.
 - Filenames are `YYYY-MM-DD HHMM Meeting.md`. Rename freely: the server finds
-  transcripts by `id`, not by filename. Moving a file out of `mictap/` hands
-  it over to you entirely.
-
-Who owns what:
-
-- **Body**: the server's until `status: done`, yours afterwards. The server
-  never reads it back, so editing prose has no side effects.
-- **Speaker properties** (`room/S1`, ...): yours, editable any time. Filling in a name makes the
-  server rewrite that speaker's line labels (and nothing else in the body)
-  and add a wikilink to `attendees`. The server polls every 30 s.
-- **`attendees`**: derived by the server from the speaker properties.
-- **`mictap/vocabulary.md`**: yours. Words whisper keeps getting wrong
-  (names, clients, jargon), one per line. Nothing is inferred from your edits.
+  transcripts by `id`, not by filename. A file moved out of `mictap/` or
+  deleted is not written again.
+- **`mictap/vocabulary.md`** is the one file the server reads: words whisper
+  keeps getting wrong (names, clients, jargon), one per line.
 
 ## Learning names
 
 Naming a speaker stores that cluster's voice embedding. After diarizing a
 new recording, each cluster is matched against the stored voices (cosine,
 best match at or above `MICTAP_MATCH_THRESHOLD`, default 0.75), and a match
-pre-fills its speaker property and labels its lines. Unmatched clusters stay `""`, and
-a name you set is never overwritten. Only new transcripts are pre-filled:
+pre-fills its name. Unmatched clusters stay unnamed, and a name you set is
+never overwritten. Only new transcripts are pre-filled:
 blanks in older ones are left alone. Accuracy is modest (see
 `local/learning-names.md`): expect misses more than wrong names.
 
@@ -168,14 +151,12 @@ is rewritten.
 ## Web page
 
 `web/index.html`, plain JS with no build step, served at `/`: every
-recording, and per recording its lines with the speaker names. Clicking a
+recording grouped by day with its progress (refreshed while anything is in
+progress), and per recording its lines with the speaker names. Clicking a
 line's timestamp plays just that line from the mixdown (the player keeps
 going if you press play again); the ▶ next to a speaker plays their longest
-line. Naming speakers there edits the transcript's
-speaker properties and applies them right away, exactly as an edit in Obsidian
-would (relabeled lines, `attendees`, learned voices). A save is refused for
-10 s after the file changed from elsewhere, since a sync may still be writing
-it. It shows the server's lines, not your edits to the body.
+line. Naming speakers (once the recording is done) stores the names, learns
+their voices and rewrites the transcript in the vault.
 
 ## Upload
 
@@ -202,12 +183,14 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
 - `POST /recordings?filename=&mtime_ms=`: whole-file upload, raw body or
   multipart.
 - `GET /recordings`: every recording, newest first, with its status and
-  progress.
+  progress. `progress` is `null` once done or failed, else
+  `{"step": "unstarted"}`, `{"step": "transcribing", "percent": 42}` or
+  `{"step": "diarizing", "since_ms": ...}` (`null` while queued).
 - `GET /recordings/{id}`: one recording, its lines (`segments`) and speaker
   `names`; `editable` once names can be set.
 - `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` sets speaker names
-  (`""` clears one) in the transcript. 409 before `status: done` or within
-  10 s of a change from elsewhere.
+  (`""` clears one) and rewrites the transcript. 409 until the recording is
+  done.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
   while transcribing). The transcript stays.
 - `GET /r/{id}/audio.ogg`: mixdown.

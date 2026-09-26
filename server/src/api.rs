@@ -15,12 +15,14 @@ use axum::{
 };
 use futures_util::StreamExt;
 use jiff::{civil::DateTime, tz::TimeZone, Timestamp};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
+
+use crate::vault::Names;
 
 pub struct App {
     dir: PathBuf,
@@ -30,8 +32,8 @@ pub struct App {
     pub(crate) vault: PathBuf,
     /// Static files served for every path no route takes: the web page.
     web: PathBuf,
-    /// Each transcript's mtime after speakers::update last wrote it: not an upload in progress.
-    pub(crate) relabeled: std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::SystemTime>>,
+    /// The recording being diarized, and since when (Unix ms).
+    pub(crate) diarizing: std::sync::Mutex<Option<(String, i64)>>,
 }
 
 impl App {
@@ -43,10 +45,10 @@ impl App {
         Ok(Self {
             dir,
             web,
+            diarizing: Default::default(),
             db: Mutex::new(db),
             tz: TimeZone::system(),
             vault,
-            relabeled: Default::default(),
         })
     }
 
@@ -267,13 +269,43 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
     let mut out = Vec::with_capacity(rows.len());
     for (id, source, started_ms, status, audio, transcript) in rows {
         let segs = crate::merge::merged(&db, &id)?;
+        let progress = step(&app, &db, &id, &status, &segs)?;
         let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
         out.push(json!({
-            "id": id, "source": source, "date": date(&app, started_ms), "status": status,
+            "id": id, "source": source, "date": date(&app, started_ms), "status": status, "progress": progress,
             "done_ms": done_ms, "total_ms": total_ms, "audio": audio, "transcript": transcript,
         }));
     }
     Ok(Json(out))
+}
+
+/// What a recording that isn't done or failed is at: `unstarted`, `transcribing` with a
+/// `percent`, or `diarizing` with the Unix ms it started at, if it has.
+fn step(app: &App, db: &Connection, id: &str, status: &str, segs: &[crate::merge::Segment]) -> Result<Value> {
+    if matches!(status, "diarized" | "done" | "failed") {
+        return Ok(Value::Null);
+    }
+    let (done, undone): (i64, i64) = db.query_row(
+        "SELECT COALESCE(SUM(done), 0), COALESCE(SUM(NOT done), 0) FROM windows WHERE recording = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if status == "windowed" && undone == 0 {
+        let since = app
+            .diarizing
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(d, _)| d == id)
+            .map(|(_, ms)| *ms);
+        return Ok(json!({ "step": "diarizing", "since_ms": since }));
+    }
+    if done == 0 {
+        return Ok(json!({ "step": "unstarted" }));
+    }
+    let (_, done_ms, total_ms) = crate::vault::progress(app, db, id, status, segs)?;
+    let percent = (100 * done_ms).checked_div(total_ms).unwrap_or(0);
+    Ok(json!({ "step": "transcribing", "percent": percent }))
 }
 
 fn date(app: &App, started_ms: Option<i64>) -> Option<String> {
@@ -285,69 +317,82 @@ fn date(app: &App, started_ms: Option<i64>) -> Option<String> {
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>> {
     check_name(&id)?;
     let db = app.db.lock().await;
-    type Row = (Option<i64>, String, Option<String>, Option<String>, Option<String>);
+    type Row = (Option<i64>, String, Option<String>, Option<String>);
     let row: Option<Row> = db
         .query_row(
-            "SELECT started_ms, status, audio, speakers, written FROM recordings WHERE id = ?1",
+            "SELECT started_ms, status, audio, speakers FROM recordings WHERE id = ?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
-    let Some((started_ms, status, audio, speakers, written)) = row else {
+    let Some((started_ms, status, audio, speakers)) = row else {
         return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")));
     };
     let segs = crate::merge::merged(&db, &id)?;
+    let editable = status == "done";
+    let progress = step(&app, &db, &id, &status, &segs)?;
     let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
     let names: Value = speakers.map_or(Ok(json!({})), |s| serde_json::from_str(&s))?;
     Ok(Json(json!({
         "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
-        "total_ms": total_ms, "audio": audio, "editable": written.as_deref() == Some("done"),
+        "total_ms": total_ms, "audio": audio, "editable": editable, "progress": progress,
         "names": names, "segments": segs,
     })))
 }
 
-/// Sets speaker names (`label -> name`, `""` clears) in the transcript's properties, as if
-/// the user had edited them in Obsidian.
+/// Sets speaker names (`label -> name`, `""` clears one), learns their voices and rewrites
+/// the transcript.
 async fn name_speakers(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
-    Json(names): Json<crate::speakers::Names>,
+    Json(names): Json<Names>,
 ) -> Result<StatusCode> {
     check_name(&id)?;
-    if let Some(l) = names.keys().find(|l| !crate::speakers::is_label(l)) {
+    if let Some(l) = names.keys().find(|l| !crate::vault::is_label(l)) {
         return Err(Error(StatusCode::BAD_REQUEST, format!("not a speaker label: {l}")));
     }
-    let cached: Option<Option<String>> = app
-        .db
-        .lock()
-        .await
-        .query_row(
-            "SELECT vault_path FROM recordings WHERE id = ?1 AND written = 'done'",
-            [&id],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(cached) = cached else {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            format!("{id} is not done, or its transcript is gone"),
-        ));
-    };
-    let Some(path) = crate::vault::locate(&app.vault, &id, cached.as_deref())? else {
-        return Err(Error(
-            StatusCode::NOT_FOUND,
-            format!("no transcript of {id} in the vault"),
-        ));
-    };
-    let mtime = std::fs::metadata(&path)?.modified()?;
-    let ours = app.relabeled.lock().unwrap().get(&path) == Some(&mtime);
-    if !ours && mtime > std::time::SystemTime::now() - crate::speakers::QUIET {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "the transcript changed a moment ago, try again in a few seconds".into(),
-        ));
+    {
+        let db = app.db.lock().await;
+        let row: Option<(String, Option<String>)> = db
+            .query_row("SELECT status, speakers FROM recordings WHERE id = ?1", [&id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let applied: Names = match row {
+            None => return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}"))),
+            Some((s, _)) if s != "done" => {
+                return Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done")));
+            }
+            Some((_, s)) => s.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default(),
+        };
+        let mut all = applied.clone();
+        for (label, name) in names {
+            match name.trim() {
+                "" => all.remove(&label),
+                n => all.insert(label, n.to_string()),
+            };
+        }
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE recordings SET speakers = ?2 WHERE id = ?1",
+            params![id, serde_json::to_string(&all)?],
+        )?;
+        for label in applied.keys().filter(|l| !all.contains_key(*l)) {
+            tx.execute(
+                "DELETE FROM voices WHERE recording = ?1 AND label = ?2",
+                params![id, label],
+            )?;
+        }
+        for (label, name) in all.iter().filter(|(l, n)| applied.get(*l) != Some(n)) {
+            tx.execute(
+                "INSERT OR REPLACE INTO voices (name, embedding, recording, label)
+                 SELECT ?3, embedding, recording, label FROM clusters WHERE recording = ?1 AND label = ?2",
+                params![id, label, name],
+            )?;
+        }
+        tx.commit()?;
     }
-    crate::speakers::rename(&app, &path, mtime, &names).await?;
+    crate::vault::write(&app, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -374,7 +419,7 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
 }
 
 /// Diarizes a finished recording again. Its labels, names and voices are dropped, the names
-/// are pre-filled anew from other recordings' voices, and the vault file is rewritten.
+/// are pre-filled anew from other recordings' voices, and the transcript is rewritten.
 async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
     check_name(&id)?;
     let mut db = app.db.lock().await;
@@ -398,8 +443,8 @@ async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Resul
     tx.execute("DELETE FROM clusters WHERE recording = ?1", [&id])?;
     tx.execute("DELETE FROM voices WHERE recording = ?1", [&id])?;
     tx.execute(
-        "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, written = NULL,
-         speakers = NULL WHERE id = ?1",
+        "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, speakers = NULL
+         WHERE id = ?1",
         [&id],
     )?;
     tx.commit()?;
@@ -715,10 +760,10 @@ mod tests {
         {
             let db = app.db.lock().await;
             db.execute_batch(
-                "INSERT INTO recordings (id, source, status, audio, written, speakers) VALUES
-                   ('r1', 'laptop', 'done', 'ready', 'done', '{\"room/S1\":\"Max\"}'),
-                   ('r2', 'laptop', 'transcribing', 'ready', NULL, NULL),
-                   ('r3', 'laptop', 'done', 'expired', 'done', NULL);
+                "INSERT INTO recordings (id, source, status, audio, speakers) VALUES
+                   ('r1', 'laptop', 'done', 'ready', '{\"room/S1\":\"Max\"}'),
+                   ('r2', 'laptop', 'transcribing', 'ready', NULL),
+                   ('r3', 'laptop', 'done', 'expired', NULL);
                  INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done)
                    VALUES (1, 'r1', '00-mic.oga', 'room', 0, 0, 1000, 1);
                  INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker)
@@ -741,12 +786,108 @@ mod tests {
         let db = app.db.lock().await;
         let one = |sql: &str| -> String { db.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(
-            one("SELECT status || '/' || attempts || '/' || COALESCE(written, '-') || '/' || COALESCE(speakers, '-') FROM recordings WHERE id = 'r1'"),
-            "windowed/0/-/-"
+            one("SELECT status || '/' || attempts || '/' || COALESCE(speakers, '-') FROM recordings WHERE id = 'r1'"),
+            "windowed/0/-"
         );
         assert_eq!(one("SELECT COALESCE(speaker, '-') FROM segments"), "-");
         assert_eq!(one("SELECT group_concat(recording) FROM clusters"), "r3");
         assert_eq!(one("SELECT group_concat(recording) FROM voices"), "r3");
+    }
+
+    #[tokio::test]
+    async fn names_speakers_learns_voices_and_rewrites_the_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::open(tmp.path().join("state")).unwrap();
+        app.vault = tmp.path().join("vault");
+        std::fs::create_dir(&app.vault).unwrap();
+        let app = Arc::new(app);
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                r#"INSERT INTO recordings (id, source, started_ms, status, speakers)
+                     VALUES ('r1', 'laptop', 0, 'done', '{"room/S2":"Eva"}'), ('r2', 'laptop', 0, 'windowed', NULL);
+                   INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done)
+                     VALUES (1, 'r1', 'a', 'room', 0, 0, 9000, 1);
+                   INSERT INTO segments (recording, window, track, start_ms, end_ms, text, speaker) VALUES
+                     ('r1', 1, 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 1, 'room', 1000, 2000, 'Ja.', 'room/S2');
+                   INSERT INTO clusters VALUES ('r1', 'room/S1', x'01'), ('r1', 'room/S2', x'02');
+                   INSERT INTO voices VALUES ('Eva', x'02', 'r1', 'room/S2');"#,
+            )
+            .unwrap();
+        let put = |id: &str, body: &str| {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(format!("/recordings/{id}/speakers"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = router(app.clone()).oneshot(req);
+            async move { res.await.unwrap().status() }
+        };
+        assert_eq!(put("r1", r#"{"bad":"x"}"#).await, StatusCode::BAD_REQUEST);
+        assert_eq!(put("r2", r#"{"room/S1":"Max"}"#).await, StatusCode::CONFLICT);
+        assert_eq!(put("nope", r#"{"room/S1":"Max"}"#).await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            put("r1", r#"{"room/S1":" Max ","room/S2":""}"#).await,
+            StatusCode::NO_CONTENT
+        );
+
+        let db = app.db.lock().await;
+        let one = |sql: &str| -> String { db.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(
+            one("SELECT speakers FROM recordings WHERE id = 'r1'"),
+            r#"{"room/S1":"Max"}"#
+        );
+        assert_eq!(
+            one("SELECT group_concat(name || ':' || hex(embedding)) FROM voices"),
+            "Max:01"
+        );
+        let note = std::fs::read_dir(&app.vault).unwrap().next().unwrap().unwrap().path();
+        let text = std::fs::read_to_string(note).unwrap();
+        assert!(text.contains("attendees: [\"[[Max]]\"]\n"), "{text}");
+        assert!(
+            text.contains("**Max** (room, ") && text.contains("**S2** (room, "),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_the_step_until_done() {
+        let (_tmp, app) = app();
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                "INSERT INTO recordings (id, source, started_ms, status) VALUES
+                   ('new', 'laptop', 4, 'receiving'), ('half', 'laptop', 3, 'windowed'),
+                   ('dia', 'laptop', 2, 'windowed'), ('done', 'laptop', 1, 'done');
+                 INSERT INTO windows (recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
+                   ('new', 'a', 'room', 0, 0, 10000, 0),
+                   ('half', 'a', 'room', 0, 0, 10000, 1), ('half', 'a', 'room', 0, 10000, 40000, 0),
+                   ('dia', 'a', 'room', 0, 0, 10000, 1), ('done', 'a', 'room', 0, 0, 10000, 1);",
+            )
+            .unwrap();
+        let dir = app.recording_dir("half");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"segments":[{"file":"a","offset_ms":0,"end_ms":40000}]}"#,
+        )
+        .unwrap();
+        *app.diarizing.lock().unwrap() = Some(("dia".into(), 1234));
+        let (_, b) = send(&app, "GET", "/recordings", b"").await;
+        let list: Value = serde_json::from_slice(&b).unwrap();
+        let got: Vec<&Value> = list.as_array().unwrap().iter().map(|r| &r["progress"]).collect();
+        assert_eq!(
+            got,
+            [
+                &json!({"step": "unstarted"}),
+                &json!({"step": "transcribing", "percent": 25}),
+                &json!({"step": "diarizing", "since_ms": 1234}),
+                &Value::Null,
+            ]
+        );
     }
 
     #[tokio::test]

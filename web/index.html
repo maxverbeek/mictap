@@ -15,6 +15,12 @@
          font: 15px/1.5 system-ui, sans-serif; }
   a { color: var(--accent); text-decoration: none; }
   h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .3rem; }
+  table { table-layout: fixed; }
+  td:nth-child(1) { width: 4rem; }
+  td:nth-child(2) { width: 5rem; }
+  td:nth-child(4) { width: 7rem; text-align: right; }
+  progress { width: 6rem; vertical-align: middle; }
   .muted { color: var(--muted); }
   table { width: 100%; border-collapse: collapse; }
   td { padding: .4rem .5rem .4rem 0; border-bottom: 1px solid var(--line); }
@@ -72,21 +78,38 @@ player.addEventListener("timeupdate", () => {
 // Resuming from the native controls plays on past the snippet.
 player.addEventListener("pause", () => { stopAt = null; });
 
+function progress(r) {
+  const p = r.progress;
+  if (!p) return r.status === "failed" ? "failed" : null;
+  if (p.step === "unstarted") return "not started";
+  if (p.step === "transcribing") return [h("progress", { value: p.percent, max: 100 }), ` transcribing ${p.percent}%`];
+  if (p.since_ms == null) return "waiting to diarize";
+  const s = Math.round((Date.now() - p.since_ms) / 1000);
+  return `diarizing for ${s >= 60 ? `${Math.floor(s / 60)}m ` : ""}${s % 60}s`;
+}
+
+const day = date => date
+  ? new Date(date.slice(0, 10)).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" })
+  : "Unknown date";
+
 async function list() {
   player.hidden = true;
   const recs = await api("/recordings");
+  const days = Map.groupBy(recs, r => day(r.date));
   app.replaceChildren(...nodes([
     h("h1", {}, "mictap"),
-    h("table", {}, recs.map(r => h("tr", {},
-      h("td", {}, h("a", { href: "#" + r.id }, r.date ?? r.id)),
-      h("td", { className: "muted" }, r.status === "transcribing"
-        ? `transcribing ${Math.round(r.done_ms / 60000)}/${Math.round(r.total_ms / 60000)} min`
-        : r.status),
-      h("td", { className: "muted" }, r.source),
-      h("td", { className: "muted" }, r.audio === "ready" ? "" : "no audio"),
-    ))),
+    [...days].map(([d, rs]) => [
+      h("h2", {}, d),
+      h("table", {}, rs.map(r => h("tr", {},
+        h("td", {}, h("a", { href: "#" + r.id }, r.date?.slice(11) ?? r.id)),
+        h("td", { className: "muted" }, r.source),
+        h("td", {}, progress(r)),
+        h("td", { className: "muted" }, r.audio === "expired" ? "audio expired" : ""),
+      ))),
+    ]),
     h("p", {}, h("a", { href: "/upload" }, "Upload a recording")),
   ]));
+  return recs.some(r => r.progress);
 }
 
 async function show(id) {
@@ -138,18 +161,22 @@ async function show(id) {
   ) }));
 
   app.replaceChildren(...nodes([
-    h("h1", {}, h("a", { href: "#" }, "mictap"), " / ", r.date ?? id,
-      h("span", { className: "muted" }, r.status === "done" ? "" : ` (${r.status})`)),
+    h("h1", {}, h("a", { href: "#" }, "mictap"), " / ", r.date ?? id),
+    h("p", { className: "muted" }, progress(r)),
     labels.length ? form : null,
     !audio ? h("p", { className: "muted" }, r.audio === "expired" ? "Audio deleted after 30 days." : "No audio yet.") : null,
     lines.map(l => l.el),
   ]));
+  return r.progress != null;
 }
 
+let refresh;
 async function route() {
+  clearTimeout(refresh);
   const id = decodeURIComponent(location.hash.slice(1));
-  try { await (id ? show(id) : list()); }
-  catch (err) { app.replaceChildren(h("p", {}, err.message)); }
+  try {
+    if (await (id ? show(id) : list())) refresh = setTimeout(route, 5000);
+  } catch (err) { app.replaceChildren(h("p", {}, err.message)); }
 }
 addEventListener("hashchange", route);
 route();

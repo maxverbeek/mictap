@@ -16,9 +16,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     attempts INTEGER NOT NULL DEFAULT 0,
     -- Unix ms before which workers leave a failing recording alone.
     retry_at INTEGER NOT NULL DEFAULT 0,
-    -- What the vault file last showed; 'done', 'failed' and 'gone' are final.
-    written TEXT,
-    -- The speakers map (label -> name, JSON) last applied to the vault file's lines.
+    -- The speakers map (label -> name, JSON).
     speakers TEXT,
     -- audio.ogg: NULL until mixed down, then 'ready', 'failed' or 'expired'.
     audio TEXT
