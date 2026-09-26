@@ -108,6 +108,15 @@ CREATE TABLE IF NOT EXISTS line_names (
     end_ms INTEGER NOT NULL,
     name TEXT NOT NULL
 );
+-- CAM++'s embedding of one line's own audio (L2-normalized f32 little-endian), kept by time
+-- like line_names. Not a model output: kept to guess names anew as voices are learned.
+CREATE TABLE IF NOT EXISTS line_voices (
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    track TEXT NOT NULL,
+    start_ms INTEGER NOT NULL,
+    end_ms INTEGER NOT NULL,
+    embedding BLOB NOT NULL
+);
 ";
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

@@ -451,6 +451,7 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         "file_progress",
         "clusters",
         "line_names",
+        "line_voices",
         "voices",
     ] {
         tx.execute(&format!("DELETE FROM {table} WHERE recording = ?1"), [&id])?;
@@ -487,6 +488,7 @@ async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Resul
     }
     let tx = db.transaction()?;
     tx.execute("DELETE FROM turns WHERE recording = ?1", [&id])?;
+    tx.execute("DELETE FROM line_voices WHERE recording = ?1", [&id])?;
     // whisper's segments expired: transcribe the audio again too.
     tx.execute(
         "UPDATE windows SET done = 0 WHERE recording = ?1
@@ -818,11 +820,19 @@ mod tests {
             .execute_batch(
                 "INSERT INTO recordings (id, source, status) VALUES ('r1', 'laptop', 'done');
                  INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00');
-                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1');",
+                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1');
+                 INSERT INTO line_voices (recording, track, start_ms, end_ms, embedding) VALUES ('r1', 'room', 0, 1000, x'00');",
             )
             .unwrap();
         let (s, b) = send(&app, "DELETE", "/recordings/r1", b"").await;
         assert_eq!(s, StatusCode::NO_CONTENT, "{}", String::from_utf8_lossy(&b));
+        let n: i64 = app
+            .db
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM line_voices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[tokio::test]
@@ -846,7 +856,8 @@ mod tests {
                  INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
                  INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');
                  INSERT INTO line_names (recording, track, start_ms, end_ms, name) VALUES ('r1', 'room', 0, 1000, 'Eva');
-                 INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms) VALUES ('Eva', x'00', 'r1', 'room', 0, 1000);",
+                 INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms) VALUES ('Eva', x'00', 'r1', 'room', 0, 1000);
+                 INSERT INTO line_voices (recording, track, start_ms, end_ms, embedding) VALUES ('r1', 'room', 0, 1000, x'00');",
             )
             .unwrap();
         }
@@ -889,6 +900,11 @@ mod tests {
             "a line name's voice stays"
         );
         assert_eq!(one("SELECT group_concat(name) FROM line_names"), "Eva");
+        assert_eq!(
+            one("SELECT CAST(COUNT(*) AS TEXT) FROM line_voices"),
+            "0",
+            "lines may change: embedded anew"
+        );
     }
 
     #[tokio::test]

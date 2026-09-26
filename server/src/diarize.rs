@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     ffi::{c_char, CString},
     path::Path,
     sync::Arc,
@@ -12,7 +12,7 @@ use tokio::process::Command;
 
 use crate::{
     api::App,
-    assemble::{derive, normalize, store_turns, Turn},
+    assemble::{bytes, derive, normalize, store_turns, Line, Turn},
 };
 
 const RATE: usize = 16_000;
@@ -195,25 +195,67 @@ impl Drop for Extractor {
     }
 }
 
+/// The normalized embedding of `samples` in `[start_ms, end_ms)`, or None when too short.
+fn embed_span(ex: &Extractor, samples: &[f32], start_ms: i64, end_ms: i64) -> Option<Vec<f32>> {
+    let at = |ms: i64| (ms.max(0) as usize * RATE / 1000).min(samples.len());
+    ex.embed(&samples[at(start_ms)..at(end_ms).max(at(start_ms))])
+        .map(|mut v| {
+            normalize(&mut v);
+            v
+        })
+}
+
 /// Sets each turn's normalized embedding, or None when it is too short.
 fn embed_turns(model: &str, samples: &[f32], turns: &mut [Turn]) -> Result<()> {
     let ex = Extractor::new(model)?;
-    let at = |ms: i64| (ms.max(0) as usize * RATE / 1000).min(samples.len());
     for t in turns {
-        t.embedding = ex
-            .embed(&samples[at(t.start_ms)..at(t.end_ms).max(at(t.start_ms))])
-            .map(|mut v| {
-                normalize(&mut v);
-                v
-            });
+        t.embedding = embed_span(&ex, samples, t.start_ms, t.end_ms);
     }
     Ok(())
 }
 
+/// Lines shorter than this get no line voice: too little to tell a voice by.
+const LINE_MS: i64 = 300;
+
+/// The line voices of `lines` from their tracks' samples: `(track, start_ms, end_ms, embedding)`.
+fn embed_lines(
+    model: &str,
+    samples: &BTreeMap<String, Vec<f32>>,
+    lines: &[Line],
+) -> Result<Vec<(String, i64, i64, Vec<f32>)>> {
+    let ex = Extractor::new(model)?;
+    Ok(lines
+        .iter()
+        .filter(|l| l.end_ms - l.start_ms >= LINE_MS)
+        .filter_map(|l| {
+            let v = embed_span(&ex, samples.get(&l.track)?, l.start_ms, l.end_ms)?;
+            Some((l.track.clone(), l.start_ms, l.end_ms, v))
+        })
+        .collect())
+}
+
+/// Computes and replaces the line voices of `id` from its tracks' `samples`.
+async fn line_voices(app: &App, id: &str, samples: BTreeMap<String, Vec<f32>>) -> Result<usize> {
+    let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
+    let lines = crate::assemble::lines(&*app.db.lock().await, id)?;
+    let voices = tokio::task::spawn_blocking(move || embed_lines(&model, &samples, &lines)).await??;
+    let mut db = app.db.lock().await;
+    let tx = db.transaction()?;
+    tx.execute("DELETE FROM line_voices WHERE recording = ?1", [id])?;
+    for (track, s, e, v) in &voices {
+        tx.execute(
+            "INSERT INTO line_voices (recording, track, start_ms, end_ms, embedding) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, track, s, e, bytes(v)],
+        )?;
+    }
+    tx.commit()?;
+    Ok(voices.len())
+}
+
 /// Diarizes the oldest windowed recording whose windows are all transcribed: stores each
-/// track's turns and their embeddings, derives its lines and suggests names from known
-/// voices. Returns false when there is none, or when it failed and will be retried after a
-/// pause.
+/// track's turns and their embeddings, derives its lines, embeds each line and suggests names
+/// from known voices. Returns false when there is none, or when it failed and will be retried
+/// after a pause.
 pub async fn step(app: &App) -> Result<bool> {
     let next: Option<String> = app
         .db
@@ -231,33 +273,41 @@ pub async fn step(app: &App) -> Result<bool> {
         return Ok(false);
     };
     *app.diarizing.lock().unwrap() = Some((id.clone(), crate::db::now_ms()));
-    let res = turns(app, &id).await;
+    let res = diarized(app, &id).await;
     *app.diarizing.lock().unwrap() = None;
-    let mut db = app.db.lock().await;
-    let tracks = match res {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{id}: diarizing: {e:#}");
-            return Ok(crate::db::fail(&db, &id, &format!("diarizing: {e:#}"))?);
-        }
-    };
-    let tx = db.transaction()?;
-    for (track, turns) in &tracks {
-        store_turns(&tx, &id, track, turns)?;
+    if let Err(e) = res {
+        eprintln!("{id}: diarizing: {e:#}");
+        return Ok(crate::db::fail(
+            &*app.db.lock().await,
+            &id,
+            &format!("diarizing: {e:#}"),
+        )?);
     }
-    derive(&tx, &id)?;
-    crate::names::suggest(&tx, &id, &crate::names::Matching::from_env())?;
-    tx.execute(
-        "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
-        [&id],
-    )?;
-    tx.commit()?;
     Ok(true)
 }
 
-/// sherpa's turns of each track of `id`, with their embeddings.
-async fn turns(app: &App, id: &str) -> Result<BTreeMap<String, Vec<Turn>>> {
-    let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
+async fn diarized(app: &App, id: &str) -> Result<()> {
+    let tracks = turns(app, id).await?;
+    {
+        let mut db = app.db.lock().await;
+        let tx = db.transaction()?;
+        for (track, (turns, _)) in &tracks {
+            store_turns(&tx, id, track, turns)?;
+        }
+        derive(&tx, id)?;
+        crate::names::suggest(&tx, id, &crate::names::Matching::from_env())?;
+        tx.commit()?;
+    }
+    line_voices(app, id, tracks.into_iter().map(|(t, (_, s))| (t, s)).collect()).await?;
+    app.db.lock().await.execute(
+        "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// Each track of `id` on one 16 kHz timeline, with sherpa's turns on it when `diarize`.
+async fn tracks(app: &App, id: &str, diarize: bool) -> Result<BTreeMap<String, (Vec<Turn>, Vec<f32>)>> {
     let mut files: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     {
         let db = app.db.lock().await;
@@ -274,30 +324,71 @@ async fn turns(app: &App, id: &str) -> Result<BTreeMap<String, Vec<Turn>>> {
         let wav = dir.join(format!(".{track}.wav"));
         let res = async {
             timeline(&dir, &files, &wav).await?;
-            let turns = diarize(&wav).await?;
-            let samples = read_wav(&wav)?;
-            anyhow::Ok((turns, samples))
+            let turns = if diarize { self::diarize(&wav).await? } else { vec![] };
+            anyhow::Ok((turns, read_wav(&wav)?))
         }
         .await;
         let _ = std::fs::remove_file(&wav);
-        let (mut turns, samples) = res?;
-        let model = model.clone();
-        let turns = tokio::task::spawn_blocking(move || {
-            embed_turns(&model, &samples, &mut turns)?;
-            anyhow::Ok(turns)
-        })
-        .await??;
-        out.insert(track, turns);
+        out.insert(track, res?);
     }
     Ok(out)
 }
 
-/// Diarizes one recording at a time.
+/// sherpa's turns of each track of `id`, with their embeddings, and the track's samples.
+async fn turns(app: &App, id: &str) -> Result<BTreeMap<String, (Vec<Turn>, Vec<f32>)>> {
+    let model = std::env::var("MICTAP_EMB_MODEL").context("MICTAP_EMB_MODEL not set")?;
+    let mut out = BTreeMap::new();
+    for (track, (mut turns, samples)) in tracks(app, id, true).await? {
+        let model = model.clone();
+        let track_out = tokio::task::spawn_blocking(move || {
+            embed_turns(&model, &samples, &mut turns)?;
+            anyhow::Ok((turns, samples))
+        })
+        .await??;
+        out.insert(track, track_out);
+    }
+    Ok(out)
+}
+
+/// Done recordings with their audio and lines but no line voices, oldest first: diarized
+/// before line voices existed.
+fn unembedded(db: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+    db.prepare(
+        "SELECT id FROM recordings r WHERE status = 'done' AND audio = 'ready'
+         AND EXISTS (SELECT 1 FROM lines WHERE recording = r.id)
+         AND NOT EXISTS (SELECT 1 FROM line_voices WHERE recording = r.id)
+         ORDER BY id",
+    )?
+    .query_map([], |r| r.get(0))?
+    .collect()
+}
+
+/// Computes the line voices of one recording that has none and rewrites its transcript, trying
+/// each recording once per run (`tried`). Returns false when there is none left.
+async fn backfill(app: &App, tried: &mut HashSet<String>) -> Result<bool> {
+    let ids = unembedded(&*app.db.lock().await)?;
+    let Some(id) = ids.into_iter().find(|id| !tried.contains(id)) else {
+        return Ok(false);
+    };
+    tried.insert(id.clone());
+    let samples = tracks(app, &id, false).await?;
+    let n = line_voices(app, &id, samples.into_iter().map(|(t, (_, s))| (t, s)).collect()).await?;
+    crate::vault::write(app, &id).await?;
+    eprintln!("{id}: backfilled {n} line voices");
+    Ok(true)
+}
+
+/// Diarizes one recording at a time; when there is none, backfills line voices.
 pub async fn run(app: Arc<App>) {
+    let mut tried = HashSet::new();
     loop {
         match step(&app).await {
             Ok(true) => continue,
-            Ok(false) => {}
+            Ok(false) => match backfill(&app, &mut tried).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => eprintln!("line voices: {e:#}"),
+            },
             Err(e) => eprintln!("diarize: {e:#}"),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -336,8 +427,6 @@ mod tests {
         assert_eq!(parse_turns("Started\n"), vec![]);
     }
 
-
-
     #[test]
     fn mixes_inputs_at_offsets() {
         assert_eq!(
@@ -350,7 +439,23 @@ mod tests {
         );
     }
 
-
+    #[test]
+    fn backfills_done_recordings_with_audio_and_lines_but_no_line_voices() {
+        let db = crate::db::open(Path::new(":memory:")).unwrap();
+        db.execute_batch(
+            "INSERT INTO recordings (id, source, status, audio) VALUES
+               ('a', 'laptop', 'done', 'ready'), ('b', 'laptop', 'done', 'expired'),
+               ('c', 'laptop', 'windowed', 'ready'), ('d', 'laptop', 'done', 'ready'),
+               ('e', 'laptop', 'done', 'ready'), ('f', 'laptop', 'done', 'ready');
+             INSERT INTO lines (recording, track, start_ms, end_ms, text) VALUES
+               ('a', 'room', 0, 1000, 'x'), ('b', 'room', 0, 1000, 'x'), ('c', 'room', 0, 1000, 'x'),
+               ('e', 'room', 0, 1000, 'x'), ('f', 'room', 0, 1000, 'x');
+             INSERT INTO line_voices (recording, track, start_ms, end_ms, embedding) VALUES
+               ('e', 'room', 0, 1000, x'00');",
+        )
+        .unwrap();
+        assert_eq!(unembedded(&db).unwrap(), ["a", "f"]);
+    }
 
     /// Needs ffmpeg and sherpa-onnx-offline-speaker-diarization on PATH,
     /// MICTAP_SEG_MODEL and MICTAP_EMB_MODEL.
@@ -385,7 +490,13 @@ mod tests {
         assert_eq!(status, "diarized");
         let speaker: String = db.query_row("SELECT speaker FROM lines", [], |r| r.get(0)).unwrap();
         assert_eq!(speaker, "room/S1");
-        let emb: Vec<u8> = db.query_row("SELECT embedding FROM clusters", [], |r| r.get(0)).unwrap();
+        let emb: Vec<u8> = db
+            .query_row("SELECT embedding FROM clusters", [], |r| r.get(0))
+            .unwrap();
         assert!(!crate::assemble::floats(&emb).is_empty());
+        let n: i64 = db
+            .query_row("SELECT COUNT(*) FROM line_voices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }
