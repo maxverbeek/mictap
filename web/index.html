@@ -272,9 +272,20 @@ async function nameLine(seg, name) {
   const card = focus && same(focus.seg, seg) ? focus.card : null;
   closeMenu();
   const clear = seg.line_name === name;
+  // In the transcript, naming a line of a speaker without a name names the whole speaker, so
+  // all their lines fill in; the card's samples, or a speaker already named, get the line only.
+  const whole = !card && seg.speaker && !cur.sp(seg.speaker).name && !seg.line_name && name !== "?";
+  const id = encodeURIComponent(cur.id);
   try {
-    await put(`/recordings/${encodeURIComponent(cur.id)}/lines`,
-      { track: seg.track, start_ms: seg.start_ms, end_ms: seg.end_ms, name: clear ? null : name });
+    if (whole) {
+      await put(`/recordings/${id}/speakers`,
+        { [seg.speaker]: { name, heard: [{ start_ms: seg.start_ms, end_ms: seg.end_ms, correct: true }] } });
+      delete pick[seg.speaker];
+      known = null;
+    } else {
+      await put(`/recordings/${id}/lines`,
+        { track: seg.track, start_ms: seg.start_ms, end_ms: seg.end_ms, name: clear ? null : name });
+    }
     await show(cur.id);
     if (card != null && !clear) { focus = { seg, card }; step(1); }
   } catch (err) { fail(err); }
