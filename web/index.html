@@ -4,95 +4,140 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>mictap</title>
 <style>
-  :root {
-    color-scheme: light dark;
-    --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --hl: #fef3c7; --accent: #2563eb;
-    --ok: #16a34a;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #1c1917; --fg: #e7e5e4; --muted: #a8a29e; --line: #44403c; --hl: #422006; --accent: #60a5fa;
-            --ok: #4ade80; }
-  }
-  body { margin: 0 auto; max-width: 52rem; padding: 1rem 1rem 6rem; background: var(--bg); color: var(--fg);
-         font: 15px/1.5 system-ui, sans-serif; }
-  a { color: var(--accent); text-decoration: none; }
-  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
-  h2 { font-size: 1rem; margin: 1.5rem 0 .3rem; }
-  table { table-layout: fixed; }
-  td:nth-child(1) { width: 4rem; }
-  td:nth-child(2) { width: 5rem; }
-  td:nth-child(4) { width: 7rem; text-align: right; }
-  progress { width: 6rem; vertical-align: middle; }
-  .muted { color: var(--muted); }
-  table { width: 100%; border-collapse: collapse; }
-  td { padding: .4rem .5rem .4rem 0; border-bottom: 1px solid var(--line); }
-  button { font: inherit; cursor: pointer; border: 1px solid var(--line); background: none; color: inherit;
-           border-radius: 4px; padding: .1rem .5rem; }
-  button:disabled { cursor: default; opacity: .4; }
-  input { font: inherit; padding: .2rem .4rem; border: 1px solid var(--line); border-radius: 4px;
-          background: var(--bg); color: inherit; width: 12rem; }
+  @font-face { font-family: "IBM Plex Serif"; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/ibm-plex-serif-latin-400-normal.woff2) format("woff2"); }
+  @font-face { font-family: "IBM Plex Serif"; font-style: italic; font-weight: 400; font-display: swap; src: url(/fonts/ibm-plex-serif-latin-400-italic.woff2) format("woff2"); }
+  @font-face { font-family: "IBM Plex Serif"; font-style: normal; font-weight: 600; font-display: swap; src: url(/fonts/ibm-plex-serif-latin-600-normal.woff2) format("woff2"); }
+  @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url(/fonts/ibm-plex-mono-latin-400-normal.woff2) format("woff2"); }
+  :root { --font: "IBM Plex Serif", Georgia, serif; --mono: "IBM Plex Mono", monospace; color-scheme: light;
+    --bg: #fbfaf7; --fg: #1f2328; --muted: #6b6f76; --line: #d8d6d0; --surface: #fffefb; --bar: #f6f4ef;
+    --accent: #2f4f8f; --hl: #e6ecf7; --grid: rgba(47, 79, 143, .07); --err: #a33; }
+  @media (prefers-color-scheme: dark) { :root { color-scheme: dark;
+    --bg: #15181d; --fg: #e3e5e8; --muted: #9aa1ab; --line: #333a44; --surface: #1b1f25; --bar: #191d23;
+    --accent: #8fb0ea; --hl: #22324d; --grid: rgba(143, 176, 234, .06); --err: #e88; } }
   [hidden] { display: none !important; }
+  body { margin: 0; background-color: var(--bg); color: var(--fg); font: 17px/1.5 var(--font);
+    background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 24px 24px; background-attachment: fixed; }
+  main { max-width: 76rem; margin: 0 auto; padding: 1.5rem 16px 5rem; }
+  a { color: var(--accent); text-decoration: none; }
+  h1 { font-weight: 600; font-size: 1.35rem; margin: 0 0 1.5rem; }
+  h1 .sep { color: var(--muted); font-weight: 400; margin: 0 .3em; }
+  h1:has(+ .meta) { margin-bottom: .3rem; }
+  h2 { font-weight: 400; font-style: italic; font-size: 1rem; color: var(--muted); margin: 1.6rem 0 .2rem; }
+  button, input { font: inherit; color: inherit; }
+  button { cursor: pointer; background: none; border: 0; padding: 0; }
   button:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .spk { padding: .7rem 0; border-bottom: 1px solid var(--line); }
-  .spk-head { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
-  .spk-head .lab { min-width: 5.5rem; }
-  .spk-head input { flex: 1 1 8rem; min-width: 8rem; width: auto; }
-  .sample { margin: .75rem 0 0 2.1rem; font-size: .9em; }
-  .sample-row { display: flex; flex-wrap: wrap; gap: .1rem .5rem; align-items: baseline; padding-left: .5rem;
-                border-left: 2px solid var(--line); }
-  .sample.kept .sample-row { border-left-color: var(--ok); }
-  .sample.excluded .text { text-decoration: line-through; color: var(--muted); }
-  .sample .text { cursor: pointer; flex: 1 1 12rem; }
-  .sample time { font-variant-numeric: tabular-nums; font-size: .9em; }
-  .ctx { font-size: .8em; color: var(--muted); padding-left: .6rem; white-space: nowrap; overflow: hidden;
-         text-overflow: ellipsis; }
-  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; font-size: .8em; }
-  .seg input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; }
-  .seg label { padding: .05rem .45rem; cursor: pointer; white-space: nowrap; }
-  .seg label + input + label { border-left: 1px solid var(--line); }
-  .seg input:checked + label { background: var(--line); }
-  .seg input:focus-visible + label { outline: 2px solid var(--accent); outline-offset: -2px; }
-  .seg input:disabled + label { cursor: default; opacity: .5; }
-  .status { margin: .45rem 0 0 2.1rem; font-size: .8em; color: var(--muted); }
-  .save { padding: .8rem 0; display: flex; gap: .6rem; align-items: baseline; flex-wrap: wrap; }
-  @media (min-width: 1100px) {
-    body:has(.rec.panel) { max-width: 78rem; }
-    .rec.panel { display: grid; grid-template-columns: 27rem 1fr; gap: 2.5rem; align-items: start; }
-    .rec.panel > aside { position: sticky; top: 0; max-height: 100vh; overflow-y: auto; padding-bottom: 5rem;
-                         box-sizing: border-box; }
+  time { font-variant-numeric: tabular-nums lining-nums; }
+  .line time, .player time { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .muted { color: var(--muted); }
+  .err { color: var(--err); margin-left: .6em; }
+
+  /* list */
+  .list { max-width: 40rem; }
+  .rec { display: grid; grid-template-columns: 3.5rem 1fr auto; gap: 1rem; align-items: baseline; padding: .45rem 0;
+    border-bottom: 1px solid var(--line); color: inherit; }
+  .rec:hover time { color: var(--accent); }
+  .rec .who { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rec .state { font-size: .8em; color: var(--muted); display: flex; gap: .5rem; align-items: center; }
+  .bar { width: 5rem; height: 3px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--accent); }
+  .upload { display: inline-block; margin-top: 1.6rem; font-size: .9em; }
+
+  /* recording */
+  .meta { color: var(--muted); font-size: .9em; margin: 0 0 1.8rem; }
+  .cols { display: grid; grid-template-columns: minmax(0, 44rem) 19rem; justify-content: space-between; gap: 4rem; align-items: start; }
+  aside { position: sticky; top: 1rem; }
+  .ask { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: .7rem .9rem .8rem; }
+  .ask h3 { margin: 0; font-size: 1.05rem; font-weight: 600; display: flex; justify-content: space-between; align-items: baseline; }
+  .ask h3 span { font-size: .72em; font-weight: 400; color: var(--muted); }
+  .ask ul { list-style: none; margin: .4rem 0 .7rem; padding: 0; }
+  .ask li { position: relative; display: grid; grid-template-columns: 1.1rem 1fr auto; gap: .5rem; padding: .25rem 0;
+    font-size: .86em; line-height: 1.4; cursor: pointer; }
+  .ask li:hover, .ask li.playing { background: var(--hl); margin: 0 -.9rem; padding: .25rem .9rem; }
+  .play { color: var(--muted); font-size: .7em; line-height: 2; }
+  .play:hover { color: var(--accent); }
+  .slot { font-size: .85em; color: var(--muted); text-align: right; }
+  .slot.sugg { font-style: italic; }
+  .slot.set { color: var(--fg); font-weight: 600; }
+  .answers { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .ok { margin-left: auto; width: 2rem; height: 1.7rem; border-radius: 999px; background: var(--accent); color: var(--surface); font-size: .9em; }
+  .ok:disabled { background: var(--line); cursor: default; }
+  .chip { font-size: .85em; border: 1px solid var(--line); border-radius: 999px; padding: 0 .65rem; line-height: 1.7; background: var(--surface); }
+  .chip:hover { border-color: var(--accent); color: var(--accent); }
+  .chip.guess { border-color: var(--accent); color: var(--accent); font-style: italic; }
+  .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); font-style: normal; }
+  .chip.new { width: 5.5rem; outline: none; }
+  .chip.new:focus { border-color: var(--accent); }
+  .chip.new::placeholder { color: var(--muted); }
+  .chip kbd { font: .75em var(--font); color: var(--muted); margin-left: .35rem; }
+  .chip[aria-pressed="true"] kbd { color: inherit; opacity: .7; }
+  .menu { position: absolute; z-index: 3; left: 5.3rem; top: calc(100% - .2rem); display: flex; gap: .3rem; padding: .4rem;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 4px 14px rgba(0, 0, 0, .12); cursor: default; }
+  .ask .menu { left: auto; right: 0; top: calc(100% - .1rem); flex-wrap: wrap; width: max-content; max-width: 17rem; }
+
+  .line { position: relative; display: grid; grid-template-columns: 4.2rem 6.5rem 1fr; gap: .7rem; padding: .2rem .4rem; border-radius: 4px; }
+  .line.named { cursor: pointer; }
+  .line time { color: var(--muted); font-size: .85em; padding-top: .15em; }
+  .line.audio time { cursor: pointer; }
+  .line.audio time:hover { color: var(--accent); }
+  .line b { font-weight: 400; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .line b.set { font-weight: 600; color: var(--fg); }
+  .line b.sugg { font-style: italic; }
+  .line.same b { visibility: hidden; }
+  .line.same:hover b, .line.playing b { visibility: visible; }
+  .line.playing, .line.named:hover { background: var(--hl); }
+
+  .player { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bar); border-top: 1px solid var(--line);
+    display: flex; align-items: center; gap: 12px; padding: 8px 16px; font-size: .85em; }
+  .player .pp { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--line); background: var(--surface);
+    display: grid; place-items: center; flex: none; }
+  .player input { flex: 1; min-width: 0; accent-color: var(--accent); }
+
+  @media (max-width: 1000px) {
+    .cols { grid-template-columns: 1fr; gap: 1.5rem; }
+    aside { order: -1; position: sticky; top: 0; z-index: 2; background: var(--bg); padding: .5rem 0; }
+    .line { grid-template-columns: 3.6rem 1fr; row-gap: 0; }
+    .line b, .line span { grid-column: 2; }
+    .line time { grid-row: span 2; }
+    .line.same b { display: none; }
+    .menu { left: 4rem; flex-wrap: wrap; }
   }
-  .line { display: flex; gap: .6rem; padding: .25rem .3rem; border-radius: 4px; }
-  .line.playing { background: var(--hl); }
-  .line time { font-variant-numeric: tabular-nums; }
-  .who { flex: 0 0 7rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .track { font-weight: normal; font-size: .8em; }
-  .suggested { font-style: italic; font-weight: normal; }
-  .mixed { font-size: .75em; color: #b45309; border: 1px solid currentColor; border-radius: 3px; padding: 0 .25em; cursor: help; }
-  audio { position: fixed; bottom: 0; left: 0; width: 100%; }
 </style>
 <body>
 <main id="app"></main>
-<audio id="player" controls hidden></audio>
+<datalist id="names"></datalist>
+<div class="player" id="bar" hidden>
+  <button class="pp" id="pp" title="Play (space)">▶</button><time id="cur">00:00</time>
+  <input type="range" id="seek" min="0" max="0" step="0.1" value="0" aria-label="Seek"><time id="dur">00:00</time>
+</div>
+<audio id="player" preload="metadata"></audio>
 <script>
 const app = document.getElementById("app");
 const player = document.getElementById("player");
-let lines = [];
+const bar = document.getElementById("bar"), pp = document.getElementById("pp"), seek = document.getElementById("seek");
+let lines = [];     // transcript and card samples as { seg, el }, highlighted while playing
 let stopAt = null;
-let queue = [];
 let playingEl = null;
+let playingSeg = null;
 // Set by a click that starts a line, so the transcript scrolls to it even if the user had
 // scrolled away; continuous playback only follows while the playing line is in view.
 let follow = false;
-let flash = "";
+let cur = null;     // what the recording page draws from, see show()
+let pick = {};      // label -> the name chosen on its card, not saved yet
+let menu = null;
+let known = null;
 
 function h(tag, props = {}, ...kids) {
   const el = Object.assign(document.createElement(tag), props);
   el.append(...nodes(kids));
   return el;
 }
-const nodes = kids => kids.flat(Infinity).filter(k => k != null);
-
-const hms = ms => new Date(ms).toISOString().slice(11, 19);
+const nodes = kids => kids.flat(Infinity).filter(k => k != null && k !== false);
+const pad = n => String(n).padStart(2, "0");
+const clock = ms => {
+  const s = Math.floor(ms / 1000);
+  return (s >= 3600 ? `${Math.floor(s / 3600)}:` : "") + `${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`;
+};
 const short = label => label.split("/")[1];
 
 async function api(path, opts) {
@@ -100,70 +145,228 @@ async function api(path, opts) {
   if (!res.ok) throw new Error(await res.text() || res.statusText);
   return res.status === 204 ? null : res.json();
 }
+const put = (path, body) => api(path, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
-function play(seg, ...next) {
+function start(seg, only) {
   player.currentTime = seg.start_ms / 1000;
-  stopAt = seg.end_ms / 1000;
-  queue = next;
+  stopAt = only ? seg.end_ms / 1000 : null;
   follow = true;
   player.play();
 }
 
 const inView = el => {
   const r = el.getBoundingClientRect();
-  return r.bottom > 0 && r.top < innerHeight - (player.hidden ? 0 : player.offsetHeight);
+  return r.bottom > 0 && r.top < innerHeight - (bar.hidden ? 0 : bar.offsetHeight);
 };
 
 player.addEventListener("timeupdate", () => {
   const t = player.currentTime;
-  if (stopAt != null && t >= stopAt) queue.length ? play(...queue) : player.pause();
+  if (stopAt != null && t >= stopAt) player.pause();
+  seek.value = t;
+  document.getElementById("cur").textContent = clock(t * 1000);
   let now = null;
-  for (const { seg, el } of lines) {
+  for (const { seg, el, transcript } of lines) {
     const on = !player.paused && seg.start_ms / 1000 <= t && t < seg.end_ms / 1000;
     el.classList.toggle("playing", on);
-    if (on && !now) now = el;
+    if (on && transcript && !now) now = el;
   }
   if (now && now !== playingEl && (follow || (playingEl && inView(playingEl)))) {
     now.scrollIntoView({ block: "center", behavior: "smooth" });
   }
-  if (now) follow = false;
-  playingEl = now ?? playingEl;
+  if (now) { follow = false; playingEl = now; playingSeg = now.seg; }
 });
-// Resuming from the native controls plays on past the snippet.
-player.addEventListener("pause", () => { stopAt = null; queue = []; });
+player.addEventListener("pause", () => { stopAt = null; pp.textContent = "▶"; player.dispatchEvent(new Event("timeupdate")); });
+player.addEventListener("play", () => { pp.textContent = "❚❚"; });
+player.addEventListener("durationchange", () => {
+  if (!isFinite(player.duration)) return;
+  seek.max = player.duration;
+  document.getElementById("dur").textContent = clock(player.duration * 1000);
+});
+pp.onclick = () => player.paused ? player.play() : player.pause();
+seek.oninput = () => { stopAt = null; player.currentTime = +seek.value; };
+
+function closeMenu() { menu?.remove(); menu = null; }
+addEventListener("click", closeMenu);
+addEventListener("keydown", e => {
+  if (!cur || e.target.tagName === "INPUT" || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === "Escape") closeMenu();
+  else if (e.key === " " && !bar.hidden) { e.preventDefault(); pp.onclick(); }
+  else if (/^[1-9]$/.test(e.key) && cur.r.editable && playingSeg) {
+    const c = choices()[e.key - 1];
+    if (c) { e.preventDefault(); nameLine(playingSeg, c); }
+  }
+});
 
 function progress(r) {
   const p = r.progress;
   if (!p) return r.status === "failed" ? "failed" : null;
   if (p.step === "unstarted") return "not started";
-  if (p.step === "transcribing") return [h("progress", { value: p.percent, max: 100 }), ` transcribing ${p.percent}%`];
+  if (p.step === "transcribing") return [h("span", { className: "bar" }, h("i", { style: `width: ${p.percent}%` })), `transcribing ${p.percent}%`];
   if (p.since_ms == null) return "waiting to diarize";
   const s = Math.round((Date.now() - p.since_ms) / 1000);
-  return `diarizing for ${s >= 60 ? `${Math.floor(s / 60)}m ` : ""}${s % 60}s`;
+  return `diarizing ${s >= 60 ? `${Math.floor(s / 60)}m ` : ""}${s % 60}s`;
 }
 
-const day = date => date
-  ? new Date(date.slice(0, 10)).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" })
-  : "Unknown date";
+const day = date => {
+  if (!date) return "Unknown date";
+  const d = new Date(date.slice(0, 10));
+  return d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long",
+    year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+};
 
 async function list() {
-  player.hidden = true;
+  cur = null;
+  bar.hidden = true;
   const recs = await api("/recordings");
   const days = Map.groupBy(recs, r => day(r.date));
+  const who = r => {
+    if (r.progress) return h("span", { className: "who muted" }, "…");
+    if (r.status === "done" && !r.attendees.length && !r.unnamed) return h("span", { className: "who muted" }, "no speech");
+    return h("span", { className: "who" }, r.attendees.join(", "),
+      r.unnamed ? h("span", { className: "muted" }, ` +${r.unnamed}`) : null);
+  };
   app.replaceChildren(...nodes([
     h("h1", {}, "mictap"),
-    [...days].map(([d, rs]) => [
-      h("h2", {}, d),
-      h("table", {}, rs.map(r => h("tr", {},
-        h("td", {}, h("a", { href: "#" + r.id }, r.date?.slice(11) ?? r.id)),
-        h("td", { className: "muted" }, r.source),
-        h("td", {}, progress(r)),
-        h("td", { className: "muted" }, r.audio === "expired" ? "audio expired" : ""),
-      ))),
-    ]),
-    h("p", {}, h("a", { href: "/upload" }, "Upload a recording")),
+    h("div", { className: "list" },
+      [...days].map(([d, rs]) => [
+        h("h2", {}, d),
+        rs.map(r => h("a", { className: "rec", href: "#" + r.id },
+          h("time", {}, r.date?.slice(11) ?? r.id), who(r),
+          h("span", { className: "state" }, progress(r) ?? (r.audio === "expired" ? "audio expired" : null)))),
+      ]),
+      h("a", { className: "upload", href: "/upload" }, "Upload a recording")),
   ]));
   return recs.some(r => r.progress);
+}
+
+// Names in this meeting: confirmed ones in label order, then the lines' own.
+function people() {
+  const out = [];
+  for (const n of [...cur.labels.map(l => cur.sp(l).name), ...cur.r.lines.map(s => s.line_name)])
+    if (n && n !== "?" && !out.includes(n)) out.push(n);
+  return out;
+}
+const choices = () => [...people(), "?"];
+const asked = () => cur.labels.filter(l => !cur.sp(l).name);
+
+// The name a line shows and its shade: set when it teaches a voice, sugg for a suggestion.
+function shown(seg) {
+  if (seg.line_name) return { n: seg.line_name, cls: seg.taught ? "set" : "" };
+  const s = cur.sp(seg.speaker);
+  if (s.name) return { n: s.name, cls: seg.taught && s.name !== "?" ? "set" : "" };
+  if (seg.speaker && seg.speaker === asked()[0] && pick[seg.speaker]) return { n: pick[seg.speaker], cls: "" };
+  if (s.suggested) return { n: s.suggested, cls: "sugg" };
+  return { n: "?", cls: "" };
+}
+
+function fail(err) { cur.err.textContent = err.message; }
+
+async function nameLine(seg, name) {
+  closeMenu();
+  try {
+    await put(`/recordings/${encodeURIComponent(cur.id)}/lines`,
+      { track: seg.track, start_ms: seg.start_ms, end_ms: seg.end_ms, name: seg.line_name === name ? null : name });
+    await show(cur.id);
+  } catch (err) { fail(err); }
+}
+
+function newName(done) {
+  const input = h("input", { className: "chip new", placeholder: "Name…", ariaLabel: "New name" });
+  input.setAttribute("list", "names");
+  input.onkeydown = e => {
+    if (e.key === "Enter" && input.value.trim()) done(input.value.trim());
+    if (e.key === "Escape") closeMenu();
+  };
+  return input;
+}
+
+function openMenu(host, seg) {
+  const again = menu?.parentNode === host;
+  closeMenu();
+  if (again || !cur.r.editable) return;
+  const input = newName(n => nameLine(seg, n));
+  input.onchange = () => input.value.trim() && nameLine(seg, input.value.trim());
+  menu = h("div", { className: "menu", onclick: e => e.stopPropagation() },
+    choices().map((c, k) => h("button", { className: "chip", ariaPressed: String(seg.line_name === c),
+      title: c === "?" ? "Mixed or unsure" : c, onclick: () => nameLine(seg, c) }, c, k < 9 ? h("kbd", {}, String(k + 1)) : null)),
+    input);
+  host.append(menu);
+}
+
+// Three of a label's lines from across the meeting (preferring ones of 2 s or more), so a
+// cluster of two people or a room is audible.
+function samples(label) {
+  const own = cur.r.lines.filter(s => s.speaker === label);
+  const long = own.filter(s => s.end_ms - s.start_ms >= 2000);
+  const pool = long.length >= 3 ? long : own;
+  return [...new Set([0, 0.5, 1].map(f => pool[Math.round(f * (pool.length - 1))]))];
+}
+
+function drawAsk() {
+  const queue = asked();
+  cur.ask.hidden = !cur.r.editable || !queue.length;
+  if (cur.ask.hidden) return [];
+  const l = queue[0], s = cur.sp(l);
+  const group = pick[l] ?? s.suggested;
+  const choose = n => { pick[l] = n; paint(); };
+  const input = newName(choose);
+  input.onchange = () => input.value.trim() && choose(input.value.trim());
+  if (pick[l] && pick[l] !== "?" && !people().includes(pick[l])) input.value = pick[l];
+  const chips = [...new Set([s.suggested, ...people()].filter(Boolean)), "?"].map(n =>
+    h("button", { className: "chip" + (n === s.suggested && pick[l] == null ? " guess" : ""), ariaPressed: String(n === group),
+      title: n === "?" ? "Several people, or not sure" : n, onclick: () => choose(n) }, n));
+  const segs = samples(l);
+  const rows = segs.map(seg => {
+    const slot = h("span", { className: "slot" + (seg.line_name ? (seg.taught ? " set" : "") : pick[l] == null && s.suggested ? " sugg" : "") },
+      seg.line_name ?? group ?? "?");
+    const li = h("li", { onclick: e => { e.stopPropagation(); if (cur.audio) start(seg, true); openMenu(li, seg); } },
+      h("button", { className: "play", title: "Play", disabled: !cur.audio,
+        onclick: e => { e.stopPropagation(); closeMenu(); start(seg, true); } }, "▶"),
+      h("span", {}, seg.text), slot);
+    return { seg, el: li };
+  });
+  const ok = async () => {
+    const heard = segs.filter(x => !x.line_name).map(x => ({ start_ms: x.start_ms, end_ms: x.end_ms, correct: true }));
+    try {
+      await put(`/recordings/${encodeURIComponent(cur.id)}/speakers`,
+        { [l]: group === "?" ? { name: "?" } : { name: group, heard } });
+      delete pick[l];
+      known = null;
+      await show(cur.id);
+    } catch (err) { fail(err); }
+  };
+  cur.ask.replaceChildren(
+    h("h3", {}, "Who is this?", h("span", {}, queue.length > 1 ? `1 of ${queue.length}` : "")),
+    h("ul", {}, rows.map(x => x.el)),
+    h("div", { className: "answers" }, chips, input,
+      h("button", { className: "ok", title: "Save", disabled: !group, onclick: ok }, "✓")));
+  return rows;
+}
+
+// Draws the names and the card from `cur` and `pick`, without fetching.
+function paint() {
+  closeMenu();
+  let prev = null;
+  for (const { seg, el, who } of cur.transcript) {
+    const { n, cls } = shown(seg);
+    who.textContent = n;
+    who.className = cls;
+    const key = n + "/" + cls;
+    el.classList.toggle("same", n !== "?" && key === prev);
+    prev = key;
+  }
+  lines = [...cur.transcript, ...drawAsk()];
+  const unknown = asked().length;
+  const names = people();
+  cur.meta.replaceChildren(...nodes([
+    names.join(", ") + (unknown ? `${names.length ? " and " : ""}${unknown} unknown` : ""),
+    names.length || unknown ? " · " : null,
+    `${Math.round(cur.r.total_ms / 60000)} minutes`,
+    progress(cur.r) ? [" · ", progress(cur.r)] : null,
+    !cur.audio ? (cur.r.audio === "expired" ? " · audio deleted after 30 days" : " · no audio yet") : null,
+    cur.err,
+  ]));
+  player.dispatchEvent(new Event("timeupdate"));
 }
 
 async function show(id) {
@@ -173,159 +376,36 @@ async function show(id) {
     player.pause();
     player.src = audio ? `/r/${encodeURIComponent(id)}/audio.ogg` : "";
     player.dataset.id = id;
+    pick = {};
   }
-  player.hidden = !audio;
+  bar.hidden = !audio;
+  if (r.editable && !known) {
+    known = api("/recordings").then(rs => [...new Set(rs.flatMap(x => x.attendees))].sort());
+    known.then(ns => document.getElementById("names").replaceChildren(...ns.map(n => h("option", { value: n }))), () => { known = null; });
+  }
 
   const labels = [...new Set(r.lines.map(s => s.speaker).filter(Boolean))]
     .sort((a, b) => (a.startsWith("remote") - b.startsWith("remote")) || short(a).slice(1) - short(b).slice(1));
-  const sp = label => r.speakers[label] ?? {};
-  const name = label => !label ? "?" : sp(label).name ?? (sp(label).suggested ? `${sp(label).suggested}?` : short(label));
-  // Three of a speaker's lines from across the meeting (preferring ones of 2 s or more), so
-  // a cluster of two people or a room is audible.
-  const samples = label => {
-    const own = r.lines.filter(s => s.speaker === label);
-    const long = own.filter(s => s.end_ms - s.start_ms >= 2000);
-    const pool = long.length >= 3 ? long : own;
-    return [...new Set([0, 0.5, 1].map(f => pool[Math.round(f * (pool.length - 1))]))];
-  };
-
-  const inputs = {};
-  const who = l => inputs[l]?.value.trim() || sp(l).suggested || "them";
-  // Per label, its samples: whether each was heard and, once heard, kept as only this speaker.
-  const picks = Object.fromEntries(labels.map(l => [l, samples(l).map(seg => ({ seg, heard: false, keep: true }))]));
-  const heard = l => picks[l].filter(p => p.heard)
-    .map(p => ({ start_ms: p.seg.start_ms, end_ms: p.seg.end_ms, correct: p.keep }));
-  const naming = (l, name) => heard(l).length ? { name, heard: heard(l) } : { name };
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
-  // What saving would do for `l`, as the server decides it (see names::confirm).
-  const status = l => {
-    if (!r.editable) return "";
-    const v = inputs[l].value.trim();
-    const { name: confirmed, suggested, mixed } = sp(l);
-    if (!v && confirmed) return "Saving leaves them unnamed";
-    if (!v && !suggested) return "Name them to learn their voice";
-    const hs = heard(l);
-    if (hs.length) {
-      const kept = hs.filter(x => x.correct).length;
-      return kept ? `Will learn ${plural(kept, "voice sample")} from what you heard`
-        : "No voice will be learned: every line you played was excluded";
-    }
-    if (confirmed && v === confirmed) return "Voice learned earlier; listen to add clean samples";
-    return mixed ? "Mixed cluster: listen and keep clean lines to teach a voice"
-      : "Will learn from the cluster's core (nothing heard yet)";
-  };
-  const refreshers = {};
-  const hear = (l, ps) => {
-    ps.forEach(p => { p.heard = true; });
-    refreshers[l]();
-    play(...ps.map(p => p.seg));
-  };
-
-  const msg = h("span", { className: "muted" }, flash);
-  flash = "";
-  const save = async names => {
-    if (!Object.keys(names).length) return;
-    msg.textContent = "saving…";
-    try {
-      const learned = await api(`/recordings/${encodeURIComponent(id)}/speakers`, {
-        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(names),
-      });
-      flash = Object.entries(names).map(([l, { name }]) => name
-        ? `${name} confirmed · ${plural(learned[l]?.voices ?? 0, "voice sample")} learned`
-        : `${short(l)} left unnamed`).join("; ");
-      await show(id);
-    } catch (err) { msg.textContent = err.message; }
-  };
-
-  const block = l => {
-    const { name: confirmed, suggested, mixed } = sp(l);
-    const line = h("div", { className: "status" });
-    const rows = picks[l].map((p, i) => {
-      const at = r.lines.indexOf(p.seg);
-      const around = x => x ? h("div", { className: "ctx" }, `${name(x.speaker)}: ${x.text}`) : null;
-      const radio = keep => h("input", { type: "radio", name: `${l}-${i}`, id: `${l}-${i}-${keep}`, checked: keep,
-        disabled: !r.editable, onchange: () => { p.keep = keep; refresh(); } });
-      const only = h("label", { htmlFor: `${l}-${i}-true`, title: "Only this speaker is heard: this line teaches their voice" });
-      const verdict = h("span", { className: "seg", role: "radiogroup", ariaLabel: `Line ${i + 1}`, hidden: true },
-        radio(true), only,
-        radio(false), h("label", { htmlFor: `${l}-${i}-false`, title: "Someone else is heard too: this line is ignored" }, "Someone else too"));
-      const unheard = h("span", { className: "muted", style: "font-size: .8em" }, "not heard yet");
-      const el = h("div", { className: "sample" },
-        around(r.lines[at - 1]),
-        h("div", { className: "sample-row" },
-          h("button", { type: "button", disabled: !audio, title: `Play line ${i + 1} (key ${i + 1})`, onclick: () => hear(l, [p]) },
-            "▶ ", h("time", {}, hms(p.seg.start_ms))),
-          h("span", { className: "text", onclick: () => audio && hear(l, [p]) }, `"${p.seg.text}"`),
-          unheard, verdict),
-        around(r.lines[at + 1]));
-      return { p, el, only, verdict, unheard };
-    });
-    const refresh = () => {
-      for (const { p, el, only, verdict, unheard } of rows) {
-        only.textContent = `Only ${who(l)}`;
-        verdict.hidden = !p.heard;
-        unheard.hidden = p.heard;
-        el.classList.toggle("kept", p.heard && p.keep);
-        el.classList.toggle("excluded", p.heard && !p.keep);
-      }
-      line.textContent = status(l);
-    };
-    refreshers[l] = refresh;
-    inputs[l] = h("input", { value: confirmed ?? "", placeholder: suggested ? `${suggested}?` : "name",
-      ariaLabel: `Name of ${short(l)} (${l.split("/")[0]})`, disabled: !r.editable, oninput: refresh });
-    const el = h("div", { className: "spk" },
-      h("div", { className: "spk-head" },
-        h("button", { type: "button", disabled: !audio, title: "Play their sample lines", onclick: () => hear(l, picks[l]) }, "▶"),
-        h("span", { className: "lab" }, short(l), " ", h("span", { className: "track muted" }, l.split("/")[0]),
-          mixed ? [" ", h("span", { className: "mixed", title: "These lines sound like more than one voice (two people, or a room). A name is kept, but no voice is learned from it unless you keep clean lines you heard." }, "mixed?")] : null),
-        inputs[l],
-        suggested && r.editable ? [
-          h("button", { type: "button", title: `Confirm ${suggested}`, onclick: () => save({ [l]: naming(l, suggested) }) }, "✓"),
-          h("button", { type: "button", title: "Not them", onclick: () => save({ [l]: { name: "" } }) }, "✗"),
-        ] : null),
-      rows.map(x => x.el),
-      line);
-    // 1/2/3 play this speaker's samples, except while typing a name.
-    el.addEventListener("keydown", e => {
-      if (!/^[1-3]$/.test(e.key) || e.target.type === "text" || e.metaKey || e.ctrlKey || e.altKey) return;
-      const p = picks[l][+e.key - 1];
-      if (p && audio) { e.preventDefault(); hear(l, [p]); }
-    });
-    refresh();
-    return el;
-  };
-
-  const form = h("form", {},
-    labels.map(block),
-    h("div", { className: "save" }, h("button", { disabled: !r.editable }, "Save names"), msg),
-  );
-  form.onsubmit = e => {
-    e.preventDefault();
-    const names = {};
-    for (const l of labels) {
-      const v = inputs[l].value.trim();
-      if (v !== (sp(l).name ?? "") || (v && heard(l).length)) names[l] = naming(l, v);
-    }
-    save(names);
-  };
-
-  lines = r.lines.map(seg => ({ seg, el: h("div", { className: "line" },
-    h("button", { disabled: !audio, onclick: () => play(seg) }, h("time", {}, hms(seg.start_ms))),
-    h("span", { className: "who" + (seg.speaker && !sp(seg.speaker).name && sp(seg.speaker).suggested ? " suggested" : ""), title: seg.speaker ?? "" }, name(seg.speaker),
-      " ", h("span", { className: "track muted" }, seg.track)),
-    h("span", {}, seg.text),
-  ) }));
-
+  const transcript = r.lines.map(seg => {
+    const who = h("b");
+    const el = h("div", { className: "line" + (audio ? " audio" : "") + (r.editable ? " named" : ""),
+      onclick: e => { e.stopPropagation(); if (audio) start(seg); openMenu(el, seg); } },
+      h("time", { title: audio ? "Play from here" : "", onclick: e => { e.stopPropagation(); closeMenu(); if (audio) start(seg); } },
+        clock(seg.start_ms)),
+      who, h("span", {}, seg.text));
+    el.seg = seg;
+    return { seg, el, who, transcript: true };
+  });
+  cur = { id, r, audio, labels, transcript, sp: l => r.speakers[l] ?? {},
+    ask: h("div", { className: "ask" }), meta: h("p", { className: "meta" }), err: h("span", { className: "err" }) };
   playingEl = null;
-  app.replaceChildren(...nodes([
-    h("h1", {}, h("a", { href: "#" }, "mictap"), " / ", r.date ?? id),
-    h("p", { className: "muted" }, progress(r)),
-    h("div", { className: "rec" + (labels.length ? " panel" : "") },
-      labels.length ? h("aside", {}, form) : null,
-      h("section", {},
-        !audio ? h("p", { className: "muted" }, r.audio === "expired" ? "Audio deleted after 30 days." : "No audio yet.") : null,
-        lines.map(l => l.el))),
-  ]));
+  playingSeg = playingSeg && transcript.find(x => x.seg.start_ms === playingSeg.start_ms && x.seg.track === playingSeg.track)?.seg;
+  const date = r.date ? `${day(r.date)}, ${r.date.slice(11)}` : id;
+  app.replaceChildren(
+    h("h1", {}, h("a", { href: "#" }, "mictap"), h("span", { className: "sep" }, "/"), date),
+    cur.meta,
+    h("div", { className: "cols" }, h("section", {}, transcript.map(x => x.el)), h("aside", {}, cur.ask)));
+  paint();
   return r.progress != null;
 }
 
