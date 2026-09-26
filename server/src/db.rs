@@ -16,8 +16,10 @@ CREATE TABLE IF NOT EXISTS recordings (
     attempts INTEGER NOT NULL DEFAULT 0,
     -- Unix ms before which workers leave a failing recording alone.
     retry_at INTEGER NOT NULL DEFAULT 0,
-    -- The speakers map (label -> name, JSON).
+    -- Confirmed names (label -> name, JSON): typed, or suggestions accepted.
     speakers TEXT,
+    -- Names suggested from known voices for unconfirmed labels (label -> name, JSON).
+    suggested TEXT,
     -- audio.ogg: NULL until mixed down, then 'ready', 'failed' or 'expired'.
     audio TEXT,
     -- Unix ms it became done; its model outputs expire MICTAP_OUTPUTS_DAYS later.
@@ -96,6 +98,9 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     if conn.prepare("SELECT retry_at FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if conn.prepare("SELECT suggested FROM recordings").is_err() {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN suggested TEXT")?;
     }
     if conn.prepare("SELECT done_ms FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN done_ms INTEGER")?;

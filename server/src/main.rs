@@ -3,6 +3,7 @@ mod assemble;
 mod audio;
 mod db;
 mod diarize;
+mod names;
 mod transcribe;
 mod vault;
 mod windows;

@@ -36,6 +36,7 @@
   .line time { font-variant-numeric: tabular-nums; }
   .who { flex: 0 0 7rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .track { font-weight: normal; font-size: .8em; }
+  .suggested { font-style: italic; font-weight: normal; }
   audio { position: fixed; bottom: 0; left: 0; width: 100%; }
   #msg { margin-left: .6rem; }
 </style>
@@ -124,25 +125,14 @@ async function show(id) {
 
   const labels = [...new Set(r.lines.map(s => s.speaker).filter(Boolean))]
     .sort((a, b) => (a.startsWith("remote") - b.startsWith("remote")) || short(a).slice(1) - short(b).slice(1));
-  const name = label => label ? r.names[label] || short(label) : "?";
+  const sp = label => r.speakers[label] ?? {};
+  const name = label => !label ? "?" : sp(label).name ?? (sp(label).suggested ? `${sp(label).suggested}?` : short(label));
   const longest = label => r.lines.filter(s => s.speaker === label)
     .reduce((a, b) => (b.end_ms - b.start_ms > a.end_ms - a.start_ms ? b : a));
 
   const inputs = {};
   const msg = h("span", { id: "msg", className: "muted" });
-  const form = h("form", { className: "speakers" },
-    labels.map(l => [
-      h("button", { type: "button", disabled: !audio, title: "Play their longest line", onclick: () => play(longest(l)) }, "▶"),
-      h("span", {}, short(l), " ", h("span", { className: "track muted" }, l.split("/")[0])),
-      inputs[l] = h("input", { value: r.names[l] ?? "", placeholder: "name", disabled: !r.editable }),
-    ]),
-    h("span"), h("span"),
-    h("div", {}, h("button", { disabled: !r.editable }, "Save names"), msg),
-  );
-  form.onsubmit = async e => {
-    e.preventDefault();
-    const names = {};
-    for (const l of labels) if (inputs[l].value.trim() !== (r.names[l] ?? "")) names[l] = inputs[l].value.trim();
+  const save = async names => {
     if (!Object.keys(names).length) return;
     msg.textContent = "saving…";
     try {
@@ -152,10 +142,33 @@ async function show(id) {
       await show(id);
     } catch (err) { msg.textContent = err.message; }
   };
+  const form = h("form", { className: "speakers" },
+    labels.map(l => {
+      const { name: confirmed, suggested } = sp(l);
+      return [
+        h("button", { type: "button", disabled: !audio, title: "Play their longest line", onclick: () => play(longest(l)) }, "▶"),
+        h("span", {}, short(l), " ", h("span", { className: "track muted" }, l.split("/")[0])),
+        h("div", {},
+          inputs[l] = h("input", { value: confirmed ?? "", placeholder: suggested ? `${suggested}?` : "name", disabled: !r.editable }),
+          suggested && r.editable ? [
+            " ", h("button", { type: "button", title: `Confirm ${suggested}`, onclick: () => save({ [l]: suggested }) }, "✓"),
+            " ", h("button", { type: "button", title: "Not them", onclick: () => save({ [l]: "" }) }, "✗"),
+          ] : null),
+      ];
+    }),
+    h("span"), h("span"),
+    h("div", {}, h("button", { disabled: !r.editable }, "Save names"), msg),
+  );
+  form.onsubmit = e => {
+    e.preventDefault();
+    const names = {};
+    for (const l of labels) if (inputs[l].value.trim() !== (sp(l).name ?? "")) names[l] = inputs[l].value.trim();
+    save(names);
+  };
 
   lines = r.lines.map(seg => ({ seg, el: h("div", { className: "line" },
     h("button", { disabled: !audio, onclick: () => play(seg) }, h("time", {}, hms(seg.start_ms))),
-    h("span", { className: "who", title: seg.speaker ?? "" }, name(seg.speaker),
+    h("span", { className: "who" + (seg.speaker && !sp(seg.speaker).name && sp(seg.speaker).suggested ? " suggested" : ""), title: seg.speaker ?? "" }, name(seg.speaker),
       " ", h("span", { className: "track muted" }, seg.track)),
     h("span", {}, seg.text),
   ) }));

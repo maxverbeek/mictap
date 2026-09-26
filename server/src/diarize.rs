@@ -7,12 +7,12 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::OptionalExtension;
 use tokio::process::Command;
 
 use crate::{
     api::App,
-    assemble::{cosine, derive, floats, normalize, store_turns, Turn},
+    assemble::{derive, normalize, store_turns, Turn},
 };
 
 const RATE: usize = 16_000;
@@ -210,20 +210,8 @@ fn embed_turns(model: &str, samples: &[f32], turns: &mut [Turn]) -> Result<()> {
     Ok(())
 }
 
-/// The name of the voice most similar to `emb`, if at least `threshold` similar.
-// ponytail: one voice per name; the same person across a room/remote channel change scores
-// ~0.6 and stays unnamed (spike S4). Keep one voice per track kind if that matters.
-fn best_match<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], threshold: f32) -> Option<&'a str> {
-    voices
-        .iter()
-        .map(|(name, v)| (name, cosine(emb, v)))
-        .filter(|&(_, c)| c >= threshold)
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|(name, _)| name.as_str())
-}
-
 /// Diarizes the oldest windowed recording whose windows are all transcribed: stores each
-/// track's turns and their embeddings, derives its lines and pre-fills names from known
+/// track's turns and their embeddings, derives its lines and suggests names from known
 /// voices. Returns false when there is none, or when it failed and will be retried after a
 /// pause.
 pub async fn step(app: &App) -> Result<bool> {
@@ -258,20 +246,13 @@ pub async fn step(app: &App) -> Result<bool> {
         store_turns(&tx, &id, track, turns)?;
     }
     derive(&tx, &id)?;
-    lookup_names(&tx, &id, match_threshold()?)?;
+    crate::names::suggest(&tx, &id, &crate::names::Matching::from_env())?;
     tx.execute(
         "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
         [&id],
     )?;
     tx.commit()?;
     Ok(true)
-}
-
-fn match_threshold() -> Result<f32> {
-    match std::env::var("MICTAP_MATCH_THRESHOLD") {
-        Ok(v) => v.parse().context("MICTAP_MATCH_THRESHOLD"),
-        Err(_) => Ok(0.75),
-    }
 }
 
 /// sherpa's turns of each track of `id`, with their embeddings.
@@ -309,28 +290,6 @@ async fn turns(app: &App, id: &str) -> Result<BTreeMap<String, Vec<Turn>>> {
         out.insert(track, turns);
     }
     Ok(out)
-}
-
-/// Name lookup: pre-fills the names of `id` (unless any are set) with the known voice of
-/// another recording most similar to each cluster, if at least `threshold` alike.
-fn lookup_names(db: &rusqlite::Connection, id: &str, threshold: f32) -> Result<()> {
-    let clusters: Vec<(String, Vec<f32>)> = db
-        .prepare("SELECT label, embedding FROM clusters WHERE recording = ?1")?
-        .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
-        .collect::<rusqlite::Result<_>>()?;
-    let voices: Vec<(String, Vec<f32>)> = db
-        .prepare("SELECT name, embedding FROM voices WHERE recording != ?1")?
-        .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
-        .collect::<rusqlite::Result<_>>()?;
-    let names: BTreeMap<&str, &str> = clusters
-        .iter()
-        .filter_map(|(label, emb)| Some((label.as_str(), best_match(emb, &voices, threshold)?)))
-        .collect();
-    db.execute(
-        "UPDATE recordings SET speakers = ?2 WHERE id = ?1 AND speakers IS NULL",
-        params![id, serde_json::to_string(&names)?],
-    )?;
-    Ok(())
 }
 
 /// Diarizes one recording at a time.
@@ -391,75 +350,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn matches_the_most_similar_voice_above_threshold() {
-        let voices = [
-            ("Max".to_string(), vec![1.0, 0.0, 0.0]),
-            ("Eva".to_string(), vec![0.0, 1.0, 0.0]),
-            ("Max".to_string(), vec![0.8, 0.6, 0.0]),
-        ];
-        assert_eq!(best_match(&[0.9, 0.1, 0.0], &voices, 0.6), Some("Max"));
-        assert_eq!(best_match(&[0.3, 2.0, 0.0], &voices, 0.6), Some("Eva"));
-        // Unnormalized input: cosine ignores length.
-        assert_eq!(best_match(&[8.0, 6.0, 0.0], &voices[1..], 0.99), Some("Max"));
-        assert_eq!(best_match(&[0.0, 0.0, 1.0], &voices, 0.6), None);
-        assert_eq!(best_match(&[1.0, 1.0, 0.0], &voices[..2], 0.8), None);
-        assert_eq!(best_match(&[0.0, 0.0, 0.0], &voices, 0.0), None);
-        assert_eq!(best_match(&[1.0, 0.0], &voices, 0.0), None, "other model's dimension");
-        assert_eq!(best_match(&[1.0, 0.0, 0.0], &[], 0.0), None);
-    }
 
-    #[test]
-    fn prefills_matched_clusters_but_keeps_names_set() {
-        let db = crate::db::open(Path::new(":memory:")).unwrap();
-        let bytes = crate::assemble::bytes;
-        for id in ["old", "r1", "r2"] {
-            crate::db::ensure_recording(&db, id, "laptop").unwrap();
-        }
-        db.execute(
-            "INSERT INTO voices (name, embedding, recording, label) VALUES
-             ('Max', ?1, 'old', 'room/S1'), ('Eva', ?2, 'old', 'remote/S1'), ('Self', ?3, 'r1', 'room/S3')",
-            params![
-                bytes(&[1.0, 0.0, 0.0]),
-                bytes(&[0.0, 1.0, 0.0]),
-                bytes(&[0.0, 0.0, 1.0])
-            ],
-        )
-        .unwrap();
-        let clusters = |id: &str, xs: &[(&str, [f32; 3])]| {
-            for (l, v) in xs {
-                db.execute(
-                    "INSERT INTO clusters (recording, label, embedding) VALUES (?1, ?2, ?3)",
-                    params![id, l, bytes(v)],
-                )
-                .unwrap();
-            }
-        };
-        let speakers = |id: &str| -> String {
-            db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))
-                .unwrap()
-        };
-        clusters(
-            "r1",
-            &[
-                ("room/S1", [0.1, 0.9, 0.0]),
-                ("room/S2", [0.7, 0.7, 0.1]),
-                ("room/S3", [0.0, 0.1, 1.0]),
-                ("remote/S1", [0.95, 0.0, 0.1]),
-            ],
-        );
-        lookup_names(&db, "r1", 0.9).unwrap();
-        assert_eq!(speakers("r1"), r#"{"remote/S1":"Max","room/S1":"Eva"}"#);
-
-        db.execute(
-            "UPDATE recordings SET speakers = '{\"room/S1\":\"Jo\"}' WHERE id = 'r2'",
-            [],
-        )
-        .unwrap();
-        clusters("r2", &[("room/S1", [0.0, 1.0, 0.0])]);
-        lookup_names(&db, "r2", 0.6).unwrap();
-        assert_eq!(speakers("r2"), r#"{"room/S1":"Jo"}"#);
-    }
 
     /// Needs ffmpeg and sherpa-onnx-offline-speaker-diarization on PATH,
     /// MICTAP_SEG_MODEL and MICTAP_EMB_MODEL.
@@ -495,6 +386,6 @@ mod tests {
         let speaker: String = db.query_row("SELECT speaker FROM lines", [], |r| r.get(0)).unwrap();
         assert_eq!(speaker, "room/S1");
         let emb: Vec<u8> = db.query_row("SELECT embedding FROM clusters", [], |r| r.get(0)).unwrap();
-        assert!(!floats(&emb).is_empty());
+        assert!(!crate::assemble::floats(&emb).is_empty());
     }
 }

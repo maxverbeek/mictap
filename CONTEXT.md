@@ -26,8 +26,11 @@ Domain terms used across the code and docs.
 - **Assembly**: derives a recording's lines and clusters (with their means) from its model
   outputs: fold fragments, merge alike clusters, split segments into lines, merge tracks,
   drop echoes. Pure; knows nothing of names.
-- **Voice**: a named cluster's mean embedding, one per named cluster (a person named in
-  five recordings has five).
-- **Name lookup**: matches a recording's clusters against the voices of other recordings
-  and pre-fills names; part of name storage, not of assembly.
+- **Voice**: a confirmed cluster's mean embedding, one per confirmed cluster (a person
+  confirmed in five recordings has five).
+- **Suggestion**: a name proposed for a cluster by matching it against the voices of other
+  recordings; only when one name clearly wins, else the cluster stays unknown. Part of
+  name storage, not of assembly. Never learned or written to the transcript.
+- **Confirmed name**: a name typed, or a suggestion accepted. Only confirmed names teach
+  voices and appear in the transcript.
 - **Transcript**: the note written to the vault; derived, never read back.

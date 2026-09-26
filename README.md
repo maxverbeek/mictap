@@ -116,8 +116,8 @@ link: http://homeserver:8765/#01J8X...
 **S2** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
 ```
 
-- `attendees` are the named speakers; unnamed ones only show up as `S<n>`
-  in the lines. `link` opens the recording on the web page.
+- `attendees` are the speakers with confirmed names; the others only show up
+  as `S<n>` in the lines. `link` opens the recording on the web page.
 - The whole file is the server's: it is rewritten whenever you name a
   speaker on the web page, and edits made in Obsidian are lost then. A
   recording without any speech, or one that failed, gets no file. Writes go
@@ -130,13 +130,16 @@ link: http://homeserver:8765/#01J8X...
 
 ## Learning names
 
-Naming a speaker stores that cluster's voice embedding. After diarizing a
-new recording, each cluster is matched against the stored voices (cosine,
-best match at or above `MICTAP_MATCH_THRESHOLD`, default 0.75), and a match
-pre-fills its name. Unmatched clusters stay unnamed, and a name you set is
-never overwritten. Only new transcripts are pre-filled:
-blanks in older ones are left alone. Accuracy is modest (see
-`local/learning-names.md`): expect misses more than wrong names.
+A name you type, or a suggestion you confirm, stores that cluster's voice
+embedding. After diarizing a new recording, each cluster is matched against
+the stored voices of other recordings (cosine, per name its most similar
+voice), and the best name is **suggested** only when it is at least
+`MICTAP_MATCH_THRESHOLD` (0.75) alike and more than `MICTAP_MATCH_MARGIN`
+(0.05) ahead of every other name. Otherwise the cluster stays unknown, as a
+guest should. No name is suggested twice within a track, nor where it is
+already confirmed for that track. Suggestions are never learned and never
+reach the vault until confirmed; a name you set is never overwritten. Accuracy
+is modest (see `local/learning-names.md`).
 
 ## Audio
 
@@ -164,8 +167,9 @@ recording grouped by day with its progress (refreshed while anything is in
 progress), and per recording its lines with the speaker names. Clicking a
 line's timestamp plays just that line from the mixdown (the player keeps
 going if you press play again); the ▶ next to a speaker plays their longest
-line. Naming speakers (once the recording is done) stores the names, learns
-their voices and rewrites the transcript in the vault.
+line. Once the recording is done, suggested names show as `Eva?` with ✓ to
+confirm and ✗ to reject; confirming or typing a name learns that voice and
+rewrites the transcript in the vault.
 
 ## Upload
 
@@ -195,11 +199,12 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   progress. `progress` is `null` once done or failed, else
   `{"step": "unstarted"}`, `{"step": "transcribing", "percent": 42}` or
   `{"step": "diarizing", "since_ms": ...}` (`null` while queued).
-- `GET /recordings/{id}`: one recording, its `lines` and speaker `names`;
-  `editable` once names can be set.
-- `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` sets speaker names
-  (`""` clears one) and rewrites the transcript. 409 until the recording is
-  done.
+- `GET /recordings/{id}`: one recording, its `lines` and `speakers`
+  (per label its confirmed `name` or else its `suggested` one); `editable`
+  once names can be set.
+- `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` confirms speaker
+  names (`""` leaves a label unnamed and rejects its suggestion), learns
+  their voices and rewrites the transcript. 409 until the recording is done.
 - `GET /recordings/{id}/outputs`: its model outputs per track (whisper
   segments, sherpa turns with their embeddings), until they expire.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
@@ -248,7 +253,8 @@ services.mictap.recorder = {
 - **Models** are pinned with `fetchurl`; override them with
   `services.mictap.server.models.*`. Tunables go in `settings`:
   `MICTAP_CLUSTER_THRESHOLD` (0.9), `MICTAP_MERGE_THRESHOLD` (0.75),
-  `MICTAP_MATCH_THRESHOLD` (0.75), `MICTAP_ECHO_JACCARD` (0.6),
+  `MICTAP_MATCH_THRESHOLD` (0.75), `MICTAP_MATCH_MARGIN` (0.05),
+  `MICTAP_ECHO_JACCARD` (0.6),
   `MICTAP_OUTPUTS_DAYS` (7).
 - `url` (default `http://<hostname>:<port>`) is the base of the timestamp
   links and the one dotted host name the server accepts besides `*.ts.net`.

@@ -15,14 +15,14 @@ use axum::{
 };
 use futures_util::StreamExt;
 use jiff::{civil::DateTime, tz::TimeZone, Timestamp};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::vault::Names;
+use crate::names::Names;
 
 pub struct App {
     dir: PathBuf,
@@ -318,80 +318,51 @@ fn date(app: &App, started_ms: Option<i64>) -> Option<String> {
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>> {
     check_name(&id)?;
     let db = app.db.lock().await;
-    type Row = (Option<i64>, String, Option<String>, Option<String>);
+    type Row = (Option<i64>, String, Option<String>);
     let row: Option<Row> = db
         .query_row(
-            "SELECT started_ms, status, audio, speakers FROM recordings WHERE id = ?1",
+            "SELECT started_ms, status, audio FROM recordings WHERE id = ?1",
             [&id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
-    let Some((started_ms, status, audio, speakers)) = row else {
+    let Some((started_ms, status, audio)) = row else {
         return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")));
     };
     let segs = crate::assemble::lines(&db, &id)?;
     let editable = status == "done";
     let progress = step(&app, &db, &id, &status, &segs)?;
     let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
-    let names: Value = speakers.map_or(Ok(json!({})), |s| serde_json::from_str(&s))?;
+    let speakers = crate::names::speakers(&db, &id, segs.iter().filter_map(|l| l.speaker.as_deref()))?;
     Ok(Json(json!({
         "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
         "total_ms": total_ms, "audio": audio, "editable": editable, "progress": progress,
-        "names": names, "lines": segs,
+        "speakers": speakers, "lines": segs,
     })))
 }
 
-/// Sets speaker names (`label -> name`, `""` clears one), learns their voices and rewrites
-/// the transcript.
+/// Confirms speaker names (`label -> name`; `""` leaves a label unnamed, rejecting its
+/// suggestion), learns their voices and rewrites the transcript.
 async fn name_speakers(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     Json(names): Json<Names>,
 ) -> Result<StatusCode> {
     check_name(&id)?;
-    if let Some(l) = names.keys().find(|l| !crate::vault::is_label(l)) {
+    if let Some(l) = names.keys().find(|l| !crate::names::is_label(l)) {
         return Err(Error(StatusCode::BAD_REQUEST, format!("not a speaker label: {l}")));
     }
     {
         let db = app.db.lock().await;
-        let row: Option<(String, Option<String>)> = db
-            .query_row("SELECT status, speakers FROM recordings WHERE id = ?1", [&id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+        let status: Option<String> = db
+            .query_row("SELECT status FROM recordings WHERE id = ?1", [&id], |r| r.get(0))
             .optional()?;
-        let applied: Names = match row {
+        match status.as_deref() {
             None => return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}"))),
-            Some((s, _)) if s != "done" => {
-                return Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done")));
-            }
-            Some((_, s)) => s.map(|s| serde_json::from_str(&s)).transpose()?.unwrap_or_default(),
-        };
-        let mut all = applied.clone();
-        for (label, name) in names {
-            match name.trim() {
-                "" => all.remove(&label),
-                n => all.insert(label, n.to_string()),
-            };
+            Some("done") => {}
+            Some(s) => return Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done"))),
         }
-        let tx = db.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE recordings SET speakers = ?2 WHERE id = ?1",
-            params![id, serde_json::to_string(&all)?],
-        )?;
-        for label in applied.keys().filter(|l| !all.contains_key(*l)) {
-            tx.execute(
-                "DELETE FROM voices WHERE recording = ?1 AND label = ?2",
-                params![id, label],
-            )?;
-        }
-        for (label, name) in all.iter().filter(|(l, n)| applied.get(*l) != Some(n)) {
-            tx.execute(
-                "INSERT OR REPLACE INTO voices (name, embedding, recording, label)
-                 SELECT ?3, embedding, recording, label FROM clusters WHERE recording = ?1 AND label = ?2",
-                params![id, label, name],
-            )?;
-        }
-        tx.commit()?;
+        crate::names::confirm(&db, &id, names)?;
     }
     crate::vault::write(&app, &id).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -475,7 +446,7 @@ async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Resul
     tx.execute("DELETE FROM voices WHERE recording = ?1", [&id])?;
     tx.execute(
         "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, speakers = NULL,
-         done_ms = NULL WHERE id = ?1",
+         suggested = NULL, done_ms = NULL WHERE id = ?1",
         [&id],
     )?;
     tx.commit()?;

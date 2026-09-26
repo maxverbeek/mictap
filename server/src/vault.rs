@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
     sync::Arc,
@@ -11,14 +10,11 @@ use jiff::Timestamp;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::{api::App, assemble::Line};
+use crate::{api::App, assemble::Line, names::Names};
 
 /// Base of the links in transcripts, as browsers reach this server.
 pub static URL: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| std::env::var("MICTAP_URL").unwrap_or_else(|_| "http://localhost:8765".into()));
-
-/// Speaker label (`room/S1`) -> name.
-pub(crate) type Names = BTreeMap<String, String>;
 
 fn hms(ms: i64) -> String {
     let s = ms / 1000;
@@ -29,15 +25,6 @@ fn hms(ms: i64) -> String {
 pub(crate) fn label_order(label: &str) -> (bool, u32) {
     let (track, n) = label.split_once("/S").unwrap_or((label, ""));
     (track != "room", n.parse().unwrap_or(u32::MAX))
-}
-
-/// A speaker label: `room/S<n>` or `remote/S<n>`.
-pub(crate) fn is_label(k: &str) -> bool {
-    k.split_once('/').is_some_and(|(track, n)| {
-        matches!(track, "room" | "remote")
-            && n.strip_prefix('S')
-                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
-    })
 }
 
 /// What a line of `label` shows: its name, else `S<n>`.
