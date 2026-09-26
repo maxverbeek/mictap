@@ -113,12 +113,12 @@ link: http://homeserver:8765/#01J8X...
 
 **Max** (room, [00:14:02](http://homeserver:8765/r/01J8X.../audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?
 **Eva** (room, [00:14:05](http://homeserver:8765/r/01J8X.../audio.ogg#t=845)): Ja, prima.
-**S2** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
+**?** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
 ```
 
-- `attendees` are the confirmed names, then the line names; a line shows its
-  line name, else its label's name, else `S<n>` (`?` for a label or line
-  answered `?`). `link` opens the recording on the web page.
+- `attendees` are the confirmed names, then the names lines show; a line
+  shows its name when taught or guessed, else `?` (see Learning names).
+  `link` opens the recording on the web page.
 - The whole file is the server's: it is rewritten whenever you name a
   speaker on the web page, and edits made in Obsidian are lost then. A
   recording without any speech, or one that failed, gets no file. Writes go
@@ -134,16 +134,23 @@ link: http://homeserver:8765/#01J8X...
 A name you type, or a suggestion you confirm, stores **voices**: embeddings of
 that speaker to recognize them by later. Lines you listened to before
 confirming are the evidence: each one you kept as only that speaker becomes a
-voice of its own (from the turns under it), and one you marked wrong teaches
+voice of its own (its line voice, see below), and one you marked wrong teaches
 nothing; if you marked all of them wrong, no voice is stored. Without heard
-lines, or once their turns have expired, the voice is the cluster's **core**:
-the mean of its turns most alike to its mean covering 70% of its speech, so
-stray turns and folded fragments are left out. Listening to a confirmed
+lines, or when none can teach (no line voice, turns expired), the voice is the
+cluster's **core**: the mean of its turns most alike to its mean covering 70%
+of its speech, so stray turns and folded fragments are left out. Listening to a confirmed
 speaker again and saving replaces its voices. A **line name** (one line named
-on its own) teaches a voice of its own from the turns under that line, replaced
-when the line is renamed and dropped when it is cleared or set to `?`; once the
-turns have expired the name is kept but nothing is learned. A label answered
-`?` teaches nothing and is never suggested a name.
+on its own) teaches a voice of its own, replaced when the line is renamed and
+dropped when it is cleared or set to `?`. A label answered `?` teaches nothing
+and is never suggested a name.
+
+After diarizing, every line of at least 300 ms gets a **line voice**: CAM++'s
+embedding of that line's own audio, kept durably. A line taught (named on its
+own, or heard) learns its line voice; without one (older recordings), the
+turns under it, and once those expired, nothing: the name is kept. Recordings
+diarized before line voices existed get them computed in the background, one
+at a time while nothing waits to be diarized, as long as their audio is kept
+(one log line each), and their transcript is rewritten.
 
 After diarizing a new recording, and in every recording whenever a voice is
 learned, each cluster's core is matched against all voices except the ones it
@@ -152,9 +159,20 @@ best name is **suggested** only when it is at least `MICTAP_MATCH_THRESHOLD`
 (0.75) alike and more than `MICTAP_MATCH_MARGIN` (0.05) ahead of every other
 name. Otherwise the cluster stays unknown, as a guest should. No name is
 suggested twice within a track, nor where it is already confirmed for that
-track. Suggestions are never learned and never reach the vault until
-confirmed; a name you set is never overwritten. Accuracy is modest (see
-`local/learning-names.md`).
+track. Suggestions are never learned; a name you set is never overwritten.
+Accuracy is modest (see `local/learning-names.md`).
+
+Each line is then **taught**, **guessed** or **unknown**, the same on the page,
+in the API and in the transcript. Taught lines show the name they taught.
+Otherwise the line's label gives a guess (its confirmed name, else its
+suggestion), and so does its line voice: matched against all voices (but ones
+taught from that very line), the best name when at least
+`MICTAP_LINE_THRESHOLD` (0.55) alike and more than `MICTAP_LINE_MARGIN` (0.1)
+ahead of every other name. Either one alone, or both agreeing, is the guess;
+when they disagree the line is unknown and worth a look, as is a line with
+neither or a line named `?`. Guesses are computed on every read, so teaching
+one line can change others at once; a transcript is rewritten when its own
+recording's names change.
 
 A cluster can hold more than one voice: two people sherpa lumped together, or
 a far meeting room where several people share one mic. Assembly splits each
@@ -180,8 +198,9 @@ learned from its named speakers, leaving the transcript.
 `mictap rediarize <id>` runs sherpa and CAM++ on a finished recording again
 while its audio is kept (after a diarization change), and whisper too once its
 segments have expired: its turns, speaker names and their voices are dropped,
-the lines are derived anew, names are pre-filled anew from other recordings,
-and the transcript is rewritten. Line names and their voices are kept.
+the lines are derived anew and embedded again, names are pre-filled anew from
+other recordings, and the transcript is rewritten. Line names and their voices
+are kept.
 
 ## Web page
 
@@ -190,12 +209,16 @@ recording grouped by day with its attendees or its progress (refreshed while
 anything is in progress), and per recording its transcript. Clicking a line's
 time plays from there; clicking the rest of the line plays it and opens a menu
 to name that line alone (`?` for mixed or unsure; picking its name again
-clears it), and keys 1 to 9 name the line playing. Beside the transcript, "Who
-is this?" asks about each unnamed label in turn with three of its lines: pick
-its suggestion, another name or `?` (several people, don't know), and ✓ confirms
-it, the lines not named on their own taught as heard. Names taught dark,
-filled in from the label light, suggestions in italics. Every change is saved
-at once and rewrites the transcript in the vault.
+clears it; for a label with no name or suggestion at all, it names the label),
+and keys 1 to 9 name the line playing. Lines show taught names dark, guessed
+ones light, and unknown ones as an orange `?`. A bar under the title counts
+each; its "unknown" button opens the menu on the first unknown line, and
+naming a line from its menu moves it on to the next unknown one (arrow keys
+move it line by line). Beside the transcript, "Who is this?" asks about each
+label with no name or suggestion in turn with three of its lines: pick a name
+or `?` (several people, don't know), and ✓ confirms it, the lines not named on
+their own taught as heard. Every change is saved at once and rewrites the
+transcript in the vault.
 
 ## Upload
 
@@ -229,8 +252,11 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
 - `GET /recordings/{id}`: one recording, its `lines` and `speakers`
   (per label its confirmed `name`, `"?"` when answered unsure, or else its
   `suggested` one); `editable` once names can be set, `teachable` while its
-  turns are kept so naming learns voices. Each line has its label
-  (`speaker`), its `line_name` if set, the `name` it shows, and `taught`.
+  turns or line voices are kept so naming learns voices. Each line has its
+  label (`speaker`), its `line_name` if set, its `state` (`"taught"`,
+  `"guessed"` or `"unknown"`) and the `name` it shows (`null` when unknown).
+  `counts` has how many lines are in each state: `{"taught": 3, "guessed":
+  40, "unknown": 5}`.
 - `PUT /recordings/{id}/speakers`: confirms speaker names, learns their
   voices and rewrites the transcript. 409 until the recording is done. Body,
   per label: `{"room/S1": {"name": "Max", "heard": [{"start_ms": 1000,
@@ -243,7 +269,7 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   `{"track": "room", "start_ms": 1000, "end_ms": 4000, "name": "Eva"}`
   (`"?"` for mixed or unsure, `null` or `""` clears it), learns its voice and
   rewrites the transcript. 404 for an unknown recording, 409 until done.
-  Answers `{"voices": 1}`, or 0 once the turns expired.
+  Answers `{"voices": 1}`, or 0 without a line voice once the turns expired.
 - `GET /recordings/{id}/outputs`: its model outputs per track (whisper
   segments, sherpa turns with their embeddings), until they expire.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
@@ -293,6 +319,7 @@ services.mictap.recorder = {
   `services.mictap.server.models.*`. Tunables go in `settings`:
   `MICTAP_CLUSTER_THRESHOLD` (0.9), `MICTAP_MERGE_THRESHOLD` (0.75),
   `MICTAP_MATCH_THRESHOLD` (0.75), `MICTAP_MATCH_MARGIN` (0.05),
+  `MICTAP_LINE_THRESHOLD` (0.55), `MICTAP_LINE_MARGIN` (0.1),
   `MICTAP_ECHO_JACCARD` (0.6),
   `MICTAP_OUTPUTS_DAYS` (7).
 - `url` (default `http://<hostname>:<port>`) is the base of the timestamp

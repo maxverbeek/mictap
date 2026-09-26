@@ -40,13 +40,24 @@ Domain terms used across the code and docs.
 - **Suggestion**: a name proposed for a cluster by matching it against every voice except the
   ones it taught itself (so other recordings, and other clusters and named lines of its own);
   recomputed whenever a voice is learned; only when one name clearly wins, else the cluster stays unknown. Part of
-  name storage, not of assembly. Never learned or written to the transcript.
+  name storage, not of assembly. Never learned; its lines show it as a guess, in the transcript too.
 - **Confirmed name**: a name typed, or a suggestion accepted. Only confirmed names teach
-  voices and appear in the transcript. A label can also be answered `?` (several people,
+  voices. A label can also be answered `?` (several people,
   or unsure): confirmed, so never asked or suggested again, but no name and no voice.
 - **Line name**: a name set for one line, overriding its label's; `?` when that line is
   mixed or unsure. Kept by track and time, since lines are derived anew: a line takes the
   line name whose span holds its midpoint.
-- **Taught line**: a line that taught a voice: it has a line name other than `?`, or it was
-  a heard snippet when its label was confirmed. Its name is shown dark on the page.
+- **Line voice**: a CAM++ embedding of one line's own audio, computed after diarizing (none
+  for lines under 300 ms). Kept by track and time like line names, and kept durably, so lines
+  are guessed anew whenever a voice is learned. Teaching a line learns its line voice, else
+  the mean of the turns under it.
+- **Line state**: every line is in one of three, shown alike on the page, in the API and in
+  the transcript:
+  - **Taught**: it taught a voice: it has a line name other than `?`, or it was a heard
+    snippet when its label was confirmed. Shows that name, dark on the page.
+  - **Guessed**: shows a name the server is fairly sure of, recomputed on every read: its
+    label's confirmed name or suggestion, and the name its line voice clearly matches best
+    among all voices (but the ones it taught itself); either one alone, or both when they
+    agree. Light on the page.
+  - **Unknown**: neither, the two disagree (the ones to check), or a line name `?`. Shows `?`.
 - **Transcript**: the note written to the vault; derived, never read back.
