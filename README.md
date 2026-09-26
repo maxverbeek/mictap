@@ -130,10 +130,11 @@ link: http://homeserver:8765/#01J8X...
 
 ## Learning names
 
-A name you type, or a suggestion you confirm, stores that cluster's voice
-embedding. After diarizing a new recording, each cluster is matched against
-the stored voices of other recordings (cosine, per name its most similar
-voice), and the best name is **suggested** only when it is at least
+A name you type, or a suggestion you confirm, stores a voice embedding for it:
+the cluster's **core**, the mean of its turns most alike to its mean covering
+70% of its speech, so stray turns and folded fragments are left out. After diarizing a new recording, each cluster is matched against
+the stored voices of other recordings (cosine between its core and each voice,
+per name its most similar voice), and the best name is **suggested** only when it is at least
 `MICTAP_MATCH_THRESHOLD` (0.75) alike and more than `MICTAP_MATCH_MARGIN`
 (0.05) ahead of every other name. Otherwise the cluster stays unknown, as a
 guest should. No name is suggested twice within a track, nor where it is

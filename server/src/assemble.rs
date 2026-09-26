@@ -80,6 +80,9 @@ pub struct Assembled {
 pub struct Cluster {
     pub label: String,
     pub mean: Vec<f32>,
+    /// The mean of its turns most alike to `mean`, covering `CORE_SHARE` of its embedded
+    /// speech: outliers and folded fragments left out. What voices are learned from.
+    pub core: Option<Vec<f32>>,
     /// The cluster's turns split into its two most different halves: how alike the halves'
     /// means are, and the smaller half's share of the speech. None under 4 embedded turns.
     pub halves: Option<(f32, f32)>,
@@ -125,9 +128,11 @@ pub fn assemble(outputs: &Outputs, tuning: &Tuning) -> Assembled {
         }
         clusters.extend(means(&turns).into_iter().enumerate().filter_map(|(k, mean)| {
             let own: Vec<&Turn> = turns.iter().filter(|t| t.speaker == k).collect();
+            let mean = mean?;
             Some(Cluster {
                 label: label(k),
-                mean: mean?,
+                core: core(&own, &mean),
+                mean,
                 halves: halves(&own),
             })
         }));
@@ -211,12 +216,13 @@ pub fn derive(db: &Connection, id: &str) -> rusqlite::Result<()> {
     db.execute("DELETE FROM clusters WHERE recording = ?1", [id])?;
     for c in &a.clusters {
         db.execute(
-            "INSERT INTO clusters (recording, label, embedding, halves_alike, minor_share)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO clusters (recording, label, embedding, core, halves_alike, minor_share)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 c.label,
                 bytes(&c.mean),
+                c.core.as_deref().map(bytes),
                 c.halves.map(|h| h.0),
                 c.halves.map(|h| h.1)
             ],
@@ -426,6 +432,34 @@ fn means(turns: &[Turn]) -> Vec<Option<Vec<f32>>> {
     }
     sums.iter_mut().flatten().for_each(|v| normalize(v));
     sums
+}
+
+/// A cluster's core covers at least this share of its embedded speech.
+const CORE_SHARE: f64 = 0.7;
+
+/// The length-weighted mean of the `turns` most alike to `mean`, taken in that order until
+/// they cover `CORE_SHARE` of the embedded speech.
+fn core(turns: &[&Turn], mean: &[f32]) -> Option<Vec<f32>> {
+    let mut ts: Vec<(f32, Turn)> = turns
+        .iter()
+        .filter_map(|t| Some((cosine(t.embedding.as_deref()?, mean), (*t).clone())))
+        .collect();
+    ts.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let total: i64 = ts.iter().map(|(_, t)| t.end_ms - t.start_ms).sum();
+    let mut covered = 0;
+    let kept: Vec<Turn> = ts
+        .into_iter()
+        .take_while(|(_, t)| {
+            let more = (covered as f64) < CORE_SHARE * total as f64;
+            covered += t.end_ms - t.start_ms;
+            more
+        })
+        .map(|(_, mut t)| {
+            t.speaker = 0;
+            t
+        })
+        .collect();
+    means(&kept).into_iter().next().flatten()
 }
 
 /// Splits `turns` in two by spherical 2-means over their embeddings, weighted by length,
@@ -909,5 +943,37 @@ mod tests {
             None,
             "too few turns to judge"
         );
+    }
+
+    #[test]
+    fn core_leaves_outliers_out() {
+        let e = |v: [f32; 2]| {
+            let mut v = v.to_vec();
+            normalize(&mut v);
+            Some(v)
+        };
+        // Four turns of one voice and a folded fragment of someone else (20% of the speech).
+        let turns = with(
+            vec![
+                t(0, 4_000, 0),
+                t(4_000, 8_000, 0),
+                t(8_000, 12_000, 0),
+                t(12_000, 16_000, 0),
+                t(16_000, 20_000, 0),
+            ],
+            [
+                e([1.0, 0.1]),
+                e([1.0, -0.1]),
+                e([1.0, 0.0]),
+                e([1.0, 0.05]),
+                e([0.0, 1.0]),
+            ],
+        );
+        let own: Vec<&Turn> = turns.iter().collect();
+        let mean = means(&turns)[0].clone().unwrap();
+        let core = core(&own, &mean).unwrap();
+        assert!(cosine(&core, &[1.0, 0.0]) > 0.999, "{core:?}");
+        assert!(cosine(&mean, &[1.0, 0.0]) < 0.99, "the mean is pulled off: {mean:?}");
+        assert_eq!(super::core(&[], &mean), None);
     }
 }

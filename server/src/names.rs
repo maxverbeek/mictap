@@ -92,7 +92,7 @@ fn best<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], m: &Matching) -> Opti
 pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
     let confirmed = confirmed(db, id)?;
     let clusters: Vec<(String, Vec<f32>)> = db
-        .prepare("SELECT label, embedding FROM clusters WHERE recording = ?1")?
+        .prepare("SELECT label, COALESCE(core, embedding) FROM clusters WHERE recording = ?1")?
         .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
         .collect::<rusqlite::Result<_>>()?;
     let voices: Vec<(String, Vec<f32>)> = db
@@ -149,8 +149,9 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: Names) -> Result<()> {
         .filter(|(l, n)| before.get(*l) != Some(n) && !mixed.contains(*l))
     {
         tx.execute(
-            "INSERT OR REPLACE INTO voices (name, embedding, recording, label)
-             SELECT ?3, embedding, recording, label FROM clusters WHERE recording = ?1 AND label = ?2",
+            "INSERT INTO voices (name, embedding, recording, label)
+             SELECT ?3, COALESCE(core, embedding), recording, label FROM clusters
+             WHERE recording = ?1 AND label = ?2",
             params![id, label, name],
         )?;
     }
@@ -326,6 +327,25 @@ mod tests {
         assert_eq!(learned, "Eva");
         let got = speakers(&db, "r1", ["room/S1", "room/S2"]).unwrap();
         assert!(got["room/S1"].mixed && !got["room/S2"].mixed);
+    }
+
+    #[test]
+    fn matches_and_learns_the_core() {
+        let db = db();
+        voice(&db, "Max", "room/S1", &[1.0, 0.0]);
+        cluster(&db, "room/S1", &[0.0, 1.0]);
+        db.execute(
+            "UPDATE clusters SET core = ?1 WHERE recording = 'r1'",
+            [bytes(&[0.99, 0.1])],
+        )
+        .unwrap();
+        suggest(&db, "r1", &M).unwrap();
+        assert_eq!(get(&db, "suggested")["room/S1"], "Max");
+        confirm(&db, "r1", [("room/S1".to_string(), "Max".to_string())].into()).unwrap();
+        let learned: Vec<u8> = db
+            .query_row("SELECT embedding FROM voices WHERE recording = 'r1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(floats(&learned), [0.99, 0.1]);
     }
 
     #[test]

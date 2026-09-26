@@ -77,22 +77,27 @@ CREATE TABLE IF NOT EXISTS lines (
     speaker TEXT
 );
 -- embedding: the mean of the cluster's L2-normalized turn embeddings, f32 little-endian.
--- halves_alike/minor_share: see assemble::Cluster::halves; NULL for clusters derived before.
+-- core: see assemble::Cluster::core; halves_alike/minor_share: see assemble::Cluster::halves.
+-- All three NULL for clusters derived before they existed.
 CREATE TABLE IF NOT EXISTS clusters (
     recording TEXT NOT NULL REFERENCES recordings(id),
     label TEXT NOT NULL,
     embedding BLOB NOT NULL,
+    core BLOB,
     halves_alike REAL,
     minor_share REAL,
     PRIMARY KEY (recording, label)
 );
--- A cluster the user named: its embedding, copied from clusters.
+-- An embedding learned for a confirmed name: from the cluster (start_ms/end_ms NULL), or
+-- from a snippet of it that was heard.
 CREATE TABLE IF NOT EXISTS voices (
+    id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     embedding BLOB NOT NULL,
     recording TEXT NOT NULL REFERENCES recordings(id),
     label TEXT NOT NULL,
-    PRIMARY KEY (recording, label)
+    start_ms INTEGER,
+    end_ms INTEGER
 );
 ";
 
@@ -107,6 +112,28 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
             "ALTER TABLE clusters ADD COLUMN halves_alike REAL;
              ALTER TABLE clusters ADD COLUMN minor_share REAL;",
         )?;
+    }
+    if conn.prepare("SELECT core FROM clusters").is_err() {
+        conn.execute_batch("ALTER TABLE clusters ADD COLUMN core BLOB")?;
+    }
+    if conn.prepare("SELECT start_ms FROM voices").is_err() {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "CREATE TABLE voices_new (
+                 id INTEGER PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 embedding BLOB NOT NULL,
+                 recording TEXT NOT NULL REFERENCES recordings(id),
+                 label TEXT NOT NULL,
+                 start_ms INTEGER,
+                 end_ms INTEGER
+             );
+             INSERT INTO voices_new (name, embedding, recording, label)
+               SELECT name, embedding, recording, label FROM voices;
+             DROP TABLE voices;
+             ALTER TABLE voices_new RENAME TO voices;",
+        )?;
+        tx.commit()?;
     }
     if conn.prepare("SELECT suggested FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN suggested TEXT")?;
@@ -298,6 +325,41 @@ mod tests {
         assert_eq!(left("SELECT group_concat(recording) FROM segments"), "new,busy");
         assert_eq!(left("SELECT group_concat(recording) FROM turns"), "new");
         assert_eq!(left("SELECT group_concat(recording) FROM lines"), "old");
+    }
+
+    #[test]
+    fn keeps_voices_of_an_old_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'receiving');
+                 INSERT INTO recordings (id, source, status) VALUES ('r1', 'laptop', 'done');
+                 CREATE TABLE clusters (recording TEXT NOT NULL, label TEXT NOT NULL,
+                   embedding BLOB NOT NULL, PRIMARY KEY (recording, label));
+                 CREATE TABLE voices (name TEXT NOT NULL, embedding BLOB NOT NULL,
+                   recording TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (recording, label));
+                 INSERT INTO voices VALUES ('Max', x'01', 'r1', 'room/S1');",
+            )
+            .unwrap();
+        let conn = super::open(&path).unwrap();
+        let row: (String, String, Option<i64>) = conn
+            .query_row("SELECT name, label, start_ms FROM voices", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("Max".into(), "room/S1".into(), None));
+        // Several voices per cluster now.
+        conn.execute(
+            "INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms)
+             VALUES ('Max', x'02', 'r1', 'room/S1', 0, 1000)",
+            [],
+        )
+        .unwrap();
+        assert!(conn.prepare("SELECT core FROM clusters").is_ok());
+        super::open(&path).unwrap();
     }
 
     #[test]

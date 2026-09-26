@@ -765,7 +765,7 @@ mod tests {
             .execute_batch(
                 "INSERT INTO recordings (id, source, status) VALUES ('r1', 'laptop', 'done');
                  INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00');
-                 INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1');",
+                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1');",
             )
             .unwrap();
         let (s, b) = send(&app, "DELETE", "/recordings/r1", b"").await;
@@ -791,7 +791,7 @@ mod tests {
                  INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker)
                    VALUES ('r1', 'room', 0, 1000, 'a', 'room/S1');
                  INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
-                 INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');",
+                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');",
             )
             .unwrap();
         }
@@ -849,7 +849,7 @@ mod tests {
                    INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES
                      ('r1', 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 'room', 1000, 2000, 'Ja.', 'room/S2');
                    INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'01'), ('r1', 'room/S2', x'02');
-                   INSERT INTO voices VALUES ('Eva', x'02', 'r1', 'room/S2');"#,
+                   INSERT INTO voices (name, embedding, recording, label) VALUES ('Eva', x'02', 'r1', 'room/S2');"#,
             )
             .unwrap();
         let put = |id: &str, body: &str| {

@@ -29,8 +29,11 @@ Domain terms used across the code and docs.
 - **Assembly**: derives a recording's lines and clusters (with their means) from its model
   outputs: fold fragments, merge alike clusters, split segments into lines, merge tracks,
   drop echoes. Pure; knows nothing of names.
-- **Voice**: a confirmed cluster's mean embedding, one per confirmed cluster (a person
-  confirmed in five recordings has five).
+- **Core**: the mean embedding of a cluster's turns most alike to its mean, covering 70% of
+  its speech; outliers and folded fragments left out.
+- **Voice**: an embedding learned for a confirmed name: a cluster's core, or a snippet of
+  it that was heard. A cluster can teach several; a person confirmed in five recordings
+  has at least five.
 - **Suggestion**: a name proposed for a cluster by matching it against the voices of other
   recordings; only when one name clearly wins, else the cluster stays unknown. Part of
   name storage, not of assembly. Never learned or written to the transcript.
