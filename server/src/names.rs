@@ -227,7 +227,9 @@ fn snippet(db: &Connection, id: &str, track: &str, start_ms: i64, end_ms: i64) -
 }
 
 /// Sets the line name of `id`'s line on `track` spanning `[start_ms, end_ms)`, replacing
-/// any line name it overlaps (either holds the other's midpoint); None or `""` clears it.
+/// any line name it overlaps (either holds the other's midpoint) and its voice; None or `""`
+/// clears it. A name other than `?` learns a voice from the turns under the line, stored
+/// under the track as label; returns how many (none once the turns expired).
 pub(crate) fn name_line(
     db: &Connection,
     id: &str,
@@ -235,22 +237,48 @@ pub(crate) fn name_line(
     start_ms: i64,
     end_ms: i64,
     name: Option<&str>,
-) -> Result<()> {
+) -> Result<usize> {
     let tx = db.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM line_names WHERE recording = ?1 AND track = ?2
-         AND ((start_ms + end_ms) / 2 >= ?3 AND (start_ms + end_ms) / 2 < ?4
-              OR (?3 + ?4) / 2 >= start_ms AND (?3 + ?4) / 2 < end_ms)",
-        params![id, track, start_ms, end_ms],
-    )?;
+    let replaced: Vec<(i64, i64)> = tx
+        .prepare(
+            "DELETE FROM line_names WHERE recording = ?1 AND track = ?2
+             AND ((start_ms + end_ms) / 2 >= ?3 AND (start_ms + end_ms) / 2 < ?4
+                  OR (?3 + ?4) / 2 >= start_ms AND (?3 + ?4) / 2 < end_ms)
+             RETURNING start_ms, end_ms",
+        )?
+        .query_map(params![id, track, start_ms, end_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (s, e) in replaced {
+        tx.execute(
+            "DELETE FROM voices WHERE recording = ?1 AND label = ?2 AND start_ms = ?3 AND end_ms = ?4",
+            params![id, track, s, e],
+        )?;
+    }
+    let mut learned = 0;
     if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
         tx.execute(
             "INSERT INTO line_names (recording, track, start_ms, end_ms, name) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, track, start_ms, end_ms, name],
         )?;
+        if let Some(v) = snippet(&tx, id, track, start_ms, end_ms)?.filter(|_| name != "?") {
+            learned = tx.execute(
+                "INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![name, bytes(&v), id, track, start_ms, end_ms],
+            )?;
+        }
     }
     tx.commit()?;
-    Ok(())
+    Ok(learned)
+}
+
+/// Whether `id`'s turns are kept, so naming can still learn voices from its lines.
+pub(crate) fn teachable(db: &Connection, id: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE recording = ?1 AND embedding IS NOT NULL)",
+        [id],
+        |r| r.get(0),
+    )?)
 }
 
 /// A line with the name it shows: its line name, else its label's confirmed name.
@@ -691,5 +719,45 @@ mod tests {
         assert_eq!(n, 2, "Bo, and Jan on the remote track");
         let got = attendees(&confirmed(&db, "r1").unwrap(), &super::named(&db, "r1").unwrap());
         assert_eq!(got, ["Max", "Bo"]);
+    }
+
+    #[test]
+    fn a_line_name_teaches_one_voice_replaced_with_it() {
+        let db = db();
+        turns(&db, &[(0, 4_000, &[1.0, 0.0]), (4_000, 8_000, &[0.0, 1.0])]);
+        assert!(teachable(&db, "r1").unwrap());
+        let voices = |db: &Connection| -> Vec<(String, String, i64)> {
+            db.prepare("SELECT name, label, start_ms FROM voices ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(name_line(&db, "r1", "room", 0, 4_000, Some("Eva")).unwrap(), 1);
+        assert_eq!(name_line(&db, "r1", "room", 4_000, 8_000, Some("Jan")).unwrap(), 1);
+        assert_eq!(learned(&db)[0].2, [1.0, 0.0]);
+        // Renamed: its voice goes with the old name.
+        assert_eq!(name_line(&db, "r1", "room", 0, 4_000, Some("Bo")).unwrap(), 1);
+        let v = |n: &str, s| (n.to_string(), "room".to_string(), s);
+        assert_eq!(voices(&db), [v("Jan", 4_000), v("Bo", 0)]);
+        // Unsure, or cleared: no voice.
+        assert_eq!(name_line(&db, "r1", "room", 0, 4_000, Some("?")).unwrap(), 0);
+        assert_eq!(name_line(&db, "r1", "room", 4_000, 8_000, Some("")).unwrap(), 0);
+        assert_eq!(voices(&db), []);
+        // A label confirmed later leaves line voices alone.
+        name_line(&db, "r1", "room", 4_000, 8_000, Some("Jan")).unwrap();
+        cluster(&db, "room/S1", &[0.6, 0.8]);
+        confirm(&db, "r1", named(&[("room/S1", "Max")])).unwrap();
+        confirm(&db, "r1", named(&[("room/S1", "")])).unwrap();
+        assert_eq!(voices(&db), [v("Jan", 4_000)]);
+        // Once the turns expired the name is still kept.
+        db.execute("DELETE FROM turns", []).unwrap();
+        assert!(!teachable(&db, "r1").unwrap());
+        assert_eq!(name_line(&db, "r1", "room", 0, 4_000, Some("Eva")).unwrap(), 0);
+        let n: i64 = db
+            .query_row("SELECT COUNT(*) FROM line_names", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
     }
 }

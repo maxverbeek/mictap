@@ -313,7 +313,8 @@ fn date(app: &App, started_ms: Option<i64>) -> Option<String> {
     Some(t.to_zoned(app.tz.clone()).strftime("%Y-%m-%d %H:%M").to_string())
 }
 
-/// One recording with its lines and speaker names. `editable` once its names can be set.
+/// One recording with its lines and speaker names. `editable` once its names can be set,
+/// `teachable` while naming can learn voices.
 async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>> {
     check_name(&id)?;
     let db = app.db.lock().await;
@@ -337,6 +338,7 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
         "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
         "total_ms": total_ms, "audio": audio, "editable": editable, "progress": progress,
         "speakers": speakers, "lines": crate::names::named(&db, &id)?,
+        "teachable": crate::names::teachable(&db, &id)?,
     })))
 }
 
@@ -361,6 +363,7 @@ struct LineName {
 }
 
 /// Sets or clears the name of one line (see `names::name_line`) and rewrites the transcript.
+/// Answers with the voices it learned.
 async fn name_line(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
@@ -370,13 +373,13 @@ async fn name_line(
     if !matches!(l.track.as_str(), "room" | "remote") || l.start_ms >= l.end_ms {
         return Err(Error(StatusCode::BAD_REQUEST, "bad line".into()));
     }
-    {
+    let voices = {
         let db = app.db.lock().await;
         done(&db, &id)?;
-        crate::names::name_line(&db, &id, &l.track, l.start_ms, l.end_ms, l.name.as_deref())?;
-    }
+        crate::names::name_line(&db, &id, &l.track, l.start_ms, l.end_ms, l.name.as_deref())?
+    };
     crate::vault::write(&app, &id).await?;
-    Ok(Json(json!({})))
+    Ok(Json(json!({ "voices": voices })))
 }
 
 /// Confirms speaker names (`label -> {name, heard}`, see `names::confirm`), learns their
@@ -449,9 +452,9 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
 }
 
 /// Runs sherpa and CAM++ on a finished recording's audio again (and whisper, if its segments
-/// expired). Its turns, speaker names and voices are dropped, line names kept; its lines stay
-/// until derived anew, names are pre-filled anew from other recordings' voices, and the
-/// transcript is rewritten.
+/// expired). Its turns, speaker names and their voices are dropped, line names and theirs
+/// kept; its lines stay until derived anew, names are pre-filled anew from other recordings'
+/// voices, and the transcript is rewritten.
 async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
     check_name(&id)?;
     let mut db = app.db.lock().await;
@@ -478,7 +481,10 @@ async fn rediarize(State(app): State<Arc<App>>, Path(id): Path<String>) -> Resul
          AND NOT EXISTS (SELECT 1 FROM segments WHERE recording = ?1)",
         [&id],
     )?;
-    tx.execute("DELETE FROM voices WHERE recording = ?1", [&id])?;
+    tx.execute(
+        "DELETE FROM voices WHERE recording = ?1 AND label NOT IN ('room', 'remote')",
+        [&id],
+    )?;
     tx.execute(
         "UPDATE recordings SET status = 'windowed', attempts = 0, retry_at = 0, speakers = NULL,
          suggested = NULL, done_ms = NULL WHERE id = ?1",
@@ -826,7 +832,9 @@ mod tests {
                  INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker)
                    VALUES ('r1', 'room', 0, 1000, 'a', 'room/S1');
                  INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
-                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');",
+                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');
+                 INSERT INTO line_names (recording, track, start_ms, end_ms, name) VALUES ('r1', 'room', 0, 1000, 'Eva');
+                 INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms) VALUES ('Eva', x'00', 'r1', 'room', 0, 1000);",
             )
             .unwrap();
         }
@@ -863,7 +871,12 @@ mod tests {
             "r1,r3",
             "until derived anew"
         );
-        assert_eq!(one("SELECT group_concat(recording) FROM voices"), "r3");
+        assert_eq!(
+            one("SELECT group_concat(recording || ':' || name) FROM voices"),
+            "r3:Max,r1:Eva",
+            "a line name's voice stays"
+        );
+        assert_eq!(one("SELECT group_concat(name) FROM line_names"), "Eva");
     }
 
     #[tokio::test]
@@ -968,7 +981,10 @@ mod tests {
         assert_eq!(put("r2", eva).await.unwrap().status(), StatusCode::CONFLICT);
         let bad = r#"{"track":"x","start_ms":1000,"end_ms":2000,"name":"Eva"}"#;
         assert_eq!(put("r1", bad).await.unwrap().status(), StatusCode::BAD_REQUEST);
-        assert_eq!(put("r1", eva).await.unwrap().status(), StatusCode::OK);
+        let res = put("r1", eva).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let b = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(b, r#"{"voices":0}"#, "no turns: named, nothing learned");
 
         let (_, b) = send(&app, "GET", "/recordings/r1", b"").await;
         let r: Value = serde_json::from_slice(&b).unwrap();
@@ -979,6 +995,7 @@ mod tests {
             .map(|l| (&l["name"], &l["line_name"]))
             .collect();
         assert_eq!(names, [(&json!("Max"), &Value::Null), (&json!("Eva"), &json!("Eva"))]);
+        assert_eq!(r["teachable"], false);
         let note = std::fs::read_dir(&app.vault).unwrap().next().unwrap().unwrap().path();
         let text = std::fs::read_to_string(note).unwrap();
         assert!(text.contains("attendees: [\"[[Max]]\", \"[[Eva]]\"]\n"), "{text}");
