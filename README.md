@@ -116,8 +116,9 @@ link: http://homeserver:8765/#01J8X...
 **S2** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
 ```
 
-- `attendees` are the speakers with confirmed names; the others only show up
-  as `S<n>` in the lines. `link` opens the recording on the web page.
+- `attendees` are the confirmed names, then the line names; a line shows its
+  line name, else its label's name, else `S<n>` (`?` for a label or line
+  answered `?`). `link` opens the recording on the web page.
 - The whole file is the server's: it is rewritten whenever you name a
   speaker on the web page, and edits made in Obsidian are lost then. A
   recording without any speech, or one that failed, gets no file. Writes go
@@ -138,7 +139,11 @@ nothing; if you marked all of them wrong, no voice is stored. Without heard
 lines, or once their turns have expired, the voice is the cluster's **core**:
 the mean of its turns most alike to its mean covering 70% of its speech, so
 stray turns and folded fragments are left out. Listening to a confirmed
-speaker again and saving replaces its voices.
+speaker again and saving replaces its voices. A **line name** (one line named
+on its own) teaches a voice of its own from the turns under that line, replaced
+when the line is renamed and dropped when it is cleared or set to `?`; once the
+turns have expired the name is kept but nothing is learned. A label answered
+`?` teaches nothing and is never suggested a name.
 
 After diarizing a new recording, each cluster's core is matched against the
 voices of other recordings (cosine, per name its most similar voice), and the
@@ -175,19 +180,21 @@ learned from its named speakers, leaving the transcript.
 while its audio is kept (after a diarization change), and whisper too once its
 segments have expired: its turns, speaker names and their voices are dropped,
 the lines are derived anew, names are pre-filled anew from other recordings,
-and the transcript is rewritten.
+and the transcript is rewritten. Line names and their voices are kept.
 
 ## Web page
 
 `web/index.html`, plain JS with no build step, served at `/`: every
-recording grouped by day with its progress (refreshed while anything is in
-progress), and per recording its lines with the speaker names. Clicking a
-line's timestamp plays just that line from the mixdown (the player keeps
-going if you press play again); ▶ next to a speaker plays three of their lines
-from across the meeting, and a `mixed?` badge marks a cluster that sounds like
-more than one voice. Once the recording is done, suggested names show as
-`Eva?` with ✓ to confirm and ✗ to reject; confirming or typing a name learns
-that voice (unless mixed) and rewrites the transcript in the vault.
+recording grouped by day with its attendees or its progress (refreshed while
+anything is in progress), and per recording its transcript. Clicking a line's
+time plays from there; clicking the rest of the line plays it and opens a menu
+to name that line alone (`?` for mixed or unsure; picking its name again
+clears it), and keys 1 to 9 name the line playing. Beside the transcript, "Who
+is this?" asks about each unnamed label in turn with three of its lines: pick
+its suggestion, another name or `?` (several people, don't know), and ✓ confirms
+it, the lines not named on their own taught as heard. Names taught dark,
+filled in from the label light, suggestions in italics. Every change is saved
+at once and rewrites the transcript in the vault.
 
 ## Upload
 
@@ -214,19 +221,28 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
 - `POST /recordings?filename=&mtime_ms=`: whole-file upload, raw body or
   multipart.
 - `GET /recordings`: every recording, newest first, with its status and
-  progress. `progress` is `null` once done or failed, else
+  progress, its `attendees` (as in the transcript) and how many labels are
+  `unnamed`. `progress` is `null` once done or failed, else
   `{"step": "unstarted"}`, `{"step": "transcribing", "percent": 42}` or
   `{"step": "diarizing", "since_ms": ...}` (`null` while queued).
 - `GET /recordings/{id}`: one recording, its `lines` and `speakers`
-  (per label its confirmed `name` or else its `suggested` one); `editable`
-  once names can be set.
+  (per label its confirmed `name`, `"?"` when answered unsure, or else its
+  `suggested` one); `editable` once names can be set, `teachable` while its
+  turns are kept so naming learns voices. Each line has its label
+  (`speaker`), its `line_name` if set, the `name` it shows, and `taught`.
 - `PUT /recordings/{id}/speakers`: confirms speaker names, learns their
   voices and rewrites the transcript. 409 until the recording is done. Body,
   per label: `{"room/S1": {"name": "Max", "heard": [{"start_ms": 1000,
   "end_ms": 4000, "correct": true}]}}`. `name: ""` leaves the label unnamed
-  and rejects its suggestion; `heard` (optional) lists the lines listened to,
-  `correct` when only that speaker is in it (see Learning names). Answers
-  with the voices each label learned: `{"room/S1": {"voices": 2}}`.
+  and rejects its suggestion, `"?"` answers several people or unsure; `heard`
+  (optional) lists the lines listened to, `correct` when only that speaker is
+  in it (see Learning names). Answers with the voices each label learned:
+  `{"room/S1": {"voices": 2}}`.
+- `PUT /recordings/{id}/lines`: names one line,
+  `{"track": "room", "start_ms": 1000, "end_ms": 4000, "name": "Eva"}`
+  (`"?"` for mixed or unsure, `null` or `""` clears it), learns its voice and
+  rewrites the transcript. 404 for an unknown recording, 409 until done.
+  Answers `{"voices": 1}`, or 0 once the turns expired.
 - `GET /recordings/{id}/outputs`: its model outputs per track (whisper
   segments, sherpa turns with their embeddings), until they expire.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409

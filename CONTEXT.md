@@ -41,5 +41,11 @@ Domain terms used across the code and docs.
   recordings; only when one name clearly wins, else the cluster stays unknown. Part of
   name storage, not of assembly. Never learned or written to the transcript.
 - **Confirmed name**: a name typed, or a suggestion accepted. Only confirmed names teach
-  voices and appear in the transcript.
+  voices and appear in the transcript. A label can also be answered `?` (several people,
+  or unsure): confirmed, so never asked or suggested again, but no name and no voice.
+- **Line name**: a name set for one line, overriding its label's; `?` when that line is
+  mixed or unsure. Kept by track and time, since lines are derived anew: a line takes the
+  line name whose span holds its midpoint.
+- **Taught line**: a line that taught a voice: it has a line name other than `?`, or it was
+  a heard snippet when its label was confirmed. Its name is shown dark on the page.
 - **Transcript**: the note written to the vault; derived, never read back.
