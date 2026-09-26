@@ -253,7 +253,7 @@ async fn finish(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
     }
 }
 
-/// Every recording, newest first, with what its note shows.
+/// Every recording, newest first, with what its note shows and how many labels are unnamed.
 async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
     let db = app.db.lock().await;
     type Row = (String, String, Option<i64>, String, Option<String>, Option<String>);
@@ -271,9 +271,17 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
         let segs = crate::assemble::lines(&db, &id)?;
         let progress = step(&app, &db, &id, &status, &segs)?;
         let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
+        let names = crate::names::confirmed(&db, &id)?;
+        let attendees = crate::names::attendees(&names, &crate::names::named(&db, &id)?);
+        let unnamed: std::collections::HashSet<&str> = segs
+            .iter()
+            .filter_map(|l| l.speaker.as_deref())
+            .filter(|l| !names.contains_key(*l))
+            .collect();
         out.push(json!({
             "id": id, "source": source, "date": date(&app, started_ms), "status": status, "progress": progress,
             "done_ms": done_ms, "total_ms": total_ms, "audio": audio, "transcript": transcript,
+            "attendees": attendees, "unnamed": unnamed.len(),
         }));
     }
     Ok(Json(out))
@@ -996,6 +1004,10 @@ mod tests {
             .collect();
         assert_eq!(names, [(&json!("Max"), &Value::Null), (&json!("Eva"), &json!("Eva"))]);
         assert_eq!(r["teachable"], false);
+        let (_, b) = send(&app, "GET", "/recordings", b"").await;
+        let list: Value = serde_json::from_slice(&b).unwrap();
+        let r1 = list.as_array().unwrap().iter().find(|r| r["id"] == "r1").unwrap();
+        assert_eq!((&r1["attendees"], &r1["unnamed"]), (&json!(["Max", "Eva"]), &json!(0)));
         let note = std::fs::read_dir(&app.vault).unwrap().next().unwrap().unwrap().path();
         let text = std::fs::read_to_string(note).unwrap();
         assert!(text.contains("attendees: [\"[[Max]]\", \"[[Eva]]\"]\n"), "{text}");
