@@ -340,17 +340,17 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
 }
 
 /// Confirms speaker names (`label -> {name, heard}`, see `names::confirm`), learns their
-/// voices and rewrites the transcript.
+/// voices and rewrites the transcript. Answers with how many voices each label learned.
 async fn name_speakers(
     State(app): State<Arc<App>>,
     Path(id): Path<String>,
     Json(names): Json<std::collections::BTreeMap<String, crate::names::Naming>>,
-) -> Result<StatusCode> {
+) -> Result<Json<Value>> {
     check_name(&id)?;
     if let Some(l) = names.keys().find(|l| !crate::names::is_label(l)) {
         return Err(Error(StatusCode::BAD_REQUEST, format!("not a speaker label: {l}")));
     }
-    {
+    let learned = {
         let db = app.db.lock().await;
         let status: Option<String> = db
             .query_row("SELECT status FROM recordings WHERE id = ?1", [&id], |r| r.get(0))
@@ -360,10 +360,12 @@ async fn name_speakers(
             Some("done") => {}
             Some(s) => return Err(Error(StatusCode::CONFLICT, format!("{id} is {s}, not done"))),
         }
-        crate::names::confirm(&db, &id, names)?;
-    }
+        crate::names::confirm(&db, &id, names)?
+    };
     crate::vault::write(&app, &id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let learned: serde_json::Map<String, Value> =
+        learned.into_iter().map(|(l, n)| (l, json!({ "voices": n }))).collect();
+    Ok(Json(learned.into()))
 }
 
 /// The model outputs of a recording, until they expire (see `CONTEXT.md`).
@@ -860,15 +862,25 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let res = router(app.clone()).oneshot(req);
-            async move { res.await.unwrap().status() }
+            async move {
+                let res = res.await.unwrap();
+                let status = res.status();
+                (status, res.into_body().collect().await.unwrap().to_bytes().to_vec())
+            }
         };
         let max = r#"{"room/S1":{"name":"Max"}}"#;
-        assert_eq!(put("r1", r#"{"bad":{"name":"x"}}"#).await, StatusCode::BAD_REQUEST);
-        assert_eq!(put("r2", max).await, StatusCode::CONFLICT);
-        assert_eq!(put("nope", max).await, StatusCode::NOT_FOUND);
+        assert_eq!(put("r1", r#"{"bad":{"name":"x"}}"#).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(put("r2", max).await.0, StatusCode::CONFLICT);
+        assert_eq!(put("nope", max).await.0, StatusCode::NOT_FOUND);
         let heard = r#"{"room/S1":{"name":" Max ","heard":[{"start_ms":0,"end_ms":1000,"correct":true}]},
                         "room/S2":{"name":""}}"#;
-        assert_eq!(put("r1", heard).await, StatusCode::NO_CONTENT);
+        let (s, b) = put("r1", heard).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap(),
+            json!({"room/S1": {"voices": 1}, "room/S2": {"voices": 0}}),
+            "voices learned per label"
+        );
 
         let db = app.db.lock().await;
         let one = |sql: &str| -> String { db.query_row(sql, [], |r| r.get(0)).unwrap() };

@@ -138,8 +138,9 @@ pub(crate) struct Heard {
 /// Confirms `changes` (`""` leaves the label unnamed, rejecting its suggestion) and learns
 /// voices for each label whose name changed or that was heard: one per correct heard
 /// snippet, none if every heard snippet was wrong, else (or when the snippets' turns
-/// expired) the cluster's core unless the cluster is mixed.
-pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Naming>) -> Result<()> {
+/// expired) the cluster's core unless the cluster is mixed. Returns how many voices each
+/// label of `changes` learned.
+pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Naming>) -> Result<BTreeMap<String, usize>> {
     let before = confirmed(db, id)?;
     let mut names = before.clone();
     let mut suggested = column(db, id, "suggested")?;
@@ -165,28 +166,28 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Namin
             params![id, label],
         )?;
     }
+    let mut learned: BTreeMap<String, usize> = changes.keys().map(|l| (l.clone(), 0)).collect();
     for (label, name) in names.iter().filter(|(l, _)| relearn(l)) {
         let heard = heard(label);
+        let n = learned.entry(label.clone()).or_default();
         if !heard.is_empty() {
-            let mut learned = false;
             for h in heard.iter().filter(|h| h.correct) {
                 if let Some(v) = snippet(&tx, id, track(label), h.start_ms, h.end_ms)? {
-                    tx.execute(
+                    *n += tx.execute(
                         "INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![name, bytes(&v), id, label, h.start_ms, h.end_ms],
                     )?;
-                    learned = true;
                 }
             }
-            if learned || !heard.iter().any(|h| h.correct) {
+            if *n > 0 || !heard.iter().any(|h| h.correct) {
                 continue;
             }
         }
         if mixed.contains(label) {
             continue;
         }
-        tx.execute(
+        *n += tx.execute(
             "INSERT INTO voices (name, embedding, recording, label)
              SELECT ?3, COALESCE(core, embedding), recording, label FROM clusters
              WHERE recording = ?1 AND label = ?2",
@@ -194,7 +195,8 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Namin
         )?;
     }
     tx.commit()?;
-    Ok(())
+    learned.retain(|l, _| changes.contains_key(l));
+    Ok(learned)
 }
 
 /// The normalized mean of the embeddings of `id`'s `track` turns overlapping

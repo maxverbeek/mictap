@@ -225,7 +225,8 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   per label: `{"room/S1": {"name": "Max", "heard": [{"start_ms": 1000,
   "end_ms": 4000, "correct": true}]}}`. `name: ""` leaves the label unnamed
   and rejects its suggestion; `heard` (optional) lists the lines listened to,
-  `correct` when only that speaker is in it (see Learning names).
+  `correct` when only that speaker is in it (see Learning names). Answers
+  with the voices each label learned: `{"room/S1": {"voices": 2}}`.
 - `GET /recordings/{id}/outputs`: its model outputs per track (whisper
   segments, sherpa turns with their embeddings), until they expire.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
