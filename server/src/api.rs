@@ -410,7 +410,8 @@ async fn outputs(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<
     Ok(Json(crate::assemble::outputs(&db, &id)?))
 }
 
-/// Deletes a finished recording's audio and state. The transcript stays in the vault.
+/// Deletes a finished recording's audio and state, including the voices learned from it. The
+/// transcript stays in the vault.
 async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<StatusCode> {
     check_name(&id)?;
     let db = app.db.lock().await;
@@ -422,10 +423,20 @@ async fn remove(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<S
         Some("done" | "failed") => {}
         Some(_) => return Err(Error(StatusCode::CONFLICT, format!("{id} is still being transcribed"))),
     }
-    for table in ["segments", "turns", "lines", "windows", "file_progress", "clusters"] {
-        db.execute(&format!("DELETE FROM {table} WHERE recording = ?1"), [&id])?;
+    let tx = db.unchecked_transaction()?;
+    for table in [
+        "segments",
+        "turns",
+        "lines",
+        "windows",
+        "file_progress",
+        "clusters",
+        "voices",
+    ] {
+        tx.execute(&format!("DELETE FROM {table} WHERE recording = ?1"), [&id])?;
     }
-    db.execute("DELETE FROM recordings WHERE id = ?1", [&id])?;
+    tx.execute("DELETE FROM recordings WHERE id = ?1", [&id])?;
+    tx.commit()?;
     match std::fs::remove_dir_all(app.recording_dir(&id)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
         _ => Ok(StatusCode::NO_CONTENT),
@@ -772,6 +783,22 @@ mod tests {
         assert_eq!(b, b"[]");
         let (s, _) = send(&app, "DELETE", "/recordings/r1", b"").await;
         assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn deletes_a_recording_with_named_speakers() {
+        let (_tmp, app) = app();
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                "INSERT INTO recordings (id, source, status) VALUES ('r1', 'laptop', 'done');
+                 INSERT INTO clusters VALUES ('r1', 'room/S1', x'00');
+                 INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1');",
+            )
+            .unwrap();
+        let (s, b) = send(&app, "DELETE", "/recordings/r1", b"").await;
+        assert_eq!(s, StatusCode::NO_CONTENT, "{}", String::from_utf8_lossy(&b));
     }
 
     #[tokio::test]
