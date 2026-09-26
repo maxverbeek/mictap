@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mictap</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fafaf9; --fg: #1c1917; --muted: #78716c; --line: #e7e5e4; --hl: #fef3c7; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1917; --fg: #e7e5e4; --muted: #a8a29e; --line: #44403c; --hl: #422006; --accent: #60a5fa; }
+  }
+  body { margin: 0 auto; max-width: 52rem; padding: 1rem 1rem 6rem; background: var(--bg); color: var(--fg);
+         font: 15px/1.5 system-ui, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  h1 { font-size: 1.2rem; margin: 0 0 1rem; }
+  .muted { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: .4rem .5rem .4rem 0; border-bottom: 1px solid var(--line); }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--line); background: none; color: inherit;
+           border-radius: 4px; padding: .1rem .5rem; }
+  button:disabled { cursor: default; opacity: .4; }
+  input { font: inherit; padding: .2rem .4rem; border: 1px solid var(--line); border-radius: 4px;
+          background: var(--bg); color: inherit; width: 12rem; }
+  .speakers { display: grid; grid-template-columns: auto auto 1fr; gap: .4rem .6rem; align-items: center;
+              margin-bottom: 1rem; }
+  .line { display: flex; gap: .6rem; padding: .25rem .3rem; border-radius: 4px; }
+  .line.playing { background: var(--hl); }
+  .line time { font-variant-numeric: tabular-nums; }
+  .who { flex: 0 0 7rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .track { font-weight: normal; font-size: .8em; }
+  audio { position: fixed; bottom: 0; left: 0; width: 100%; }
+  #msg { margin-left: .6rem; }
+</style>
+<body>
+<main id="app"></main>
+<audio id="player" controls hidden></audio>
+<script>
+const app = document.getElementById("app");
+const player = document.getElementById("player");
+let lines = [];
+let stopAt = null;
+
+function h(tag, props = {}, ...kids) {
+  const el = Object.assign(document.createElement(tag), props);
+  el.append(...nodes(kids));
+  return el;
+}
+const nodes = kids => kids.flat(Infinity).filter(k => k != null);
+
+const hms = ms => new Date(ms).toISOString().slice(11, 19);
+const short = label => label.split("/")[1];
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) throw new Error(await res.text() || res.statusText);
+  return res.status === 204 ? null : res.json();
+}
+
+function play(seg) {
+  player.currentTime = seg.start_ms / 1000;
+  stopAt = seg.end_ms / 1000;
+  player.play();
+}
+
+player.addEventListener("timeupdate", () => {
+  const t = player.currentTime;
+  if (stopAt != null && t >= stopAt) player.pause();
+  for (const { seg, el } of lines) el.classList.toggle("playing", !player.paused && seg.start_ms / 1000 <= t && t < seg.end_ms / 1000);
+});
+// Resuming from the native controls plays on past the snippet.
+player.addEventListener("pause", () => { stopAt = null; });
+
+async function list() {
+  player.hidden = true;
+  const recs = await api("/recordings");
+  app.replaceChildren(...nodes([
+    h("h1", {}, "mictap"),
+    h("table", {}, recs.map(r => h("tr", {},
+      h("td", {}, h("a", { href: "#" + r.id }, r.date ?? r.id)),
+      h("td", { className: "muted" }, r.status === "transcribing"
+        ? `transcribing ${Math.round(r.done_ms / 60000)}/${Math.round(r.total_ms / 60000)} min`
+        : r.status),
+      h("td", { className: "muted" }, r.source),
+      h("td", { className: "muted" }, r.audio === "ready" ? "" : "no audio"),
+    ))),
+    h("p", {}, h("a", { href: "/upload" }, "Upload a recording")),
+  ]));
+}
+
+async function show(id) {
+  const r = await api("/recordings/" + encodeURIComponent(id));
+  const audio = r.audio === "ready";
+  if (player.dataset.id !== id) {
+    player.pause();
+    player.src = audio ? `/r/${encodeURIComponent(id)}/audio.ogg` : "";
+    player.dataset.id = id;
+  }
+  player.hidden = !audio;
+
+  const labels = [...new Set(r.segments.map(s => s.speaker).filter(Boolean))]
+    .sort((a, b) => (a.startsWith("remote") - b.startsWith("remote")) || short(a).slice(1) - short(b).slice(1));
+  const name = label => label ? r.names[label] || short(label) : "?";
+  const longest = label => r.segments.filter(s => s.speaker === label)
+    .reduce((a, b) => (b.end_ms - b.start_ms > a.end_ms - a.start_ms ? b : a));
+
+  const inputs = {};
+  const msg = h("span", { id: "msg", className: "muted" });
+  const form = h("form", { className: "speakers" },
+    labels.map(l => [
+      h("button", { type: "button", disabled: !audio, title: "Play their longest line", onclick: () => play(longest(l)) }, "▶"),
+      h("span", {}, short(l), " ", h("span", { className: "track muted" }, l.split("/")[0])),
+      inputs[l] = h("input", { value: r.names[l] ?? "", placeholder: "name", disabled: !r.editable }),
+    ]),
+    h("span"), h("span"),
+    h("div", {}, h("button", { disabled: !r.editable }, "Save names"), msg),
+  );
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const names = {};
+    for (const l of labels) if (inputs[l].value.trim() !== (r.names[l] ?? "")) names[l] = inputs[l].value.trim();
+    if (!Object.keys(names).length) return;
+    msg.textContent = "saving…";
+    try {
+      await api(`/recordings/${encodeURIComponent(id)}/speakers`, {
+        method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(names),
+      });
+      await show(id);
+    } catch (err) { msg.textContent = err.message; }
+  };
+
+  lines = r.segments.map(seg => ({ seg, el: h("div", { className: "line" },
+    h("button", { disabled: !audio, onclick: () => play(seg) }, h("time", {}, hms(seg.start_ms))),
+    h("span", { className: "who", title: seg.speaker ?? "" }, name(seg.speaker),
+      " ", h("span", { className: "track muted" }, seg.track)),
+    h("span", {}, seg.text),
+  ) }));
+
+  app.replaceChildren(...nodes([
+    h("h1", {}, h("a", { href: "#" }, "mictap"), " / ", r.date ?? id,
+      h("span", { className: "muted" }, r.status === "done" ? "" : ` (${r.status})`)),
+    labels.length ? form : null,
+    !audio ? h("p", { className: "muted" }, r.audio === "expired" ? "Audio deleted after 30 days." : "No audio yet.") : null,
+    lines.map(l => l.el),
+  ]));
+}
+
+async function route() {
+  const id = decodeURIComponent(location.hash.slice(1));
+  try { await (id ? show(id) : list()); }
+  catch (err) { app.replaceChildren(h("p", {}, err.message)); }
+}
+addEventListener("hashchange", route);
+route();
+</script>

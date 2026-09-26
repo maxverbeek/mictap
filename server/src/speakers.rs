@@ -24,7 +24,7 @@ fn split(text: &str) -> Option<(&str, &str)> {
 }
 
 /// A speaker property's key: `room/S<n>` or `remote/S<n>`.
-fn is_label(k: &str) -> bool {
+pub(crate) fn is_label(k: &str) -> bool {
     k.split_once('/').is_some_and(|(track, n)| {
         matches!(track, "room" | "remote")
             && n.strip_prefix('S')
@@ -113,18 +113,22 @@ pub(crate) fn attendees(names: &Names) -> String {
     format!("attendees: [{}]\n", links.join(", "))
 }
 
-/// Replaces the `attendees` key (flow or block style) in `front`, or appends it.
-fn set_attendees(front: &str, names: &Names) -> String {
-    let attendees = attendees(names);
+/// Replaces the `key` property (quoted or not, flow or block style) in `front` with `replacement`,
+/// or appends it.
+fn set_property(front: &str, key: &str, replacement: &str) -> String {
     let mut out = String::new();
     let mut replaced = false;
     let mut lines = front.lines().peekable();
     while let Some(line) = lines.next() {
-        if !replaced && line.starts_with("attendees:") {
+        let is_key = !line.starts_with([' ', '\t'])
+            && line
+                .split_once(':')
+                .is_some_and(|(k, _)| k.trim().trim_matches(['"', '\'']) == key);
+        if !replaced && is_key {
             while lines.peek().is_some_and(|l| l.starts_with([' ', '\t', '-'])) {
                 lines.next();
             }
-            out += &attendees;
+            out += replacement;
             replaced = true;
         } else {
             out += line;
@@ -132,15 +136,31 @@ fn set_attendees(front: &str, names: &Names) -> String {
         }
     }
     if !replaced {
-        out += &attendees;
+        out += replacement;
     }
     out
 }
 
 /// Applies changed speaker names in the transcript at `path` (last modified at `mtime`).
 async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
+    update(app, path, mtime, &std::fs::read_to_string(path)?).await
+}
+
+/// Sets the speaker properties in `names` (`""` clears one) in the transcript at `path`
+/// (last modified at `mtime`), then applies them as if the user had edited them.
+pub(crate) async fn rename(app: &App, path: &Path, mtime: SystemTime, names: &Names) -> Result<()> {
     let text = std::fs::read_to_string(path)?;
-    let Some((front, body)) = split(&text) else {
+    let (front, body) = split(&text).ok_or_else(|| anyhow::anyhow!("no frontmatter"))?;
+    let front = names.iter().fold(front.to_string(), |f, (label, name)| {
+        set_property(&f, label, &format!("{label}: {}\n", Value::from(name.as_str())))
+    });
+    update(app, path, mtime, &format!("---\n{front}---\n{body}")).await
+}
+
+/// Writes `text`, the transcript at `path` with its lines relabeled to its speaker properties,
+/// unless the file changed since `mtime`.
+async fn update(app: &App, path: &Path, mtime: SystemTime, text: &str) -> Result<()> {
+    let Some((front, body)) = split(text) else {
         return Ok(());
     };
     let Some((id, names)) = parse(front)? else {
@@ -165,12 +185,19 @@ async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
     if names == applied && relabeled == body {
         return Ok(());
     }
-    let content = format!("---\n{}---\n{relabeled}", set_attendees(front, &names));
+    let content = format!(
+        "---\n{}---\n{relabeled}",
+        set_property(front, "attendees", &attendees(&names))
+    );
     // Edited since it was read: the next poll picks up the newer version.
     if std::fs::metadata(path)?.modified()? != mtime {
         return Ok(());
     }
     put(&app.vault, &id, Some(path), "", &content)?;
+    app.relabeled
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), std::fs::metadata(path)?.modified()?);
     let tx = db.unchecked_transaction()?;
     tx.execute(
         "UPDATE recordings SET speakers = ?2 WHERE id = ?1",
@@ -196,7 +223,7 @@ async fn apply(app: &App, path: &Path, mtime: SystemTime) -> Result<()> {
 /// rclone's WebDAV server writes an upload into the file in place, so a file modified this
 /// recently may be half uploaded: renaming a relabeled copy of it over the file would cut
 /// the transcript short on every device.
-const QUIET: Duration = Duration::from_secs(10);
+pub(crate) const QUIET: Duration = Duration::from_secs(10);
 
 async fn scan(app: &App, seen: &mut HashMap<PathBuf, SystemTime>) -> std::io::Result<()> {
     let quiet_since = SystemTime::now() - QUIET;
@@ -333,10 +360,7 @@ mod tests {
 
         let named = sub(
             FIXTURE,
-            &[
-                ("room/S1: \"\"", "room/S1: Max"),
-                ("remote/S1: \"\"", "remote/S1: Jan"),
-            ],
+            &[("room/S1: \"\"", "room/S1: Max"), ("remote/S1: \"\"", "remote/S1: Jan")],
         );
         let got = edit(&app, &path, &named).await;
         let want = sub(
@@ -397,6 +421,30 @@ mod tests {
         );
         assert_eq!(edit(&app, &path, &cleared).await, want);
         assert_eq!(voices(&app).await, [v("remote/S1", "Jan", 3), v("room/S2", "Eva", 2)]);
+    }
+
+    #[tokio::test]
+    async fn renames_through_the_properties() {
+        let (_tmp, app, path) = setup().await;
+        let quoted = sub(FIXTURE, &[("room/S2: \"\"", "'room/S2': Eva")]);
+        edit(&app, &path, &quoted).await;
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let names: Names = [("room/S1", "Max"), ("room/S2", "")]
+            .map(|(l, n)| (l.to_string(), n.to_string()))
+            .into();
+        rename(&app, &path, mtime, &names).await.unwrap();
+        let got = std::fs::read_to_string(&path).unwrap();
+        let want = sub(
+            FIXTURE,
+            &[
+                ("attendees: []", "attendees: [\"[[Max]]\"]"),
+                ("room/S1: \"\"", "room/S1: \"Max\""),
+                ("**S1** (room, [00:00:02]", "**Max** (room, [00:00:02]"),
+                ("**S1** (room, [00:00:31]", "**Max** (room, [00:00:31]"),
+            ],
+        );
+        assert_eq!(got, want);
+        assert_eq!(voices(&app).await, [v("room/S1", "Max", 1)]);
     }
 
     #[tokio::test]

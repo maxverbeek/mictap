@@ -10,7 +10,7 @@ use axum::{
     http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use futures_util::StreamExt;
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tower::ServiceExt;
-use tower_http::services::ServeFile;
+use tower_http::services::{ServeDir, ServeFile};
 
 pub struct App {
     dir: PathBuf,
@@ -28,6 +28,10 @@ pub struct App {
     pub(crate) db: Mutex<Connection>,
     pub(crate) tz: TimeZone,
     pub(crate) vault: PathBuf,
+    /// Static files served for every path no route takes: the web page.
+    web: PathBuf,
+    /// Each transcript's mtime after speakers::update last wrote it: not an upload in progress.
+    pub(crate) relabeled: std::sync::Mutex<std::collections::HashMap<PathBuf, std::time::SystemTime>>,
 }
 
 impl App {
@@ -35,11 +39,14 @@ impl App {
         std::fs::create_dir_all(dir.join("recordings"))?;
         let db = crate::db::open(&dir.join("mictap.db"))?;
         let vault = std::env::var_os("MICTAP_VAULT").map_or_else(|| dir.join("vault"), PathBuf::from);
+        let web = std::env::var_os("MICTAP_WEB").map_or_else(|| "web".into(), PathBuf::from);
         Ok(Self {
             dir,
+            web,
             db: Mutex::new(db),
             tz: TimeZone::system(),
             vault,
+            relabeled: Default::default(),
         })
     }
 
@@ -51,7 +58,8 @@ impl App {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/recordings", post(upload).layer(DefaultBodyLimit::disable()).get(list))
-        .route("/recordings/{id}", delete(remove))
+        .route("/recordings/{id}", get(show).delete(remove))
+        .route("/recordings/{id}/speakers", put(name_speakers))
         .route(
             "/recordings/{id}/files/{name}",
             put(put_file).layer(DefaultBodyLimit::max(16 << 20)),
@@ -61,6 +69,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/recordings/{id}/rediarize", post(rediarize))
         .route("/r/{id}/audio.ogg", get(audio))
         .route("/upload", get(|| async { Html(UPLOAD_FORM) }))
+        .fallback_service(ServeDir::new(&app.web))
         .layer(middleware::from_fn(guard))
         .with_state(app)
 }
@@ -259,15 +268,87 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
     for (id, source, started_ms, status, audio, transcript) in rows {
         let segs = crate::merge::merged(&db, &id)?;
         let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
-        let date = started_ms
-            .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-            .map(|t| t.to_zoned(app.tz.clone()).strftime("%Y-%m-%d %H:%M").to_string());
         out.push(json!({
-            "id": id, "source": source, "date": date, "status": status,
+            "id": id, "source": source, "date": date(&app, started_ms), "status": status,
             "done_ms": done_ms, "total_ms": total_ms, "audio": audio, "transcript": transcript,
         }));
     }
     Ok(Json(out))
+}
+
+fn date(app: &App, started_ms: Option<i64>) -> Option<String> {
+    let t = Timestamp::from_millisecond(started_ms?).ok()?;
+    Some(t.to_zoned(app.tz.clone()).strftime("%Y-%m-%d %H:%M").to_string())
+}
+
+/// One recording with its lines and speaker names. `editable` once its names can be set.
+async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<Value>> {
+    check_name(&id)?;
+    let db = app.db.lock().await;
+    type Row = (Option<i64>, String, Option<String>, Option<String>, Option<String>);
+    let row: Option<Row> = db
+        .query_row(
+            "SELECT started_ms, status, audio, speakers, written FROM recordings WHERE id = ?1",
+            [&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let Some((started_ms, status, audio, speakers, written)) = row else {
+        return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")));
+    };
+    let segs = crate::merge::merged(&db, &id)?;
+    let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
+    let names: Value = speakers.map_or(Ok(json!({})), |s| serde_json::from_str(&s))?;
+    Ok(Json(json!({
+        "id": id, "date": date(&app, started_ms), "status": status, "done_ms": done_ms,
+        "total_ms": total_ms, "audio": audio, "editable": written.as_deref() == Some("done"),
+        "names": names, "segments": segs,
+    })))
+}
+
+/// Sets speaker names (`label -> name`, `""` clears) in the transcript's properties, as if
+/// the user had edited them in Obsidian.
+async fn name_speakers(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    Json(names): Json<crate::speakers::Names>,
+) -> Result<StatusCode> {
+    check_name(&id)?;
+    if let Some(l) = names.keys().find(|l| !crate::speakers::is_label(l)) {
+        return Err(Error(StatusCode::BAD_REQUEST, format!("not a speaker label: {l}")));
+    }
+    let cached: Option<Option<String>> = app
+        .db
+        .lock()
+        .await
+        .query_row(
+            "SELECT vault_path FROM recordings WHERE id = ?1 AND written = 'done'",
+            [&id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(cached) = cached else {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            format!("{id} is not done, or its transcript is gone"),
+        ));
+    };
+    let Some(path) = crate::vault::locate(&app.vault, &id, cached.as_deref())? else {
+        return Err(Error(
+            StatusCode::NOT_FOUND,
+            format!("no transcript of {id} in the vault"),
+        ));
+    };
+    let mtime = std::fs::metadata(&path)?.modified()?;
+    let ours = app.relabeled.lock().unwrap().get(&path) == Some(&mtime);
+    if !ours && mtime > std::time::SystemTime::now() - crate::speakers::QUIET {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "the transcript changed a moment ago, try again in a few seconds".into(),
+        ));
+    }
+    crate::speakers::rename(&app, &path, mtime, &names).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Deletes a finished recording's audio and state. The transcript stays in the vault.
@@ -833,6 +914,22 @@ mod tests {
             let res = get(uri, None).await.unwrap();
             assert_eq!(res.status(), StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+
+    #[tokio::test]
+    async fn serves_the_web_dir_behind_the_api() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::open(tmp.path().to_path_buf()).unwrap();
+        app.web = tmp.path().join("web");
+        std::fs::create_dir(&app.web).unwrap();
+        std::fs::write(app.web.join("index.html"), "page").unwrap();
+        let app = Arc::new(app);
+        assert_eq!(send(&app, "GET", "/", b"").await, (StatusCode::OK, b"page".to_vec()));
+        assert_eq!(
+            send(&app, "GET", "/recordings", b"").await,
+            (StatusCode::OK, b"[]".to_vec())
+        );
+        assert_eq!(send(&app, "GET", "/nope.js", b"").await.0, StatusCode::NOT_FOUND);
     }
 
     #[test]

@@ -6,7 +6,7 @@ const NEAR_MS: i64 = 1_000;
 const SLICE_MS: i64 = 250;
 const DROP_CLUSTER: f64 = 0.7;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Segment {
     pub track: String,
     pub start_ms: i64,

@@ -71,6 +71,13 @@ in
       description = "Group the server runs as. Created when left at the default.";
     };
 
+    web = mkOption {
+      type = types.path;
+      default = "${cfg.package}/share/mictap-web";
+      defaultText = lib.literalExpression ''"''${package}/share/mictap-web"'';
+      description = "Directory of static files served for every path the API doesn't take; the web page by default.";
+    };
+
     models = {
       whisper = mkOption {
         type = types.path;
@@ -142,6 +149,7 @@ in
         MICTAP_LISTEN = cfg.listen;
         MICTAP_URL = cfg.url;
         MICTAP_VAULT = cfg.outputDir;
+        MICTAP_WEB = "${cfg.web}";
         MICTAP_WHISPER_MODEL = "${cfg.models.whisper}";
         MICTAP_VAD_MODEL = "${cfg.models.vad}";
         MICTAP_SEG_MODEL = "${cfg.models.segmentation}";
@@ -158,6 +166,7 @@ in
         enable = true;
         packages = tools ++ [
           pkgs.tzdata
+          cfg.web
           cfg.models.whisper
           cfg.models.vad
           cfg.models.segmentation

@@ -1,8 +1,9 @@
 # mictap
 
 Self-hosted meeting transcription. The laptop records, the VPS transcribes,
-transcripts land in Obsidian. No GUI: everything you read or edit is markdown
-in the vault.
+transcripts land in Obsidian. The vault's markdown is the source of truth; a
+small web page (`web/`, static files over the JSON API) makes naming speakers
+and replaying lines easier than Obsidian's property editor.
 
 ```text
 laptop (mictap daemon) --byte ranges over tailnet--> homeserver (mictap server)
@@ -164,6 +165,18 @@ kept (after a diarization change): its speaker names and their voices are
 dropped, names are pre-filled anew from other recordings, and the transcript
 is rewritten.
 
+## Web page
+
+`web/index.html`, plain JS with no build step, served at `/`: every
+recording, and per recording its lines with the speaker names. Clicking a
+line's timestamp plays just that line from the mixdown (the player keeps
+going if you press play again); the ▶ next to a speaker plays their longest
+line. Naming speakers there edits the transcript's
+speaker properties and applies them right away, exactly as an edit in Obsidian
+would (relabeled lines, `attendees`, learned voices). A save is refused for
+10 s after the file changed from elsewhere, since a sync may still be writing
+it. It shows the server's lines, not your edits to the body.
+
 ## Upload
 
 For recordings made elsewhere (phone recorder app): a plain upload form
@@ -190,10 +203,18 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   multipart.
 - `GET /recordings`: every recording, newest first, with its status and
   progress.
+- `GET /recordings/{id}`: one recording, its lines (`segments`) and speaker
+  `names`; `editable` once names can be set.
+- `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` sets speaker names
+  (`""` clears one) in the transcript. 409 before `status: done` or within
+  10 s of a change from elsewhere.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
   while transcribing). The transcript stays.
 - `GET /r/{id}/audio.ogg`: mixdown.
 - `GET /upload`: upload form.
+- Any other path: a static file from `MICTAP_WEB` (the `web` option, default
+  the package's copy of `web/`, `./web` when unset), so a different frontend
+  can be dropped in without touching the server.
 
 ## Deployment
 

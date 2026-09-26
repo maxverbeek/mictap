@@ -98,7 +98,7 @@ fn has_id(path: &Path, id: &str) -> bool {
 
 /// The transcript of `id` in `vault`: the cached file name if it still holds it, else a
 /// rescan of `*.md`.
-fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::Result<Option<PathBuf>> {
+pub(crate) fn locate(vault: &Path, id: &str, cached: Option<&str>) -> std::io::Result<Option<PathBuf>> {
     if let Some(p) = cached.map(|c| vault.join(c)).filter(|p| has_id(p, id)) {
         return Ok(Some(p));
     }

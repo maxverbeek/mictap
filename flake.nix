@@ -24,6 +24,7 @@
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
           buildInputs = [ pkgs.sherpa-onnx ];
+          postInstall = "mkdir -p $out/share && cp -r web $out/share/mictap-web";
         };
       });
 
