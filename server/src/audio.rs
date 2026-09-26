@@ -121,14 +121,19 @@ pub fn expire(app: &App, db: &rusqlite::Connection, now: SystemTime) -> Result<(
     Ok(())
 }
 
-/// Mixes down finished recordings one at a time; expires old audio daily.
+/// Mixes down finished recordings one at a time; expires old audio and model outputs daily.
 pub async fn run(app: Arc<App>) {
     let mut expired: Option<Instant> = None;
     loop {
         if expired.is_none_or(|t| t.elapsed() >= DAY) {
-            if let Err(e) = expire(&app, &*app.db.lock().await, SystemTime::now()) {
+            let db = app.db.lock().await;
+            if let Err(e) = expire(&app, &db, SystemTime::now()) {
                 eprintln!("audio retention: {e:#}");
             }
+            if let Err(e) = crate::db::expire_outputs(&db, crate::db::now_ms()) {
+                eprintln!("model output retention: {e:#}");
+            }
+            drop(db);
             expired = Some(Instant::now());
         }
         match step(&app).await {

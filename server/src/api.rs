@@ -69,6 +69,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/recordings/{id}/meta", put(put_meta))
         .route("/recordings/{id}/finish", post(finish))
         .route("/recordings/{id}/rediarize", post(rediarize))
+        .route("/recordings/{id}/outputs", get(outputs))
         .route("/r/{id}/audio.ogg", get(audio))
         .route("/upload", get(|| async { Html(UPLOAD_FORM) }))
         .fallback_service(ServeDir::new(&app.web))
@@ -394,6 +395,19 @@ async fn name_speakers(
     }
     crate::vault::write(&app, &id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The model outputs of a recording, until they expire (see `CONTEXT.md`).
+async fn outputs(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Json<crate::assemble::Outputs>> {
+    check_name(&id)?;
+    let db = app.db.lock().await;
+    let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM recordings WHERE id = ?1)", [&id], |r| {
+        r.get(0)
+    })?;
+    if !exists {
+        return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")));
+    }
+    Ok(Json(crate::assemble::outputs(&db, &id)?))
 }
 
 /// Deletes a finished recording's audio and state. The transcript stays in the vault.
@@ -895,6 +909,37 @@ mod tests {
                 &json!({"step": "diarizing", "since_ms": 1234}),
                 &Value::Null,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_model_outputs() {
+        let (_tmp, app) = app();
+        app.db
+            .lock()
+            .await
+            .execute_batch(
+                "INSERT INTO recordings (id, source) VALUES ('r1', 'laptop');
+                 INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms)
+                   VALUES (1, 'r1', 'a', 'room', 0, 0, 1);
+                 INSERT INTO segments (recording, window, track, start_ms, end_ms, text)
+                   VALUES ('r1', 1, 'room', 0, 900, 'hoi');
+                 INSERT INTO turns (recording, track, start_ms, end_ms, speaker, embedding)
+                   VALUES ('r1', 'room', 0, 1000, 0, x'0000803f');",
+            )
+            .unwrap();
+        let (s, b) = send(&app, "GET", "/recordings/r1/outputs", b"").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&b).unwrap(),
+            json!({"tracks": {"room": {
+                "segments": [{"start_ms": 0, "end_ms": 900, "text": "hoi"}],
+                "turns": [{"start_ms": 0, "end_ms": 1000, "speaker": 0, "embedding": [1.0]}],
+            }}})
+        );
+        assert_eq!(
+            send(&app, "GET", "/recordings/nope/outputs", b"").await.0,
+            StatusCode::NOT_FOUND
         );
     }
 

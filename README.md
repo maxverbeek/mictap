@@ -90,6 +90,9 @@ meeting instead of after it.
   turn) are stored as produced and never modified; lines, clusters and their
   mean embeddings are derived from them (`server/src/assemble.rs`) after every
   transcribed window and after diarization. See `CONTEXT.md` for the terms.
+  The outputs are deleted `MICTAP_OUTPUTS_DAYS` (default 7) after a recording
+  is done; what was derived stays. Until then `GET /recordings/{id}/outputs`
+  exports them as JSON, to replay a real meeting when tuning assembly.
 - **Echo dedupe.** Remote voices coming out of a speaker get picked up by the
   mic. Mic segments that overlap remote speech within about 1 s and match
   its text are dropped. A room speaker cluster that is mostly echo (the
@@ -195,6 +198,8 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
 - `PUT /recordings/{id}/speakers`: `{"room/S1": "Max"}` sets speaker names
   (`""` clears one) and rewrites the transcript. 409 until the recording is
   done.
+- `GET /recordings/{id}/outputs`: its model outputs per track (whisper
+  segments, sherpa turns with their embeddings), until they expire.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
   while transcribing). The transcript stays.
 - `GET /r/{id}/audio.ogg`: mixdown.
@@ -241,7 +246,8 @@ services.mictap.recorder = {
 - **Models** are pinned with `fetchurl`; override them with
   `services.mictap.server.models.*`. Tunables go in `settings`:
   `MICTAP_CLUSTER_THRESHOLD` (0.9), `MICTAP_MERGE_THRESHOLD` (0.75),
-  `MICTAP_MATCH_THRESHOLD` (0.75), `MICTAP_ECHO_JACCARD` (0.6).
+  `MICTAP_MATCH_THRESHOLD` (0.75), `MICTAP_ECHO_JACCARD` (0.6),
+  `MICTAP_OUTPUTS_DAYS` (7).
 - `url` (default `http://<hostname>:<port>`) is the base of the timestamp
   links and the one dotted host name the server accepts besides `*.ts.net`.
 

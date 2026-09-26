@@ -234,10 +234,10 @@ pub async fn run(app: Arc<App>) {
 
 async fn done(app: &App, id: &str) -> Result<()> {
     write(app, id).await?;
-    app.db
-        .lock()
-        .await
-        .execute("UPDATE recordings SET status = 'done' WHERE id = ?1", [id])?;
+    app.db.lock().await.execute(
+        "UPDATE recordings SET status = 'done', done_ms = ?2 WHERE id = ?1",
+        params![id, crate::db::now_ms()],
+    )?;
     Ok(())
 }
 

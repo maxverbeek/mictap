@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS recordings (
     -- The speakers map (label -> name, JSON).
     speakers TEXT,
     -- audio.ogg: NULL until mixed down, then 'ready', 'failed' or 'expired'.
-    audio TEXT
+    audio TEXT,
+    -- Unix ms it became done; its model outputs expire MICTAP_OUTPUTS_DAYS later.
+    done_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS file_progress (
     recording TEXT NOT NULL REFERENCES recordings(id),
@@ -95,6 +97,10 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if conn.prepare("SELECT retry_at FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0")?;
     }
+    if conn.prepare("SELECT done_ms FROM recordings").is_err() {
+        conn.execute_batch("ALTER TABLE recordings ADD COLUMN done_ms INTEGER")?;
+        conn.execute("UPDATE recordings SET done_ms = ?1 WHERE status = 'done'", [now_ms()])?;
+    }
     if conn.prepare("SELECT speaker FROM segments").is_ok() {
         lines_from_labeled_segments(&conn)?;
     }
@@ -156,6 +162,25 @@ pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("UPDATE recordings SET finished = 1 WHERE id = ?1", params![id])? == 1)
 }
 
+/// Deletes the model outputs of recordings done more than `MICTAP_OUTPUTS_DAYS` (default 7)
+/// before `now_ms`. Their lines stay.
+pub fn expire_outputs(conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
+    let days: i64 = std::env::var("MICTAP_OUTPUTS_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    for table in ["segments", "turns"] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE recording IN
+                 (SELECT id FROM recordings WHERE done_ms < ?1)"
+            ),
+            [now_ms - days * 86_400_000],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
 }
@@ -214,8 +239,8 @@ mod tests {
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute_batch(
-                "CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL);
-                 INSERT INTO recordings VALUES ('r1', 'laptop');
+                "CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'receiving');
+                 INSERT INTO recordings (id, source, status) VALUES ('r1', 'laptop', 'done');
                  CREATE TABLE segments (id INTEGER PRIMARY KEY, recording TEXT NOT NULL,
                    window INTEGER NOT NULL, track TEXT NOT NULL, start_ms INTEGER NOT NULL,
                    end_ms INTEGER NOT NULL, text TEXT NOT NULL, speaker TEXT);
@@ -238,12 +263,36 @@ mod tests {
     }
 
     #[test]
+    fn expires_outputs_of_long_done_recordings() {
+        let conn = super::open(std::path::Path::new(":memory:")).unwrap();
+        let day = 86_400_000;
+        conn.execute_batch(&format!(
+            "INSERT INTO recordings (id, source, status, done_ms) VALUES
+               ('old', 'laptop', 'done', 0), ('new', 'laptop', 'done', {}), ('busy', 'laptop', 'windowed', NULL);
+             INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms) VALUES
+               (1, 'old', 'a', 'room', 0, 0, 1), (2, 'new', 'a', 'room', 0, 0, 1), (3, 'busy', 'a', 'room', 0, 0, 1);
+             INSERT INTO segments (recording, window, track, start_ms, end_ms, text) VALUES
+               ('old', 1, 'room', 0, 1, 'a'), ('new', 2, 'room', 0, 1, 'b'), ('busy', 3, 'room', 0, 1, 'c');
+             INSERT INTO turns (recording, track, start_ms, end_ms, speaker) VALUES
+               ('old', 'room', 0, 1, 0), ('new', 'room', 0, 1, 0);
+             INSERT INTO lines (recording, track, start_ms, end_ms, text) VALUES ('old', 'room', 0, 1, 'a');",
+            2 * day
+        ))
+        .unwrap();
+        super::expire_outputs(&conn, 8 * day).unwrap();
+        let left = |sql: &str| -> String { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(left("SELECT group_concat(recording) FROM segments"), "new,busy");
+        assert_eq!(left("SELECT group_concat(recording) FROM turns"), "new");
+        assert_eq!(left("SELECT group_concat(recording) FROM lines"), "old");
+    }
+
+    #[test]
     fn adds_retry_at_to_an_old_db() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("old.db");
         rusqlite::Connection::open(&path)
             .unwrap()
-            .execute_batch("CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL)")
+            .execute_batch("CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'receiving')")
             .unwrap();
         let conn = super::open(&path).unwrap();
         conn.execute("INSERT INTO recordings (id, source) VALUES ('r1', 'laptop')", [])
