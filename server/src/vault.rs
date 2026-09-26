@@ -11,7 +11,7 @@ use jiff::Timestamp;
 use rusqlite::{params, Connection};
 use serde_json::Value;
 
-use crate::{api::App, merge::Segment};
+use crate::{api::App, assemble::Segment};
 
 /// Base of the links in transcripts, as browsers reach this server.
 pub static URL: std::sync::LazyLock<String> =
@@ -191,7 +191,7 @@ pub async fn write(app: &App, id: &str) -> Result<()> {
         [id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    let segs = crate::merge::merged(&db, id)?;
+    let segs = crate::assemble::merged(&db, id)?;
     drop(db);
     let names: Names = speakers
         .map(|s| serde_json::from_str(&s))
@@ -236,7 +236,7 @@ pub async fn run(app: Arc<App>) {
 async fn done(app: &App, id: &str) -> Result<()> {
     {
         let db = app.db.lock().await;
-        let segs = crate::merge::merged(&db, id)?;
+        let segs = crate::assemble::merged(&db, id)?;
         let speakers: Option<String> =
             db.query_row("SELECT speakers FROM recordings WHERE id = ?1", [id], |r| r.get(0))?;
         let mut names: Names = speakers

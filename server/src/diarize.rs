@@ -10,17 +10,12 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, OptionalExtension};
 use tokio::process::Command;
 
-use crate::api::App;
+use crate::{
+    api::App,
+    assemble::{cluster, cosine, means, normalize, split, Turn},
+};
 
 const RATE: usize = 16_000;
-
-#[derive(Debug, PartialEq)]
-struct Turn {
-    start_ms: i64,
-    end_ms: i64,
-    /// Index in order of first appearance: 0 is `S1`.
-    speaker: usize,
-}
 
 /// Parses `59.566 -- 68.324 speaker_02` lines and renumbers speakers by first appearance.
 fn parse_turns(out: &str) -> Vec<Turn> {
@@ -46,84 +41,6 @@ fn parse_turns(out: &str) -> Vec<Turn> {
                 speaker,
             }
         })
-        .collect()
-}
-
-/// The speaker with the most overlap with `[s, e)`, else the one of the nearest turn.
-fn assign(turns: &[Turn], s: i64, e: i64) -> Option<usize> {
-    let n = turns.iter().map(|t| t.speaker + 1).max()?;
-    let mut overlap = vec![0; n];
-    for t in turns {
-        overlap[t.speaker] += (e.min(t.end_ms) - s.max(t.start_ms)).max(0);
-    }
-    let (best, &most) = overlap
-        .iter()
-        .enumerate()
-        .max_by_key(|&(i, o)| (*o, std::cmp::Reverse(i)))?;
-    if most > 0 {
-        return Some(best);
-    }
-    turns
-        .iter()
-        .min_by_key(|t| (t.start_ms - e).max(s - t.end_ms))
-        .map(|t| t.speaker)
-}
-
-/// A speaker's run of words shorter than this joins its neighbour instead of becoming a line.
-const MIN_RUN_MS: i64 = 1_000;
-
-/// A cut moves up to this many words to end a line on a sentence or clause.
-const SNAP_WORDS: usize = 2;
-
-/// Segment `[s, e)` as `(start_ms, end_ms, text, speaker)` lines, cut where the speaker
-/// changes, since whisper segments often span a reply. The speaker of each word is the one
-/// its share of the segment overlaps most.
-// ponytail: words spread evenly over the segment, as merge.rs does; whisper-cli's token
-// timestamps (-ojf) would place cuts better if they land mid-phrase.
-fn split(turns: &[Turn], s: i64, e: i64, text: &str) -> Vec<(i64, i64, String, usize)> {
-    let Some(whole) = assign(turns, s, e) else {
-        return vec![];
-    };
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let step = (e - s) as f64 / words.len().max(1) as f64;
-    let at = |i: usize| s + (i as f64 * step).round() as i64;
-    // [from, to) word ranges and their speaker.
-    let mut runs: Vec<(usize, usize, usize)> = vec![];
-    for i in 0..words.len() {
-        let k = assign(turns, at(i), at(i + 1)).unwrap_or(whole);
-        match runs.last_mut() {
-            Some(r) if r.2 == k => r.1 = i + 1,
-            _ => runs.push((i, i + 1, k)),
-        }
-    }
-    let short = |r: &(usize, usize, usize)| ((r.1 - r.0) as f64 * step) < MIN_RUN_MS as f64;
-    let mut lines: Vec<(usize, usize, usize)> = vec![];
-    for r in runs {
-        match lines.last_mut() {
-            Some(l) if l.2 == r.2 || short(&r) => l.1 = r.1,
-            // Only the first line can still be short: it takes the next speaker.
-            Some(l) if short(l) => *l = (l.0, r.1, r.2),
-            _ => lines.push(r),
-        }
-    }
-    if lines.len() < 2 {
-        return vec![(s, e, text.to_string(), whole)];
-    }
-    for j in 1..lines.len() {
-        let cut = lines[j].0;
-        let ends = |c: usize| words[c - 1].ends_with(['.', '?', '!', ',', ';', ':']);
-        let snap = (0..=SNAP_WORDS)
-            .flat_map(|d| [cut.checked_sub(d), Some(cut + d)])
-            .flatten()
-            .find(|&c| c > lines[j - 1].0 && c < lines[j].1 && ends(c));
-        if let Some(c) = snap {
-            lines[j - 1].1 = c;
-            lines[j].0 = c;
-        }
-    }
-    lines
-        .into_iter()
-        .map(|(from, to, k)| (at(from), at(to), words[from..to].join(" "), k))
         .collect()
 }
 
@@ -277,13 +194,6 @@ impl Drop for Extractor {
     }
 }
 
-fn normalize(v: &mut [f32]) {
-    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if n > 0.0 {
-        v.iter_mut().for_each(|x| *x /= n);
-    }
-}
-
 /// Each turn's normalized embedding, or None when it is too short.
 fn turn_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Vec<Option<Vec<f32>>>> {
     let ex = Extractor::new(model)?;
@@ -298,90 +208,8 @@ fn turn_embeddings(model: &str, samples: &[f32], turns: &[Turn]) -> Result<Vec<O
         .collect())
 }
 
-/// Per speaker, the normalized mean of its turns' embeddings, weighted by turn length.
-fn means(turns: &[Turn], embs: &[Option<Vec<f32>>]) -> Vec<Option<Vec<f32>>> {
-    let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
-    let mut sums: Vec<Option<Vec<f32>>> = vec![None; n];
-    for (t, v) in turns.iter().zip(embs) {
-        let Some(v) = v else { continue };
-        let w = (t.end_ms - t.start_ms) as f32;
-        match &mut sums[t.speaker] {
-            Some(sum) => sum.iter_mut().zip(v).for_each(|(a, b)| *a += w * b),
-            slot => *slot = Some(v.iter().map(|b| w * b).collect()),
-        }
-    }
-    sums.iter_mut().flatten().for_each(|v| normalize(v));
-    sums
-}
-
-/// Clusters with less speech than this are folded into the most similar larger one.
-const MIN_CLUSTER_MS: i64 = 10_000;
-
-/// sherpa splits a speaker into many clusters, most of them fragments of a few seconds (spike
-/// S3; a 3-person meeting got 39). Folds the fragments into the most similar larger cluster,
-/// then merges the most similar pair while their means are at least `threshold` alike, and
-/// renumbers speakers by first appearance. Never splits a cluster.
-fn merge(turns: &mut [Turn], embs: &[Option<Vec<f32>>], threshold: f32) {
-    let n = turns.iter().map(|t| t.speaker + 1).max().unwrap_or(0);
-    let mut len = vec![0; n];
-    for t in turns.iter() {
-        len[t.speaker] += t.end_ms - t.start_ms;
-    }
-    let relabel = |turns: &mut [Turn], from: usize, to: usize| {
-        turns
-            .iter_mut()
-            .filter(|t| t.speaker == from)
-            .for_each(|t| t.speaker = to);
-    };
-
-    let m = means(turns, embs);
-    let big: Vec<usize> = (0..n).filter(|&i| len[i] >= MIN_CLUSTER_MS && m[i].is_some()).collect();
-    for small in (0..n).filter(|&i| len[i] < MIN_CLUSTER_MS) {
-        let Some(v) = &m[small] else { continue };
-        let nearest = big
-            .iter()
-            .map(|&b| (cosine(v, m[b].as_ref().unwrap()), b))
-            .filter(|p| p.0.is_finite())
-            .max_by(|a, b| a.0.total_cmp(&b.0));
-        if let Some((_, b)) = nearest {
-            relabel(turns, small, b);
-        }
-    }
-
-    loop {
-        let m = means(turns, embs);
-        let live: Vec<usize> = (0..m.len()).filter(|&i| m[i].is_some()).collect();
-        let best = live
-            .iter()
-            .enumerate()
-            .flat_map(|(k, &a)| live[k + 1..].iter().map(move |&b| (a, b)))
-            .map(|(a, b)| (cosine(m[a].as_ref().unwrap(), m[b].as_ref().unwrap()), a, b))
-            .filter(|p| p.0 >= threshold)
-            .max_by(|a, b| a.0.total_cmp(&b.0));
-        let Some((_, a, b)) = best else { break };
-        relabel(turns, b, a);
-    }
-
-    let mut seen: Vec<usize> = vec![];
-    for t in turns.iter_mut() {
-        t.speaker = seen.iter().position(|&s| s == t.speaker).unwrap_or_else(|| {
-            seen.push(t.speaker);
-            seen.len() - 1
-        });
-    }
-}
-
 fn floats(b: &[u8]) -> Vec<f32> {
     b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect()
-}
-
-/// NaN, which matches nothing, for a zero vector or vectors of different lengths.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
-    if a.len() != b.len() {
-        return f32::NAN;
-    }
-    dot(a, b) / (dot(a, a) * dot(b, b)).sqrt()
 }
 
 /// The name of the voice most similar to `emb`, if at least `threshold` similar.
@@ -479,7 +307,7 @@ async fn label(app: &App, id: &str) -> Result<()> {
         let model = model.clone();
         let (turns, embeddings) = tokio::task::spawn_blocking(move || {
             let embs = turn_embeddings(&model, &samples, &turns)?;
-            merge(&mut turns, &embs, merge_threshold);
+            cluster(&mut turns, &embs, merge_threshold);
             let m = means(&turns, &embs);
             anyhow::Ok((turns, m))
         })
@@ -603,51 +431,7 @@ mod tests {
         assert_eq!(parse_turns("Started\n"), vec![]);
     }
 
-    #[test]
-    fn assigns_most_overlap_then_nearest() {
-        let turns = [
-            t(0, 4_000, 0),
-            t(4_000, 6_000, 1),
-            t(6_000, 7_000, 0),
-            t(20_000, 30_000, 1),
-        ];
-        // S1 overlaps 1 s + 1 s, S2 1.5 s.
-        assert_eq!(assign(&turns, 3_000, 7_000), Some(0));
-        assert_eq!(assign(&turns, 3_500, 6_500), Some(1));
-        // No overlap: nearest turn.
-        assert_eq!(assign(&turns, 8_000, 9_000), Some(0));
-        assert_eq!(assign(&turns, 15_000, 19_000), Some(1));
-        assert_eq!(assign(&[], 0, 1_000), None);
-    }
 
-    #[test]
-    fn splits_segments_where_the_speaker_changes() {
-        let line = |s: i64, e: i64, text: &str, k: usize| (s, e, text.to_string(), k);
-        // 9 words over 8 s; the change at 4 s falls in "Ja", the cut moves back to "Wesley?".
-        let turns = [t(0, 4_000, 0), t(4_000, 8_000, 1)];
-        assert_eq!(
-            split(&turns, 0, 8_000, "Heb jij tijd, Wesley? Ja hoor dat kan wel."),
-            [
-                line(0, 3_556, "Heb jij tijd, Wesley?", 0),
-                line(3_556, 8_000, "Ja hoor dat kan wel.", 1)
-            ]
-        );
-        // Without punctuation nearby, the cut stays at the change.
-        assert_eq!(
-            split(&turns, 0, 8_000, "een twee drie vier vijf zes zeven acht"),
-            [
-                line(0, 4_000, "een twee drie vier", 0),
-                line(4_000, 8_000, "vijf zes zeven acht", 1)
-            ]
-        );
-        // Runs under a second don't become lines: a blip, or a short first run.
-        let text = "een twee drie vier vijf zes zeven acht negen tien";
-        let blip = [t(0, 2_000, 0), t(2_000, 2_600, 1), t(2_600, 5_000, 0)];
-        assert_eq!(split(&blip, 0, 5_000, text), [line(0, 5_000, text, 0)]);
-        let late = [t(0, 400, 0), t(400, 5_000, 1)];
-        assert_eq!(split(&late, 0, 5_000, text), [line(0, 5_000, text, 1)]);
-        assert_eq!(split(&[], 0, 5_000, text), []);
-    }
 
     #[test]
     fn saves_split_segments_as_lines() {
@@ -684,50 +468,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn folds_fragments_and_merges_alike_clusters() {
-        let mut turns = [
-            t(0, 20_000, 0),
-            t(20_000, 35_000, 1),
-            t(35_000, 40_000, 2),
-            t(40_000, 70_000, 3),
-            t(70_000, 71_000, 4),
-            t(71_000, 72_000, 5),
-        ];
-        let unit = |v: [f32; 3]| {
-            let mut v = v.to_vec();
-            normalize(&mut v);
-            Some(v)
-        };
-        let embs = [
-            unit([1.0, 0.0, 0.0]),
-            // Same speaker as S1: merged.
-            unit([0.9, 0.1, 0.0]),
-            // A fragment, closest to S4 though below the threshold: folded.
-            unit([0.0, 1.0, 0.0]),
-            unit([0.0, 0.8, 0.6]),
-            // A fragment without an embedding: kept.
-            None,
-            // A fragment alike to nothing big still goes to the nearest.
-            unit([0.0, 0.0, -1.0]),
-        ];
-        merge(&mut turns, &embs, 0.9);
-        let speakers: Vec<usize> = turns.iter().map(|t| t.speaker).collect();
-        assert_eq!(speakers, [0, 0, 1, 1, 2, 0]);
 
-        let mut two = [t(0, 20_000, 0), t(20_000, 40_000, 1)];
-        merge(&mut two, &[unit([1.0, 0.0, 0.0]), unit([0.6, 0.8, 0.0])], 0.7);
-        assert_eq!(two.map(|t| t.speaker), [0, 1], "0.6 < 0.7 stays apart");
-    }
-
-    #[test]
-    fn weights_means_by_turn_length() {
-        let turns = [t(0, 3_000, 0), t(3_000, 4_000, 0), t(4_000, 5_000, 2)];
-        let m = means(&turns, &[Some(vec![1.0, 0.0]), Some(vec![0.0, 1.0]), None]);
-        let s = m[0].as_ref().unwrap();
-        assert!((s[0] - 0.9487).abs() < 1e-3 && (s[1] - 0.3162).abs() < 1e-3, "{s:?}");
-        assert_eq!(m[1..], [None, None]);
-    }
 
     #[test]
     fn mixes_inputs_at_offsets() {

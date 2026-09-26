@@ -268,7 +268,7 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
         .collect::<rusqlite::Result<_>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for (id, source, started_ms, status, audio, transcript) in rows {
-        let segs = crate::merge::merged(&db, &id)?;
+        let segs = crate::assemble::merged(&db, &id)?;
         let progress = step(&app, &db, &id, &status, &segs)?;
         let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;
         out.push(json!({
@@ -281,7 +281,7 @@ async fn list(State(app): State<Arc<App>>) -> Result<Json<Vec<Value>>> {
 
 /// What a recording that isn't done or failed is at: `unstarted`, `transcribing` with a
 /// `percent`, or `diarizing` with the Unix ms it started at, if it has.
-fn step(app: &App, db: &Connection, id: &str, status: &str, segs: &[crate::merge::Segment]) -> Result<Value> {
+fn step(app: &App, db: &Connection, id: &str, status: &str, segs: &[crate::assemble::Segment]) -> Result<Value> {
     if matches!(status, "diarized" | "done" | "failed") {
         return Ok(Value::Null);
     }
@@ -328,7 +328,7 @@ async fn show(State(app): State<Arc<App>>, Path(id): Path<String>) -> Result<Jso
     let Some((started_ms, status, audio, speakers)) = row else {
         return Err(Error(StatusCode::NOT_FOUND, format!("no recording {id}")));
     };
-    let segs = crate::merge::merged(&db, &id)?;
+    let segs = crate::assemble::merged(&db, &id)?;
     let editable = status == "done";
     let progress = step(&app, &db, &id, &status, &segs)?;
     let (status, done_ms, total_ms) = crate::vault::progress(&app, &db, &id, &status, &segs)?;

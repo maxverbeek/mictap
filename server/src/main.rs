@@ -1,8 +1,8 @@
 mod api;
+mod assemble;
 mod audio;
 mod db;
 mod diarize;
-mod merge;
 mod transcribe;
 mod vault;
 mod windows;
