@@ -72,8 +72,26 @@ impl Tuning {
 pub struct Assembled {
     /// Chronological, echoes dropped.
     pub lines: Vec<Line>,
-    /// Each label's mean embedding, for the labels that have lines.
-    pub clusters: Vec<(String, Vec<f32>)>,
+    /// The clusters that have lines.
+    pub clusters: Vec<Cluster>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Cluster {
+    pub label: String,
+    pub mean: Vec<f32>,
+    /// The cluster's turns split into its two most different halves: how alike the halves'
+    /// means are, and the smaller half's share of the speech. None under 4 embedded turns.
+    pub halves: Option<(f32, f32)>,
+}
+
+/// A smaller half with at least this share of the speech is a speaker, not a stray turn.
+const MIXED_SHARE: f32 = 0.2;
+
+/// Whether a cluster's `halves` sound like two speakers (or a room): both carry real speech
+/// and they are less alike than clusters assembly would merge.
+pub fn mixed(halves: Option<(f32, f32)>, tuning: &Tuning) -> bool {
+    halves.is_some_and(|(alike, share)| share >= MIXED_SHARE && alike < tuning.merge_threshold)
 }
 
 /// Per track, folds and merges sherpa's clusters into speakers and splits each segment into
@@ -105,15 +123,17 @@ pub fn assemble(outputs: &Outputs, tuning: &Tuning) -> Assembled {
                 speaker: Some(label(k)),
             }));
         }
-        clusters.extend(
-            means(&turns)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(k, v)| Some((label(k), v?))),
-        );
+        clusters.extend(means(&turns).into_iter().enumerate().filter_map(|(k, mean)| {
+            let own: Vec<&Turn> = turns.iter().filter(|t| t.speaker == k).collect();
+            Some(Cluster {
+                label: label(k),
+                mean: mean?,
+                halves: halves(&own),
+            })
+        }));
     }
     let lines = drop_echoes(lines, tuning.echo_jaccard);
-    clusters.retain(|(l, _)| lines.iter().any(|x| x.speaker.as_ref() == Some(l)));
+    clusters.retain(|c| lines.iter().any(|x| x.speaker.as_ref() == Some(&c.label)));
     Assembled { lines, clusters }
 }
 
@@ -189,10 +209,17 @@ pub fn derive(db: &Connection, id: &str) -> rusqlite::Result<()> {
         )?;
     }
     db.execute("DELETE FROM clusters WHERE recording = ?1", [id])?;
-    for (label, emb) in &a.clusters {
+    for c in &a.clusters {
         db.execute(
-            "INSERT INTO clusters (recording, label, embedding) VALUES (?1, ?2, ?3)",
-            params![id, label, bytes(emb)],
+            "INSERT INTO clusters (recording, label, embedding, halves_alike, minor_share)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                c.label,
+                bytes(&c.mean),
+                c.halves.map(|h| h.0),
+                c.halves.map(|h| h.1)
+            ],
         )?;
     }
     Ok(())
@@ -399,6 +426,48 @@ fn means(turns: &[Turn]) -> Vec<Option<Vec<f32>>> {
     }
     sums.iter_mut().flatten().for_each(|v| normalize(v));
     sums
+}
+
+/// Splits `turns` in two by spherical 2-means over their embeddings, weighted by length,
+/// seeded with the longest turn and the one least alike to it. Returns how alike the halves'
+/// means are and the smaller half's share of the speech; None under 4 embedded turns.
+fn halves(turns: &[&Turn]) -> Option<(f32, f32)> {
+    let mut ts: Vec<Turn> = turns
+        .iter()
+        .filter(|t| t.embedding.is_some())
+        .map(|t| (*t).clone())
+        .collect();
+    if ts.len() < 4 {
+        return None;
+    }
+    let emb = |t: &Turn| t.embedding.clone().unwrap();
+    let first = ts.iter().max_by_key(|t| t.end_ms - t.start_ms).map(emb)?;
+    let second = ts
+        .iter()
+        .min_by(|a, b| cosine(&emb(a), &first).total_cmp(&cosine(&emb(b), &first)))
+        .map(emb)?;
+    let mut m = vec![Some(first), Some(second)];
+    for _ in 0..10 {
+        for t in ts.iter_mut() {
+            let e = emb(t);
+            let alike = |k: usize| m[k].as_ref().map_or(f32::NEG_INFINITY, |v| cosine(&e, v));
+            t.speaker = usize::from(alike(1) > alike(0));
+        }
+        m = means(&ts);
+        m.resize(2, None);
+    }
+    let len = |k: usize| -> i64 {
+        ts.iter()
+            .filter(|t| t.speaker == k)
+            .map(|t| t.end_ms - t.start_ms)
+            .sum()
+    };
+    let (a, b) = (len(0), len(1));
+    let share = a.min(b) as f32 / (a + b).max(1) as f32;
+    Some(match (&m[0], &m[1]) {
+        (Some(x), Some(y)) => (cosine(x, y), share),
+        _ => (1.0, 0.0),
+    })
 }
 
 /// Clusters with less speech than this are folded into the most similar larger one.
@@ -744,7 +813,7 @@ mod tests {
             ]
         );
         // S3, alike to nothing, only had the echo: no lines left, so no cluster.
-        let labels: Vec<&str> = a.clusters.iter().map(|(l, _)| l.as_str()).collect();
+        let labels: Vec<&str> = a.clusters.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(labels, ["room/S1", "room/S2"]);
     }
 
@@ -782,6 +851,63 @@ mod tests {
                 .unwrap(),
             2,
             "outputs untouched"
+        );
+    }
+
+    #[test]
+    fn halves_tell_one_voice_from_two() {
+        let e = |v: [f32; 2]| {
+            let mut v = v.to_vec();
+            normalize(&mut v);
+            Some(v)
+        };
+        let turns = |embs: &[[f32; 2]]| -> Vec<Turn> {
+            let ts: Vec<Turn> = (0..embs.len() as i64)
+                .map(|i| t(i * 5_000, i * 5_000 + 4_000, 0))
+                .collect();
+            with(ts, embs.iter().map(|&v| e(v)))
+        };
+        let tuning = TUNING;
+        // One voice, a little noise: the halves are alike.
+        let one = turns(&[
+            [1.0, 0.05],
+            [1.0, -0.05],
+            [1.0, 0.1],
+            [1.0, 0.0],
+            [1.0, -0.1],
+            [1.0, 0.02],
+        ]);
+        let h = halves(&one.iter().collect::<Vec<_>>()).unwrap();
+        assert!(h.0 > 0.99 && !mixed(Some(h), &tuning), "{h:?}");
+        // Two voices sherpa put in one cluster: two halves, half the speech each, 0.3 alike.
+        let two = turns(&[
+            [1.0, 0.0],
+            [0.3, 0.95],
+            [1.0, 0.05],
+            [0.3, 0.9],
+            [1.0, -0.05],
+            [0.35, 0.95],
+        ]);
+        let h = halves(&two.iter().collect::<Vec<_>>()).unwrap();
+        assert!(
+            h.0 < 0.5 && (h.1 - 0.5).abs() < 1e-6 && mixed(Some(h), &tuning),
+            "{h:?}"
+        );
+        // One stray turn of someone else: an outlier, not a second speaker.
+        let stray = turns(&[
+            [1.0, 0.0],
+            [1.0, 0.05],
+            [1.0, -0.05],
+            [1.0, 0.1],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]);
+        let h = halves(&stray.iter().collect::<Vec<_>>()).unwrap();
+        assert!(h.1 < 0.2 && !mixed(Some(h), &tuning), "{h:?}");
+        assert_eq!(
+            halves(&one[..3].iter().collect::<Vec<_>>()),
+            None,
+            "too few turns to judge"
         );
     }
 }

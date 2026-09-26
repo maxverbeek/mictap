@@ -764,7 +764,7 @@ mod tests {
             .await
             .execute_batch(
                 "INSERT INTO recordings (id, source, status) VALUES ('r1', 'laptop', 'done');
-                 INSERT INTO clusters VALUES ('r1', 'room/S1', x'00');
+                 INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00');
                  INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1');",
             )
             .unwrap();
@@ -790,7 +790,7 @@ mod tests {
                    VALUES ('r1', 'room', 0, 1000, 0);
                  INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker)
                    VALUES ('r1', 'room', 0, 1000, 'a', 'room/S1');
-                 INSERT INTO clusters VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
+                 INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'00'), ('r3', 'room/S1', x'00');
                  INSERT INTO voices VALUES ('Max', x'00', 'r1', 'room/S1'), ('Max', x'00', 'r3', 'room/S1');",
             )
             .unwrap();
@@ -848,7 +848,7 @@ mod tests {
                      VALUES (1, 'r1', 'a', 'room', 0, 0, 9000, 1);
                    INSERT INTO lines (recording, track, start_ms, end_ms, text, speaker) VALUES
                      ('r1', 'room', 0, 1000, 'Hoi.', 'room/S1'), ('r1', 'room', 1000, 2000, 'Ja.', 'room/S2');
-                   INSERT INTO clusters VALUES ('r1', 'room/S1', x'01'), ('r1', 'room/S2', x'02');
+                   INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'01'), ('r1', 'room/S2', x'02');
                    INSERT INTO voices VALUES ('Eva', x'02', 'r1', 'room/S2');"#,
             )
             .unwrap();

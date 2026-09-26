@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
-use crate::assemble::{cosine, floats};
+use crate::assemble::{cosine, floats, mixed, Tuning};
 
 /// Speaker label (`room/S1`) -> name.
 pub(crate) type Names = BTreeMap<String, String>;
@@ -27,6 +27,20 @@ fn track(label: &str) -> &str {
 /// The confirmed names of `id`: typed, or suggestions accepted.
 pub(crate) fn confirmed(db: &Connection, id: &str) -> Result<Names> {
     column(db, id, "speakers")
+}
+
+/// The labels of `id` whose clusters sound like two speakers or a room (`assemble::mixed`).
+fn mixed_labels(db: &Connection, id: &str) -> Result<HashSet<String>> {
+    let tuning = Tuning::from_env();
+    let rows: Vec<(String, Option<f32>, Option<f32>)> = db
+        .prepare("SELECT label, halves_alike, minor_share FROM clusters WHERE recording = ?1")?
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, alike, share)| mixed(alike.zip(*share), &tuning))
+        .map(|(label, _, _)| label)
+        .collect())
 }
 
 fn column(db: &Connection, id: &str, col: &str) -> Result<Names> {
@@ -73,7 +87,7 @@ fn best<'a>(emb: &[f32], voices: &'a [(String, Vec<f32>)], m: &Matching) -> Opti
 }
 
 /// Suggests names for the unconfirmed clusters of `id` from the voices of other recordings.
-/// A cluster without a clear match stays unknown, and no name is suggested twice within a
+/// A mixed cluster, or one without a clear match, stays unknown, and no name is suggested twice within a
 /// track or for a track where it is already confirmed; the most similar cluster gets it.
 pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
     let confirmed = confirmed(db, id)?;
@@ -85,9 +99,10 @@ pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
         .prepare("SELECT name, embedding FROM voices WHERE recording != ?1")?
         .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
         .collect::<rusqlite::Result<_>>()?;
+    let mixed = mixed_labels(db, id)?;
     let mut candidates: Vec<(f32, &str, &str)> = clusters
         .iter()
-        .filter(|(label, _)| !confirmed.contains_key(label))
+        .filter(|(label, _)| !confirmed.contains_key(label) && !mixed.contains(label))
         .filter_map(|(label, emb)| best(emb, &voices, m).map(|(name, c)| (c, label.as_str(), name)))
         .collect();
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -105,7 +120,7 @@ pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
 }
 
 /// Confirms `changes` (label -> name; `""` leaves the label unnamed, rejecting its
-/// suggestion) and learns the voice of each newly confirmed name.
+/// suggestion) and learns the voice of each newly confirmed name, unless its cluster is mixed.
 pub(crate) fn confirm(db: &Connection, id: &str, changes: Names) -> Result<()> {
     let before = confirmed(db, id)?;
     let mut names = before.clone();
@@ -117,6 +132,7 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: Names) -> Result<()> {
             n => names.insert(label, n.to_string()),
         };
     }
+    let mixed = mixed_labels(db, id)?;
     let tx = db.unchecked_transaction()?;
     tx.execute(
         "UPDATE recordings SET speakers = ?2, suggested = ?3 WHERE id = ?1",
@@ -128,7 +144,10 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: Names) -> Result<()> {
             params![id, label],
         )?;
     }
-    for (label, name) in names.iter().filter(|(l, n)| before.get(*l) != Some(n)) {
+    for (label, name) in names
+        .iter()
+        .filter(|(l, n)| before.get(*l) != Some(n) && !mixed.contains(*l))
+    {
         tx.execute(
             "INSERT OR REPLACE INTO voices (name, embedding, recording, label)
              SELECT ?3, embedding, recording, label FROM clusters WHERE recording = ?1 AND label = ?2",
@@ -143,6 +162,8 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: Names) -> Result<()> {
 pub(crate) struct Speaker {
     pub name: Option<String>,
     pub suggested: Option<String>,
+    /// Its cluster sounds like two speakers or a room: a name is kept, no voice learned.
+    pub mixed: bool,
 }
 
 /// Each of `labels` with its confirmed name or else its suggestion.
@@ -152,12 +173,18 @@ pub(crate) fn speakers<'a>(
     labels: impl IntoIterator<Item = &'a str>,
 ) -> Result<BTreeMap<String, Speaker>> {
     let (names, suggested) = (confirmed(db, id)?, column(db, id, "suggested")?);
+    let mixed = mixed_labels(db, id)?;
     Ok(labels
         .into_iter()
         .map(|l| {
             let name = names.get(l).cloned();
             let suggested = suggested.get(l).filter(|_| name.is_none()).cloned();
-            (l.to_string(), Speaker { name, suggested })
+            let speaker = Speaker {
+                name,
+                suggested,
+                mixed: mixed.contains(l),
+            };
+            (l.to_string(), speaker)
         })
         .collect())
 }
@@ -229,6 +256,12 @@ mod tests {
         cluster(&db, "room/S3", &[0.0, 0.2, 1.0]); // Jan: confirmed on the remote track only
         cluster(&db, "remote/S1", &[1.0, 0.05, 0.0]); // Max on another track: fine
         cluster(&db, "remote/S2", &[0.0, 0.0, 1.0]); // Jan, confirmed for remote/S3
+        cluster(&db, "remote/S4", &[0.0, 1.0, 0.0]); // Eva, but mixed
+        db.execute(
+            "UPDATE clusters SET halves_alike = 0.2, minor_share = 0.5 WHERE label = 'remote/S4'",
+            [],
+        )
+        .unwrap();
         db.execute(
             r#"UPDATE recordings SET speakers = '{"remote/S3":"Jan","room/S4":"Bo"}' WHERE id = 'r1'"#,
             [],
@@ -273,6 +306,29 @@ mod tests {
     }
 
     #[test]
+    fn a_mixed_cluster_keeps_its_name_but_teaches_no_voice() {
+        let db = db();
+        cluster(&db, "room/S1", &[1.0, 0.0]);
+        cluster(&db, "room/S2", &[0.0, 1.0]);
+        db.execute_batch(
+            "UPDATE clusters SET halves_alike = 0.3, minor_share = 0.4 WHERE label = 'room/S1';
+             UPDATE clusters SET halves_alike = 0.9, minor_share = 0.4 WHERE label = 'room/S2';",
+        )
+        .unwrap();
+        let changes: Names = [("room/S1", "Room B"), ("room/S2", "Eva")]
+            .map(|(l, n)| (l.to_string(), n.to_string()))
+            .into();
+        confirm(&db, "r1", changes).unwrap();
+        assert_eq!(get(&db, "speakers").len(), 2);
+        let learned: String = db
+            .query_row("SELECT group_concat(name) FROM voices", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(learned, "Eva");
+        let got = speakers(&db, "r1", ["room/S1", "room/S2"]).unwrap();
+        assert!(got["room/S1"].mixed && !got["room/S2"].mixed);
+    }
+
+    #[test]
     fn a_confirmed_name_hides_the_suggestion() {
         let db = db();
         db.execute(
@@ -284,6 +340,7 @@ mod tests {
         let s = |name: Option<&str>, suggested: Option<&str>| Speaker {
             name: name.map(Into::into),
             suggested: suggested.map(Into::into),
+            mixed: false,
         };
         assert_eq!(got["room/S1"], s(Some("Max"), None));
         assert_eq!(got["room/S2"], s(None, Some("Jan")));

@@ -141,6 +141,13 @@ already confirmed for that track. Suggestions are never learned and never
 reach the vault until confirmed; a name you set is never overwritten. Accuracy
 is modest (see `local/learning-names.md`).
 
+A cluster can hold more than one voice: two people sherpa lumped together, or
+a far meeting room where several people share one mic. Assembly splits each
+cluster's turns into its two most different halves; when both carry at least
+20% of the speech and are less alike than `MICTAP_MERGE_THRESHOLD`, the
+cluster is **mixed**. A mixed cluster gets no suggestion, and naming it keeps
+the name but learns no voice, so a room's sound never becomes someone's voice.
+
 ## Audio
 
 Kept for 30 days on the VPS, then deleted. Transcripts stay.
@@ -166,10 +173,11 @@ and the transcript is rewritten.
 recording grouped by day with its progress (refreshed while anything is in
 progress), and per recording its lines with the speaker names. Clicking a
 line's timestamp plays just that line from the mixdown (the player keeps
-going if you press play again); the ▶ next to a speaker plays their longest
-line. Once the recording is done, suggested names show as `Eva?` with ✓ to
-confirm and ✗ to reject; confirming or typing a name learns that voice and
-rewrites the transcript in the vault.
+going if you press play again); ▶ next to a speaker plays three of their lines
+from across the meeting, and a `mixed?` badge marks a cluster that sounds like
+more than one voice. Once the recording is done, suggested names show as
+`Eva?` with ✓ to confirm and ✗ to reject; confirming or typing a name learns
+that voice (unless mixed) and rewrites the transcript in the vault.
 
 ## Upload
 

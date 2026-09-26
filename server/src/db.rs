@@ -77,10 +77,13 @@ CREATE TABLE IF NOT EXISTS lines (
     speaker TEXT
 );
 -- embedding: the mean of the cluster's L2-normalized turn embeddings, f32 little-endian.
+-- halves_alike/minor_share: see assemble::Cluster::halves; NULL for clusters derived before.
 CREATE TABLE IF NOT EXISTS clusters (
     recording TEXT NOT NULL REFERENCES recordings(id),
     label TEXT NOT NULL,
     embedding BLOB NOT NULL,
+    halves_alike REAL,
+    minor_share REAL,
     PRIMARY KEY (recording, label)
 );
 -- A cluster the user named: its embedding, copied from clusters.
@@ -98,6 +101,12 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     if conn.prepare("SELECT retry_at FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN retry_at INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if conn.prepare("SELECT halves_alike FROM clusters").is_err() {
+        conn.execute_batch(
+            "ALTER TABLE clusters ADD COLUMN halves_alike REAL;
+             ALTER TABLE clusters ADD COLUMN minor_share REAL;",
+        )?;
     }
     if conn.prepare("SELECT suggested FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN suggested TEXT")?;
