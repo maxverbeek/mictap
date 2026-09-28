@@ -8,7 +8,6 @@ const ALLOWLIST: &str = "zen,chromium,chrome,zoom,slack";
 #[derive(Debug, Clone)]
 pub struct Node {
     pub id: u32,
-    pub serial: u64,
     pub class: String,
     pub name: String,
     pub description: String,
@@ -22,6 +21,7 @@ pub struct Graph {
     /// (output node id, input node id)
     pub links: Vec<(u32, u32)>,
     pub default_source: Option<String>,
+    pub default_sink: Option<String>,
 }
 
 #[derive(Debug)]
@@ -51,7 +51,6 @@ pub fn parse(json: &str) -> Result<Graph> {
                 let p = &o["info"]["props"];
                 g.nodes.push(Node {
                     id: id(&o["id"]),
-                    serial: p["object.serial"].as_u64().unwrap_or(0),
                     class: s(&p["media.class"]),
                     name: s(&p["node.name"]),
                     description: s(&p["node.description"]),
@@ -65,8 +64,11 @@ pub fn parse(json: &str) -> Result<Graph> {
             }
             Some("PipeWire:Interface:Metadata") if o["props"]["metadata.name"] == "default" => {
                 for m in o["metadata"].as_array().into_iter().flatten() {
-                    if m["key"] == "default.audio.source" {
-                        g.default_source = m["value"]["name"].as_str().map(String::from);
+                    let name = m["value"]["name"].as_str().map(String::from);
+                    match m["key"].as_str() {
+                        Some("default.audio.source") => g.default_source = name,
+                        Some("default.audio.sink") => g.default_sink = name,
+                        _ => {}
                     }
                 }
             }
@@ -104,18 +106,24 @@ impl Graph {
         })
     }
 
-    pub fn playbacks(&self, m: &Meeting) -> Vec<&Node> {
-        self.nodes
-            .iter()
-            .filter(|n| n.class == "Stream/Output/Audio")
-            .filter(|n| {
-                if m.binary.is_empty() {
+    /// node.name of the sink the app plays to, else the default sink. Its monitor is
+    /// recorded rather than the app's own streams: linking a recorder to a pipewire-pulse
+    /// stream while it renegotiates fails its format and stalls the app's audio.
+    pub fn sink(&self, m: &Meeting) -> Option<String> {
+        let ours = |n: &Node| {
+            n.class == "Stream/Output/Audio"
+                && if m.binary.is_empty() {
                     n.app == m.app
                 } else {
                     n.binary == m.binary
                 }
-            })
-            .collect()
+        };
+        self.links
+            .iter()
+            .filter(|(out, _)| self.nodes.iter().any(|n| n.id == *out && ours(n)))
+            .find_map(|(_, input)| self.nodes.iter().find(|n| n.id == *input && n.class == "Audio/Sink"))
+            .map(|n| n.name.clone())
+            .or_else(|| self.default_sink.clone())
     }
 
     pub fn sources(&self) -> Vec<&Node> {
@@ -132,15 +140,20 @@ mod tests {
 
     const DUMP: &str = r#"[
       {"id": 30, "type": "PipeWire:Interface:Metadata", "props": {"metadata.name": "default"},
-       "metadata": [{"subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON", "value": {"name": "mic1"}}]},
+       "metadata": [{"subject": 0, "key": "default.audio.source", "type": "Spa:String:JSON", "value": {"name": "mic1"}},
+                    {"subject": 0, "key": "default.audio.sink", "type": "Spa:String:JSON", "value": {"name": "speaker"}}]},
       {"id": 57, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Source", "node.name": "mic1", "node.description": "Digital Microphone", "object.serial": 57}}},
       {"id": 58, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Source", "node.name": "headset", "node.description": "Headset", "object.serial": 58}}},
       {"id": 90, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Stream/Input/Audio", "application.name": "clankertyper", "object.serial": 400}}},
       {"id": 98, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Stream/Input/Audio", "application.name": "Zen", "application.process.binary": "zen", "object.serial": 426}}},
       {"id": 99, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Stream/Output/Audio", "application.name": "Zen", "application.process.binary": "zen", "object.serial": 427}}},
       {"id": 100, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Stream/Output/Audio", "application.name": "spotify", "application.process.binary": "spotify", "object.serial": 428}}},
+      {"id": 101, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Sink", "node.name": "speaker", "object.serial": 60}}},
+      {"id": 102, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Sink", "node.name": "headphones", "object.serial": 61}}},
       {"id": 120, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 58, "input-node-id": 98}},
-      {"id": 121, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 57, "input-node-id": 90}}
+      {"id": 121, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 57, "input-node-id": 90}},
+      {"id": 122, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 100, "input-node-id": 101}},
+      {"id": 123, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 99, "input-node-id": 102}}
     ]"#;
 
     #[test]
@@ -151,12 +164,18 @@ mod tests {
             (m.stream, m.app.as_str(), m.source.as_deref()),
             (98, "Zen", Some("headset"))
         );
-        assert_eq!(g.playbacks(&m).iter().map(|n| n.serial).collect::<Vec<_>>(), [427]);
+        assert_eq!(g.sink(&m).as_deref(), Some("headphones"), "Zen's sink, not Spotify's");
         assert_eq!(g.default_source.as_deref(), Some("mic1"));
         assert_eq!(
             g.sources().iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
             ["mic1", "headset"]
         );
+    }
+
+    #[test]
+    fn sink_falls_back_to_the_default_before_the_app_plays() {
+        let g = parse(&DUMP.replace(r#""output-node-id": 99"#, r#""output-node-id": 1"#)).unwrap();
+        assert_eq!(g.sink(&g.meeting().unwrap()).as_deref(), Some("speaker"));
     }
 
     #[test]

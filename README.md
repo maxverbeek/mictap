@@ -25,9 +25,10 @@ so reloading the bar never kills a recording.
   Non-allowlisted apps (clankertyper, voice notes) never trigger it.
 - **Right mic.** It records the source the meeting app is actually capturing
   from, not the default. Switching mics in Meet is followed.
-- **Tracks.** The mic and each of the meeting app's playback streams are
-  recorded as separate Opus tracks, stamped on one clock. Other apps
-  (Spotify) are not recorded.
+- **Tracks.** The mic and the monitor of the sink the meeting app plays to
+  are recorded as separate Opus tracks, stamped on one clock. Other apps
+  playing to that sink (Spotify) end up in the remote track: tapping the
+  app's own streams stalls pipewire-pulse clients (Zen) mid-join.
 - **Auto-stop.** 2 minutes after the capture stream disappears. Meet keeps
   the stream open while muted (verified in Zen), so muting doesn't split a
   meeting.

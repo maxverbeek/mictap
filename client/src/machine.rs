@@ -15,9 +15,9 @@ pub enum Mode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
-    /// "mic" or "app-<serial>"
+    /// "mic" or "app-monitor"
     pub key: String,
-    /// What `pw-record --target` gets: a node.name or an object.serial.
+    /// What `pw-record --target` gets: a source or sink node.name.
     pub target: String,
 }
 
@@ -112,11 +112,11 @@ impl Machine {
             })
             .into_iter()
             .collect();
-        if let Some(m) = &meeting {
-            tracks.extend(g.playbacks(m).into_iter().map(|n| Track {
-                key: format!("app-{}", n.serial),
-                target: n.serial.to_string(),
-            }));
+        if let Some(target) = meeting.as_ref().and_then(|m| g.sink(m)) {
+            tracks.push(Track {
+                key: "app-monitor".into(),
+                target,
+            });
         }
         s.tracks = tracks.clone();
         Some(tracks)
@@ -131,7 +131,6 @@ mod tests {
     fn node(id: u32, class: &str, name: &str, app: &str) -> Node {
         Node {
             id,
-            serial: id as u64,
             class: class.into(),
             name: name.into(),
             description: String::new(),
@@ -145,6 +144,7 @@ mod tests {
             nodes: vec![node(1, "Audio/Source", "mic1", "")],
             links: vec![],
             default_source: Some("mic1".into()),
+            default_sink: Some("speaker".into()),
         }
     }
 
@@ -158,6 +158,7 @@ mod tests {
             ],
             links: vec![(if source == "mic1" { 1 } else { 2 }, 10)],
             default_source: Some("mic1".into()),
+            default_sink: Some("speaker".into()),
         }
     }
 
@@ -173,9 +174,12 @@ mod tests {
     fn auto_starts_follows_source_and_stops_after_grace() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         assert_eq!(m.tick(&quiet(), t0), None);
-        assert_eq!(keys(m.tick(&meeting("headset"), t0)), ["mic=headset", "app-11=11"]);
+        assert_eq!(
+            keys(m.tick(&meeting("headset"), t0)),
+            ["mic=headset", "app-monitor=speaker"]
+        );
         assert_eq!(m.mode(), Some(Mode::Auto));
-        assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=mic1", "app-11=11"]);
+        assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=mic1", "app-monitor=speaker"]);
         assert_eq!(keys(m.tick(&quiet(), t0 + secs(1))), ["mic=mic1"]);
         assert!(m.tick(&quiet(), t0 + secs(120)).is_some());
         assert_eq!(m.tick(&quiet(), t0 + secs(121)), None);
@@ -207,7 +211,10 @@ mod tests {
         assert_eq!(keys(m.tick(&quiet(), t0)), ["mic=mic1"]);
         assert_eq!(m.mode(), Some(Mode::Manual));
         m.start(Some("headset".into()));
-        assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=headset", "app-11=11"]);
+        assert_eq!(
+            keys(m.tick(&meeting("mic1"), t0)),
+            ["mic=headset", "app-monitor=speaker"]
+        );
         assert!(m.tick(&quiet(), t0 + secs(600)).is_some());
     }
 

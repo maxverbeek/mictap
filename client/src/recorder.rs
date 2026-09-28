@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -21,14 +21,39 @@ struct Segment {
     end_ms: Option<u64>,
 }
 
+/// A track whose file hasn't grown this long gets no audio: Opus pages keep coming even for silence.
+const STALL: Duration = Duration::from_secs(30);
+
+struct Running {
+    segment: usize,
+    child: Child,
+    size: u64,
+    grew: Instant,
+    stalled: bool,
+}
+
+impl Running {
+    /// Some(true) when the file just stalled, Some(false) when it grows again after a stall.
+    fn observe(&mut self, size: u64, now: Instant) -> Option<bool> {
+        if size > self.size {
+            self.size = size;
+            self.grew = now;
+            return std::mem::take(&mut self.stalled).then_some(false);
+        }
+        (!self.stalled && now.duration_since(self.grew) >= STALL).then(|| {
+            self.stalled = true;
+            true
+        })
+    }
+}
+
 pub struct Recorder {
     pub id: String,
     pub started_ms: u64,
     dir: PathBuf,
     clock: Instant,
     app: Option<String>,
-    /// key -> (index into segments, pw-record)
-    running: HashMap<String, (usize, Child)>,
+    running: HashMap<String, Running>,
     segments: Vec<Segment>,
     finished: bool,
 }
@@ -67,18 +92,34 @@ impl Recorder {
         let dead: Vec<String> = self
             .running
             .iter_mut()
-            .filter_map(|(k, (_, c))| (!matches!(c.try_wait(), Ok(None))).then(|| k.clone()))
+            .filter_map(|(k, r)| (!matches!(r.child.try_wait(), Ok(None))).then(|| k.clone()))
             .collect();
         for k in &dead {
+            eprintln!("recording {}: pw-record for {k} quit", self.id);
             self.stop(k).await;
+        }
+        let now = Instant::now();
+        for (k, r) in &mut self.running {
+            let seg = &self.segments[r.segment];
+            let size = std::fs::metadata(self.dir.join(&seg.file)).map_or(0, |m| m.len());
+            match r.observe(size, now) {
+                Some(true) => eprintln!(
+                    "recording {}: {k} got no audio for {}s ({})",
+                    self.id,
+                    STALL.as_secs(),
+                    seg.target
+                ),
+                Some(false) => eprintln!("recording {}: {k} gets audio again", self.id),
+                None => {}
+            }
         }
         let stale: Vec<String> = self
             .running
             .iter()
-            .filter(|(k, (i, _))| {
+            .filter(|(k, r)| {
                 !want
                     .iter()
-                    .any(|t| &t.key == *k && t.target == self.segments[*i].target)
+                    .any(|t| &t.key == *k && t.target == self.segments[r.segment].target)
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -118,13 +159,27 @@ impl Recorder {
                 "opus",
                 "-P",
             ])
-            // dont-reconnect: when an app stream goes away, don't let the session
-            // manager relink the recorder to the default mic.
-            .arg(format!("{{ node.name = mictap-{} node.dont-reconnect = true }}", t.key))
+            // dont-reconnect: when the target goes away, don't let the session
+            // manager relink the recorder to a default device.
+            .arg(format!(
+                "{{ node.name = mictap-{} node.dont-reconnect = true stream.capture.sink = {} }}",
+                t.key,
+                t.key != "mic"
+            ))
             .arg(self.dir.join(&file))
             .kill_on_drop(true)
             .spawn()?;
-        self.running.insert(t.key.clone(), (self.segments.len(), child));
+        eprintln!("recording {}: {} -> {}", self.id, t.key, t.target);
+        self.running.insert(
+            t.key.clone(),
+            Running {
+                segment: self.segments.len(),
+                child,
+                size: 0,
+                grew: Instant::now(),
+                stalled: false,
+            },
+        );
         // ponytail: offset is taken at spawn, so it's late by pw-record's startup (tens of ms).
         // Echo dedupe tolerates ±1 s; use PipeWire stream timestamps if alignment ever matters.
         self.segments.push(Segment {
@@ -138,7 +193,10 @@ impl Recorder {
     }
 
     async fn stop(&mut self, key: &str) {
-        let Some((i, mut child)) = self.running.remove(key) else {
+        let Some(Running {
+            segment: i, mut child, ..
+        }) = self.running.remove(key)
+        else {
             return;
         };
         // SIGINT lets pw-record flush the last Ogg page.
@@ -147,6 +205,7 @@ impl Recorder {
         }
         let _ = child.wait().await;
         self.segments[i].end_ms = Some(self.ms());
+        eprintln!("recording {}: {key} stopped", self.id);
     }
 
     async fn stop_all(&mut self) {
@@ -202,6 +261,24 @@ pub fn close_orphans(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stall_is_reported_once_and_recovery_once() {
+        let t0 = Instant::now();
+        let mut r = Running {
+            segment: 0,
+            child: Command::new("true").spawn().unwrap(),
+            size: 0,
+            grew: t0,
+            stalled: false,
+        };
+        assert_eq!(r.observe(871, t0 + Duration::from_secs(1)), None, "header written");
+        assert_eq!(r.observe(871, t0 + Duration::from_secs(30)), None);
+        assert_eq!(r.observe(871, t0 + Duration::from_secs(31)), Some(true));
+        assert_eq!(r.observe(871, t0 + Duration::from_secs(60)), None, "warned once");
+        assert_eq!(r.observe(2000, t0 + Duration::from_secs(61)), Some(false));
+        assert_eq!(r.observe(3000, t0 + Duration::from_secs(62)), None);
+    }
 
     #[test]
     fn ids_are_unique_within_a_second() {

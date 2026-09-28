@@ -92,6 +92,12 @@ pub async fn run() -> Result<()> {
                 let r = match r {
                     Some(r) => Ok(r),
                     None => Recorder::new(&spool()).inspect(|r| {
+                        eprintln!(
+                            "recording {}: started ({:?}, {})",
+                            r.id,
+                            machine.mode().unwrap(),
+                            machine.app().unwrap_or("no app")
+                        );
                         if machine.mode() == Some(Mode::Auto) {
                             notify(r.id.clone(), machine.app(), tx.clone());
                         }
@@ -106,8 +112,23 @@ pub async fn run() -> Result<()> {
                     Err(e) => Err(e),
                 }
             }
-            (None, Some(r)) if discard => r.discard().await,
-            (None, Some(r)) => r.finish().await,
+            (None, Some(r)) => {
+                let why = if reply.is_some() {
+                    "on request"
+                } else {
+                    "the meeting's mic stream is gone"
+                };
+                eprintln!(
+                    "recording {}: {} {why}",
+                    r.id,
+                    if discard { "discarded" } else { "finished" }
+                );
+                if discard {
+                    r.discard().await
+                } else {
+                    r.finish().await
+                }
+            }
             (None, None) => Ok(()),
         };
         if let Err(e) = res {
@@ -143,20 +164,14 @@ fn status(m: &Machine, rec: Option<&Recorder>, g: &Graph, now: Instant) -> Strin
     .to_string()
 }
 
-/// What a track records, for people: the mic's description or the app's name.
+/// What a track records, for people: the mic's or the sink's description.
 fn track_name(g: &Graph, t: &Track) -> String {
-    let name = if t.key == "mic" {
-        g.nodes
-            .iter()
-            .find(|n| n.name == t.target)
-            .map(|n| n.description.clone())
-    } else {
-        g.nodes
-            .iter()
-            .find(|n| n.serial.to_string() == t.target)
-            .map(|n| n.app.clone())
-    };
-    name.filter(|n| !n.is_empty()).unwrap_or_else(|| t.target.clone())
+    g.nodes
+        .iter()
+        .find(|n| n.name == t.target)
+        .map(|n| n.description.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| t.target.clone())
 }
 
 fn sources(g: &Graph) -> String {
@@ -244,26 +259,26 @@ mod tests {
 
     #[test]
     fn track_names() {
-        let node = |name: &str, serial, description: &str, app: &str| Node {
+        let node = |name: &str, description: &str| Node {
             id: 0,
-            serial,
             class: String::new(),
             name: name.into(),
             description: description.into(),
-            app: app.into(),
+            app: String::new(),
             binary: String::new(),
         };
         let g = Graph {
-            nodes: vec![node("mic1", 5, "Digital Microphone", ""), node("", 427, "", "Zen")],
+            nodes: vec![node("mic1", "Digital Microphone"), node("speaker", "Speaker")],
             links: vec![],
             default_source: None,
+            default_sink: None,
         };
         let t = |key: &str, target: &str| Track {
             key: key.into(),
             target: target.into(),
         };
         assert_eq!(track_name(&g, &t("mic", "mic1")), "Digital Microphone");
-        assert_eq!(track_name(&g, &t("app-427", "427")), "Zen");
-        assert_eq!(track_name(&g, &t("app-9", "9")), "9", "gone from the graph");
+        assert_eq!(track_name(&g, &t("app-monitor", "speaker")), "Speaker");
+        assert_eq!(track_name(&g, &t("app-monitor", "hdmi")), "hdmi", "gone from the graph");
     }
 }
