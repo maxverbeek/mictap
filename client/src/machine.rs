@@ -5,6 +5,10 @@ use serde::Serialize;
 use crate::pw::Graph;
 
 pub const GRACE: Duration = Duration::from_secs(120);
+/// How long a meeting's capture stream must exist before recording from it. Opening the mic
+/// switches a Bluetooth headset to its call profile, and a recorder linked during that switch
+/// keeps the headset from recovering, which stalls the app's audio.
+pub const SETTLE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -46,6 +50,8 @@ impl Session {
 pub struct Machine {
     pub session: Option<Session>,
     meeting: Option<u32>,
+    /// The capture stream last seen, and since when.
+    seen: Option<(u32, Instant)>,
     suppressed: Option<u32>,
 }
 
@@ -83,7 +89,11 @@ impl Machine {
         if self.suppressed != self.meeting {
             self.suppressed = None;
         }
-        if self.session.is_none() && self.meeting.is_some() && self.suppressed.is_none() {
+        if self.seen.map(|(id, _)| id) != self.meeting {
+            self.seen = self.meeting.map(|id| (id, now));
+        }
+        let settled = self.seen.is_some_and(|(_, t)| now.duration_since(t) >= SETTLE);
+        if self.session.is_none() && settled && self.suppressed.is_none() {
             self.session = Some(Session::new(Mode::Auto, None));
         }
         let s = self.session.as_mut()?;
@@ -112,7 +122,7 @@ impl Machine {
             })
             .into_iter()
             .collect();
-        if let Some(target) = meeting.as_ref().and_then(|m| g.sink(m)) {
+        if let Some(target) = meeting.as_ref().filter(|_| settled).and_then(|m| g.sink(m)) {
             tracks.push(Track {
                 key: "app-monitor".into(),
                 target,
@@ -171,48 +181,65 @@ mod tests {
     }
 
     #[test]
-    fn auto_starts_follows_source_and_stops_after_grace() {
+    fn auto_starts_once_settled_follows_source_and_stops_after_grace() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         assert_eq!(m.tick(&quiet(), t0), None);
         assert_eq!(
-            keys(m.tick(&meeting("headset"), t0)),
+            m.tick(&meeting("headset"), t0),
+            None,
+            "the headset may be switching profiles"
+        );
+        assert_eq!(m.tick(&meeting("headset"), t0 + secs(9)), None);
+        let t = t0 + SETTLE;
+        assert_eq!(
+            keys(m.tick(&meeting("headset"), t)),
             ["mic=headset", "app-monitor=speaker"]
         );
         assert_eq!(m.mode(), Some(Mode::Auto));
-        assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=mic1", "app-monitor=speaker"]);
-        assert_eq!(keys(m.tick(&quiet(), t0 + secs(1))), ["mic=mic1"]);
-        assert!(m.tick(&quiet(), t0 + secs(120)).is_some());
-        assert_eq!(m.tick(&quiet(), t0 + secs(121)), None);
+        assert_eq!(keys(m.tick(&meeting("mic1"), t)), ["mic=mic1", "app-monitor=speaker"]);
+        assert_eq!(keys(m.tick(&quiet(), t + secs(1))), ["mic=mic1"]);
+        assert!(m.tick(&quiet(), t + secs(120)).is_some());
+        assert_eq!(m.tick(&quiet(), t + secs(121)), None);
     }
 
     #[test]
-    fn meeting_returning_within_grace_keeps_recording() {
+    fn meeting_returning_within_grace_keeps_the_mic_and_waits_to_settle_for_the_rest() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         m.tick(&meeting("mic1"), t0);
-        m.tick(&quiet(), t0 + secs(1));
-        m.tick(&meeting("mic1"), t0 + secs(100));
-        assert!(m.tick(&quiet(), t0 + secs(200)).is_some());
+        let t = t0 + SETTLE;
+        m.tick(&meeting("mic1"), t);
+        m.tick(&quiet(), t + secs(1));
+        assert_eq!(keys(m.tick(&meeting("mic1"), t + secs(100))), ["mic=mic1"]);
+        assert_eq!(
+            keys(m.tick(&meeting("mic1"), t + secs(110))),
+            ["mic=mic1", "app-monitor=speaker"]
+        );
+        assert!(m.tick(&quiet(), t + secs(200)).is_some());
     }
 
     #[test]
     fn stop_suppresses_until_the_meeting_stream_goes_away() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         m.tick(&meeting("mic1"), t0);
+        let t = t0 + SETTLE;
+        m.tick(&meeting("mic1"), t);
         m.stop();
-        assert_eq!(m.tick(&meeting("mic1"), t0), None);
-        assert_eq!(m.tick(&quiet(), t0), None);
-        assert!(m.tick(&meeting("mic1"), t0).is_some());
+        assert_eq!(m.tick(&meeting("mic1"), t), None);
+        assert_eq!(m.tick(&quiet(), t), None);
+        m.tick(&meeting("mic1"), t);
+        assert!(m.tick(&meeting("mic1"), t + SETTLE).is_some());
     }
 
     #[test]
-    fn manual_uses_override_then_default_and_never_times_out() {
+    fn manual_starts_at_once_and_never_times_out() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         m.start(None);
         assert_eq!(keys(m.tick(&quiet(), t0)), ["mic=mic1"]);
         assert_eq!(m.mode(), Some(Mode::Manual));
         m.start(Some("headset".into()));
+        assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=headset"]);
         assert_eq!(
-            keys(m.tick(&meeting("mic1"), t0)),
+            keys(m.tick(&meeting("mic1"), t0 + SETTLE)),
             ["mic=headset", "app-monitor=speaker"]
         );
         assert!(m.tick(&quiet(), t0 + secs(600)).is_some());
@@ -222,9 +249,10 @@ mod tests {
     fn start_during_grace_clears_the_countdown() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         m.tick(&meeting("mic1"), t0);
-        m.tick(&quiet(), t0 + secs(1));
+        m.tick(&meeting("mic1"), t0 + SETTLE);
+        m.tick(&quiet(), t0 + secs(11));
         m.start(None);
-        assert!(m.tick(&quiet(), t0 + secs(2)).is_some());
+        assert!(m.tick(&quiet(), t0 + secs(12)).is_some());
         assert_eq!(m.session.as_ref().unwrap().lost_at, None);
     }
 }
