@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::assemble::{bytes, cosine, floats, mixed, normalize, Line, Tuning};
+use crate::assemble::{bytes, cosine, floats, mixed, normalize, Line, Tuning, Turn};
 
 /// Speaker label (`room/S1`) -> name.
 pub(crate) type Names = BTreeMap<String, String>;
@@ -67,6 +67,12 @@ impl Matching {
     /// (default 0.1).
     pub fn lines_from_env() -> Self {
         Self::env("MICTAP_LINE", 0.55, 0.1)
+    }
+
+    /// Between the names of a cluster naming split, which share its channel: no threshold, and
+    /// `MICTAP_SPLIT_MARGIN` (default 0.02).
+    pub fn splits_from_env() -> Self {
+        Self::env("MICTAP_SPLIT", -1.0, 0.02)
     }
 
     fn env(prefix: &str, threshold: f32, margin: f32) -> Self {
@@ -232,9 +238,9 @@ pub(crate) fn confirm(db: &Connection, id: &str, changes: BTreeMap<String, Namin
         }
         *n += tx.execute(
             "INSERT INTO voices (name, embedding, recording, label)
-             SELECT ?3, COALESCE(core, embedding), recording, label FROM clusters
+             SELECT ?3, COALESCE(?4, core, embedding), recording, label FROM clusters
              WHERE recording = ?1 AND label = ?2",
-            params![id, label, name],
+            params![id, label, name, label_core(&tx, id, label, name)?.as_deref().map(bytes)],
         )?;
     }
     tx.commit()?;
@@ -328,8 +334,35 @@ pub(crate) fn name_line(
             )?;
         }
     }
+    let label: Option<String> = tx
+        .query_row(
+            "SELECT speaker FROM lines WHERE recording = ?1 AND track = ?2
+             AND start_ms <= ?3 AND ?3 < end_ms",
+            params![id, track, (start_ms + end_ms) / 2],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(label) = label {
+        relearn_core(&tx, id, &label)?;
+    }
     tx.commit()?;
     Ok(learned)
+}
+
+/// Relearns the voice `label`'s cluster taught (when it taught one) from its `clean_core`, or
+/// its core again once no line of it is named otherwise.
+fn relearn_core(db: &Connection, id: &str, label: &str) -> Result<()> {
+    let Some(name) = confirmed(db, id)?.remove(label).filter(|n| n != "?") else {
+        return Ok(());
+    };
+    db.execute(
+        "UPDATE voices SET embedding = COALESCE(?3,
+           (SELECT COALESCE(core, embedding) FROM clusters WHERE recording = ?1 AND label = ?2))
+         WHERE recording = ?1 AND label = ?2 AND start_ms IS NULL",
+        params![id, label, label_core(db, id, label, &name)?.as_deref().map(bytes)],
+    )?;
+    Ok(())
 }
 
 /// Whether `id` has line voices or its turns are kept, so naming can still learn voices from its
@@ -377,14 +410,164 @@ pub(crate) fn guess<'a>(
     }
 }
 
-/// The derived lines of `id` with their names: taught by a line name or a heard voice over
-/// it, else guessed anew from the voices known now (see `guess`).
-pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
-    let (names, suggested) = (confirmed(db, id)?, column(db, id, "suggested")?);
-    let line_names: Vec<(String, i64, i64, String)> = db
+/// Whether `line` is on `track` with its midpoint in `[s, e)`: how names, voices and turns
+/// kept by time find the line they belong to.
+fn holds(line: &Line, track: &str, s: i64, e: i64) -> bool {
+    let mid = (line.start_ms + line.end_ms) / 2;
+    line.track == track && s <= mid && mid < e
+}
+
+/// `id`'s line names as (track, start_ms, end_ms, name).
+fn line_names(db: &Connection, id: &str) -> Result<Vec<(String, i64, i64, String)>> {
+    Ok(db
         .prepare("SELECT track, start_ms, end_ms, name FROM line_names WHERE recording = ?1")?
         .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// `id`'s embedded turns with their tracks.
+fn turns(db: &Connection, id: &str) -> Result<Vec<(String, Turn)>> {
+    Ok(db
+        .prepare(
+            "SELECT track, start_ms, end_ms, speaker, embedding FROM turns
+             WHERE recording = ?1 AND embedding IS NOT NULL",
+        )?
+        .query_map([id], |r| {
+            let turn = Turn {
+                start_ms: r.get(1)?,
+                end_ms: r.get(2)?,
+                speaker: r.get(3)?,
+                embedding: Some(floats(&r.get::<_, Vec<u8>>(4)?)),
+            };
+            Ok((r.get(0)?, turn))
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// What a line tells about who speaks in its cluster.
+struct Evidence<'a> {
+    line: &'a Line,
+    /// Its line name, `?` included.
+    line_name: Option<&'a str>,
+    /// The name it taught (see `State::Taught`).
+    taught: Option<&'a str>,
+    voice: Option<&'a [f32]>,
+}
+
+/// The core of `label`'s turns but those holding one of its lines named other than `name`
+/// (`?` included): what the cluster teaches once naming lines showed it holds other people
+/// too. None when no turn is left out, or none is kept.
+fn clean_core(label: &str, name: &str, ev: &[Evidence], turns: &[(String, Turn)]) -> Option<Vec<f32>> {
+    let mut left_out = false;
+    let kept: Vec<&Turn> = turns
+        .iter()
+        .filter(|(track, t)| {
+            let mut own = ev
+                .iter()
+                .filter(|e| e.line.speaker.as_deref() == Some(label) && holds(e.line, track, t.start_ms, t.end_ms))
+                .peekable();
+            own.peek().is_some() && {
+                let clean = own.all(|e| e.line_name.is_none_or(|n| n == name));
+                left_out |= !clean;
+                clean
+            }
+        })
+        .map(|(_, t)| t)
+        .collect();
+    left_out.then(|| crate::assemble::core_of(&kept)).flatten()
+}
+
+/// `clean_core` of `label` in `id` as named now.
+fn label_core(db: &Connection, id: &str, label: &str, name: &str) -> Result<Option<Vec<f32>>> {
+    let (lines, names) = (crate::assemble::lines(db, id)?, line_names(db, id)?);
+    let ev: Vec<Evidence> = lines
+        .iter()
+        .map(|line| Evidence {
+            line,
+            line_name: names.iter().find(|n| holds(line, &n.0, n.1, n.2)).map(|n| n.3.as_str()),
+            taught: None,
+            voice: None,
+        })
+        .collect();
+    Ok(clean_core(label, name, &ev, &turns(db, id)?))
+}
+
+/// A name taught this many times within a cluster (lines with a line voice) splits it.
+const SPLIT_SEEDS: usize = 3;
+
+/// The clusters of `ev` that naming lines split: those with, besides the name `label_name`
+/// gives them, another name taught `SPLIT_SEEDS` times in them, or two such names. Per split
+/// cluster, a centroid per such name: the voices of the lines it taught there and of the
+/// turns whose lines it taught all; for the label's own name also its `core_of` the label.
+fn splits<'a>(
+    ev: &[Evidence<'a>],
+    turns: &[(String, Turn)],
+    label_name: impl Fn(&str) -> Option<&'a str>,
+    core_of: impl Fn(&str, &str) -> Option<Vec<f32>>,
+) -> HashMap<&'a str, Vec<(String, Vec<f32>)>> {
+    fn add(sum: &mut Vec<f32>, v: &[f32]) {
+        if sum.is_empty() {
+            sum.extend_from_slice(v);
+        } else {
+            sum.iter_mut().zip(v).for_each(|(a, b)| *a += b);
+        }
+    }
+    // label -> name -> (lines taught with a line voice, sum of seed voices)
+    let mut seeds: HashMap<&str, HashMap<&str, (usize, Vec<f32>)>> = HashMap::new();
+    for e in ev {
+        if let (Some(label), Some(name), Some(v)) = (e.line.speaker.as_deref(), e.taught, e.voice) {
+            let s = seeds.entry(label).or_default().entry(name).or_default();
+            s.0 += 1;
+            add(&mut s.1, v);
+        }
+    }
+    for (track, t) in turns {
+        let mut inside = ev.iter().filter(|e| holds(e.line, track, t.start_ms, t.end_ms));
+        let Some(first) = inside.next() else { continue };
+        let (Some(label), Some(name)) = (first.line.speaker.as_deref(), first.taught) else {
+            continue;
+        };
+        if inside.all(|e| e.taught == Some(name) && e.line.speaker.as_deref() == Some(label)) {
+            let s = seeds.entry(label).or_default().entry(name).or_default();
+            add(&mut s.1, t.embedding.as_deref().unwrap_or_default());
+        }
+    }
+    let mut out = HashMap::new();
+    for (label, by_name) in seeds {
+        let own = label_name(label);
+        let mut names: Vec<&str> = by_name.iter().filter(|s| s.1 .0 >= SPLIT_SEEDS).map(|s| *s.0).collect();
+        names.extend(own.filter(|o| !names.contains(o)));
+        if names.len() < 2 {
+            continue;
+        }
+        let centroids: Vec<(String, Vec<f32>)> = names
+            .into_iter()
+            .filter_map(|name| {
+                let mut sum = by_name.get(name).map(|s| s.1.clone()).unwrap_or_default();
+                if Some(name) == own {
+                    if let Some(c) = core_of(label, name) {
+                        add(&mut sum, &c);
+                    }
+                }
+                (!sum.is_empty()).then(|| {
+                    normalize(&mut sum);
+                    (name.to_string(), sum)
+                })
+            })
+            .collect();
+        if centroids.len() >= 2 {
+            out.insert(label, centroids);
+        }
+    }
+    out
+}
+
+/// The derived lines of `id` with their names: taught by a line name or a heard voice over
+/// it, else guessed anew from the voices known now: within a cluster naming split, by the
+/// nearest of its `splits` centroids, else by `guess`.
+pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
+    let (names, suggested) = (confirmed(db, id)?, column(db, id, "suggested")?);
+    let line_names = line_names(db, id)?;
     let line_voices: Vec<(String, i64, i64, Vec<f32>)> = db
         .prepare("SELECT track, start_ms, end_ms, embedding FROM line_voices WHERE recording = ?1")?
         .query_map([id], |r| {
@@ -405,39 +588,58 @@ pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let m = Matching::lines_from_env();
-    Ok(crate::assemble::lines(db, id)?
-        .into_iter()
+    let cores: HashMap<String, Vec<f32>> = db
+        .prepare("SELECT label, COALESCE(core, embedding) FROM clusters WHERE recording = ?1")?
+        .query_map([id], |r| Ok((r.get(0)?, floats(&r.get::<_, Vec<u8>>(1)?))))?
+        .collect::<rusqlite::Result<_>>()?;
+    let turns = turns(db, id)?;
+    let lines = crate::assemble::lines(db, id)?;
+    let own = |line: &Line, (r, l, span, _): &Voice| r == id && span.is_some_and(|(s, e)| holds(line, track(l), s, e));
+    let ev: Vec<Evidence> = lines
+        .iter()
         .map(|line| {
-            let mid = (line.start_ms + line.end_ms) / 2;
-            let holds = |t: &str, s: i64, e: i64| t == line.track && s <= mid && mid < e;
-            let line_name = line_names
-                .iter()
-                .find(|(t, s, e, _)| holds(t, *s, *e))
-                .map(|n| n.3.clone());
-            let own = |(r, l, span, _): &&Voice| r == id && span.is_some_and(|(s, e)| holds(track(l), s, e));
-            let heard = voices.iter().find(own).map(|v| v.3 .0.clone());
-            let (state, name) = match line_name.as_deref() {
-                Some("?") => (State::Unknown, None),
-                Some(n) => (State::Taught, Some(n.to_string())),
-                None if heard.is_some() => (State::Taught, heard),
-                None => {
-                    let g = line.speaker.as_ref().and_then(|l| match names.get(l) {
-                        Some(n) => Some(n).filter(|n| *n != "?"),
-                        None => suggested.get(l),
-                    });
-                    let emb = line_voices.iter().find(|(t, s, e, _)| holds(t, *s, *e));
-                    let others = voices.iter().filter(|v| !own(v)).map(|v| &v.3);
-                    match guess(g.map(String::as_str), emb.map(|v| &v.3[..]), others, &m) {
+            let line_name = line_names.iter().find(|n| holds(line, &n.0, n.1, n.2)).map(|n| n.3.as_str());
+            let heard = voices.iter().find(|v| own(line, v)).map(|v| v.3 .0.as_str());
+            Evidence {
+                line,
+                line_name,
+                taught: line_name.filter(|n| *n != "?").or(heard.filter(|_| line_name.is_none())),
+                voice: line_voices.iter().find(|v| holds(line, &v.0, v.1, v.2)).map(|v| &v.3[..]),
+            }
+        })
+        .collect();
+    let label_name = |l: &str| match names.get(l) {
+        Some(n) => Some(n.as_str()).filter(|n| *n != "?"),
+        None => suggested.get(l).map(String::as_str),
+    };
+    let core = |label: &str, name: &str| clean_core(label, name, &ev, &turns).or_else(|| cores.get(label).cloned());
+    let splits = splits(&ev, &turns, label_name, core);
+    let (m, sm) = (Matching::lines_from_env(), Matching::splits_from_env());
+    Ok(ev
+        .iter()
+        .map(|e| {
+            let label = e.line.speaker.as_deref();
+            let (state, name) = match (e.line_name, e.taught) {
+                (Some("?"), _) => (State::Unknown, None),
+                (_, Some(n)) => (State::Taught, Some(n.to_string())),
+                _ => {
+                    let guessed = match label.and_then(|l| splits.get(l)) {
+                        Some(cs) => e.voice.and_then(|v| best(v, cs, &sm)).map(|b| b.0),
+                        None => {
+                            let others = voices.iter().filter(|v| !own(e.line, v)).map(|v| &v.3);
+                            guess(label.and_then(label_name), e.voice, others, &m)
+                        }
+                    };
+                    match guessed {
                         Some(n) => (State::Guessed, Some(n.to_string())),
                         None => (State::Unknown, None),
                     }
                 }
             };
             Named {
-                line,
+                line: e.line.clone(),
                 name,
-                line_name,
+                line_name: e.line_name.map(String::from),
                 state,
             }
         })
@@ -1056,6 +1258,67 @@ mod tests {
         db.execute("DELETE FROM turns", []).unwrap();
         assert!(teachable(&db, "r1").unwrap());
         assert_eq!(name_line(&db, "r1", "room", 0, 4_000, Some("Bo")).unwrap(), 1);
+    }
+
+    #[test]
+    fn naming_lines_splits_a_cluster_of_two_people() {
+        use State::*;
+        let db = db();
+        db.execute(
+            r#"UPDATE recordings SET speakers = '{"room/S1":"Dave"}' WHERE id = 'r1'"#,
+            [],
+        )
+        .unwrap();
+        // One cluster holding Dave ([1, 0]) and Erin ([0, 1]), a line per second.
+        let own = [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.1, 1.0],
+            [0.0, 1.0],
+            [0.2, 1.0],
+            [1.0, 0.1],
+            [1.0, 0.97],
+        ];
+        let spans: Vec<(i64, i64, &str)> = (0..own.len() as i64).map(|i| (i * 1_000, i * 1_000 + 1_000, "room/S1")).collect();
+        lines(&db, &spans);
+        for (i, v) in own.iter().enumerate() {
+            line_voice(&db, i as i64 * 1_000, i as i64 * 1_000 + 1_000, v);
+        }
+        cluster(&db, "room/S1", &[0.6, 0.8]);
+        turns(&db, &[(0, 1_000, &[1.0, 0.0]), (1_000, 5_000, &[0.0, 1.0]), (5_000, 7_000, &[1.0, 0.0])]);
+        let states = |db: &Connection| -> Vec<(Option<String>, State)> { shown(db)[4..].to_vec() };
+        let s = |n: Option<&str>, t| (n.map(String::from), t);
+        // Erin taught twice: lines sounding like him only disagree with the label.
+        name_line(&db, "r1", "room", 1_000, 2_000, Some("Erin")).unwrap();
+        name_line(&db, "r1", "room", 2_000, 3_000, Some("Erin")).unwrap();
+        assert_eq!(states(&db), [s(None, Unknown), s(Some("Dave"), Guessed), s(None, Unknown)]);
+        // A third time splits the cluster: each line goes to the nearer of the two, the unclear
+        // one to neither.
+        name_line(&db, "r1", "room", 3_000, 4_000, Some("Erin")).unwrap();
+        assert_eq!(states(&db), [s(Some("Erin"), Guessed), s(Some("Dave"), Guessed), s(None, Unknown)]);
+        // Cleared again: no split.
+        name_line(&db, "r1", "room", 3_000, 4_000, None).unwrap();
+        assert_eq!(states(&db)[0], s(None, Unknown));
+    }
+
+    #[test]
+    fn a_cluster_teaches_the_turns_no_line_of_it_is_named_otherwise() {
+        let db = db();
+        cluster(&db, "room/S1", &[0.6, 0.8]);
+        turns(&db, &[(0, 4_000, &[1.0, 0.0]), (4_000, 8_000, &[0.0, 1.0])]);
+        lines(&db, &[(0, 4_000, "room/S1"), (4_000, 8_000, "room/S1")]);
+        confirm(&db, "r1", named(&[("room/S1", "Max")])).unwrap();
+        let core = |db: &Connection| learned(db).into_iter().find(|v| v.0.is_none()).unwrap().2;
+        assert_eq!(core(&db), [0.6, 0.8], "nothing named otherwise: the stored core");
+        name_line(&db, "r1", "room", 4_000, 8_000, Some("Eva")).unwrap();
+        assert_eq!(core(&db), [1.0, 0.0], "Eva's turn left out");
+        name_line(&db, "r1", "room", 4_000, 8_000, Some("Max")).unwrap();
+        assert_eq!(core(&db), [0.6, 0.8]);
+        name_line(&db, "r1", "room", 4_000, 8_000, Some("?")).unwrap();
+        assert_eq!(core(&db), [1.0, 0.0], "an unsure line's turn left out too");
+        // Confirmed anew, it learns the clean core right away.
+        confirm(&db, "r1", named(&[("room/S1", "Bo")])).unwrap();
+        assert_eq!(core(&db), [1.0, 0.0]);
     }
 
     fn learned_count(db: &Connection) -> i64 {

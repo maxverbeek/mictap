@@ -462,6 +462,12 @@ fn core(turns: &[&Turn], mean: &[f32]) -> Option<Vec<f32>> {
     means(&kept).into_iter().next().flatten()
 }
 
+/// The core of `turns` taken as one cluster.
+pub(crate) fn core_of(turns: &[&Turn]) -> Option<Vec<f32>> {
+    let one: Vec<Turn> = turns.iter().map(|t| Turn { speaker: 0, ..(*t).clone() }).collect();
+    core(turns, &means(&one).into_iter().next().flatten()?)
+}
+
 /// Splits `turns` in two by spherical 2-means over their embeddings, weighted by length,
 /// seeded with the longest turn and the one least alike to it. Returns how alike the halves'
 /// means are and the smaller half's share of the speech; None under 4 embedded turns.

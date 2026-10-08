@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS recordings (
     suggested TEXT,
     -- audio.ogg: NULL until mixed down, then 'ready', 'failed' or 'expired'.
     audio TEXT,
-    -- Unix ms it became done; its model outputs expire MICTAP_OUTPUTS_DAYS later.
+    -- Unix ms it became done; whisper's segments expire MICTAP_OUTPUTS_DAYS later.
     done_ms INTEGER
 );
 CREATE TABLE IF NOT EXISTS file_progress (
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS segments (
     text TEXT NOT NULL
 );
 -- sherpa's, with speaker its cluster and embedding CAM++'s (L2-normalized f32 little-endian).
+-- Kept durably, unlike segments: naming lines weighs them anew (names::named).
 CREATE TABLE IF NOT EXISTS turns (
     id INTEGER PRIMARY KEY,
     recording TEXT NOT NULL REFERENCES recordings(id),
@@ -221,22 +222,17 @@ pub fn finish(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
     Ok(conn.execute("UPDATE recordings SET finished = 1 WHERE id = ?1", params![id])? == 1)
 }
 
-/// Deletes the model outputs of recordings done more than `MICTAP_OUTPUTS_DAYS` (default 7)
-/// before `now_ms`. Their lines stay.
+/// Deletes whisper's segments of recordings done more than `MICTAP_OUTPUTS_DAYS` (default 7)
+/// before `now_ms`. Their lines and turns stay.
 pub fn expire_outputs(conn: &Connection, now_ms: i64) -> rusqlite::Result<()> {
     let days: i64 = std::env::var("MICTAP_OUTPUTS_DAYS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
-    for table in ["segments", "turns"] {
-        conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE recording IN
-                 (SELECT id FROM recordings WHERE done_ms < ?1)"
-            ),
-            [now_ms - days * 86_400_000],
-        )?;
-    }
+    conn.execute(
+        "DELETE FROM segments WHERE recording IN (SELECT id FROM recordings WHERE done_ms < ?1)",
+        [now_ms - days * 86_400_000],
+    )?;
     Ok(())
 }
 
@@ -341,7 +337,7 @@ mod tests {
         super::expire_outputs(&conn, 8 * day).unwrap();
         let left = |sql: &str| -> String { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
         assert_eq!(left("SELECT group_concat(recording) FROM segments"), "new,busy");
-        assert_eq!(left("SELECT group_concat(recording) FROM turns"), "new");
+        assert_eq!(left("SELECT group_concat(recording) FROM turns"), "old,new");
         assert_eq!(left("SELECT group_concat(recording) FROM lines"), "old");
     }
 

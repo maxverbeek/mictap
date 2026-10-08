@@ -91,9 +91,10 @@ meeting instead of after it.
   turn) are stored as produced and never modified; lines, clusters and their
   mean embeddings are derived from them (`server/src/assemble.rs`) after every
   transcribed window and after diarization. See `CONTEXT.md` for the terms.
-  The outputs are deleted `MICTAP_OUTPUTS_DAYS` (default 7) after a recording
-  is done; what was derived stays. Until then `GET /recordings/{id}/outputs`
-  exports them as JSON, to replay a real meeting when tuning assembly.
+  Whisper's segments are deleted `MICTAP_OUTPUTS_DAYS` (default 7) after a
+  recording is done; what was derived stays, and so do the turns, which
+  naming lines weighs anew (see Learning names). `GET /recordings/{id}/outputs`
+  exports the outputs as JSON, to replay a real meeting when tuning assembly.
 - **Echo dedupe.** Remote voices coming out of a speaker get picked up by the
   mic. Mic segments that overlap remote speech within about 1 s and match
   its text are dropped. A room speaker cluster that is mostly echo (the
@@ -182,6 +183,20 @@ cluster's turns into its two most different halves; when both carry at least
 cluster is **mixed**. A mixed cluster gets no suggestion, and naming it keeps
 the name but learns no voice from its core, only from lines you heard and kept,
 so a room's sound never becomes someone's voice.
+
+Naming lines can show what the mixed check missed: a cluster in which another
+name than its own is taught on at least 3 lines (with a line voice) is
+**split**. Its lines are then guessed only between the names it holds that
+way, plus its own: each name gets a centroid from the line voices it taught
+there and the turns whose lines all carry it, and the label's own name also
+its core. A line goes to the nearest centroid when more than
+`MICTAP_SPLIT_MARGIN` (0.02) ahead of the next, else it is unknown; there is
+no threshold, since every name in the cluster came through the same mic. The
+core leaves out the turns holding a line named otherwise (or `?`), and the
+voice a confirmed cluster taught is relearned from it whenever one of its
+lines is named, so a second person in the cluster stops blurring its voice
+in other recordings. On a recording where one cluster held two people, this
+halved the clicks needed to name every line.
 
 ## Audio
 

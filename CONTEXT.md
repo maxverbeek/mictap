@@ -10,8 +10,9 @@ Domain terms used across the code and docs.
 - **Model outputs**: what the models produced for a recording, per track, before the app
   interprets it: whisper's **segments** (times and text), sherpa's **turns** (times
   and sherpa's own cluster id), and one CAM++ **embedding** per turn. Never modified;
-  expire a configurable number of days (shorter than the audio) after the recording is
-  done. Everything the app shows is **derived** from them and kept durably.
+  the segments expire a configurable number of days (shorter than the audio) after the
+  recording is done, the turns are kept. Everything the app shows is **derived** from
+  them and kept durably.
 - **Rediarize**: discard a recording's turns and embeddings, run sherpa and CAM++ on its
   audio again, and derive anew. Needs the audio; whisper's segments are kept, or
   transcribed again when they expired.
@@ -24,6 +25,10 @@ Domain terms used across the code and docs.
   speech and are less alike than clusters assembly would merge: two people, or a room
   sharing one mic. Gets no suggestion, and its core teaches no voice (heard snippets
   still can).
+- **Split cluster**: a cluster in which another name than its own is taught on at least 3
+  lines: naming lines showed two people or more in it. Its lines are guessed only between
+  those names and its own, each a centroid of the line voices it taught there and the turns
+  whose lines all carry it (its own name also its core).
 - **Heard snippet**: a line of a label that was listened to before confirming its name,
   kept (only that speaker) or marked wrong. Each kept one becomes a voice.
 - **Label**: a cluster's name within its recording, `room/S1`, numbered by first
@@ -33,7 +38,8 @@ Domain terms used across the code and docs.
   outputs: fold fragments, merge alike clusters, split segments into lines, merge tracks,
   drop echoes. Pure; knows nothing of names.
 - **Core**: the mean embedding of a cluster's turns most alike to its mean, covering 70% of
-  its speech; outliers and folded fragments left out.
+  its speech; outliers and folded fragments left out, and the turns holding a line of it
+  named otherwise (or `?`).
 - **Voice**: an embedding learned for a confirmed name: a cluster's core, or a snippet of
   it that was heard. A cluster can teach several; a person confirmed in five recordings
   has at least five.
@@ -58,6 +64,7 @@ Domain terms used across the code and docs.
   - **Guessed**: shows a name the server is fairly sure of, recomputed on every read: its
     label's confirmed name or suggestion, and the name its line voice clearly matches best
     among all voices (but the ones it taught itself); either one alone, or both when they
-    agree. Light on the page.
+    agree. In a split cluster instead the centroid its line voice is clearly nearest to.
+    Light on the page.
   - **Unknown**: neither, the two disagree (the ones to check), or a line name `?`. Shows `?`.
 - **Transcript**: the note written to the vault; derived, never read back.
