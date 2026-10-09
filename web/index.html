@@ -278,12 +278,16 @@ function fail(err) { cur.err.textContent = err.message; }
 async function nameLine(seg, name) {
   const card = focus && same(focus.seg, seg) ? focus.card : null;
   closeMenu();
-  // Picking the name a line taught by naming its whole speaker again unconfirms that speaker.
-  const undo = seg.speaker && !seg.line_name && seg.state === "taught" && seg.name === name;
+  // A line heard when its speaker was named: picking that name again unconfirms the speaker,
+  // another name renames it when this was the only line heard for it (it was named from here).
+  const heard = l => cur.r.lines.filter(x => x.speaker === l && !x.line_name && x.state === "taught");
+  const byLabel = seg.speaker && !seg.line_name && seg.state === "taught";
+  const undo = byLabel && seg.name === name;
+  const rename = byLabel && !undo && name !== "?" && heard(seg.speaker).length === 1;
   const clear = seg.line_name === name || undo;
   // In the transcript, naming a line of a speaker without a name names the whole speaker, so
   // all their lines fill in; the card's samples, or a speaker already named, get the line only.
-  const whole = !card && seg.speaker && nameless(seg.speaker) && !seg.line_name && name !== "?";
+  const whole = rename || !card && seg.speaker && nameless(seg.speaker) && !seg.line_name && name !== "?";
   const id = encodeURIComponent(cur.id);
   try {
     if (undo) {
