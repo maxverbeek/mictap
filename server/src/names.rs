@@ -110,8 +110,34 @@ fn best<'a>(
     (first >= m.threshold && first - second > m.margin).then_some((name, first))
 }
 
+/// One voice per recording and name: the mean of the ones taught there, so a name taught on many
+/// lines of a meeting gets one chance to match rather than one per line, and a wrong one among
+/// them is outweighed.
+fn pool<'a>(voices: impl IntoIterator<Item = (&'a str, &'a (String, Vec<f32>))>) -> Vec<(String, Vec<f32>)> {
+    let mut sums: HashMap<(&str, &str, usize), Vec<f32>> = HashMap::new();
+    for (recording, (name, v)) in voices {
+        let mut v = v.clone();
+        normalize(&mut v);
+        add(sums.entry((recording, name, v.len())).or_default(), &v);
+    }
+    sums.into_iter()
+        .map(|((_, name, _), mut sum)| {
+            normalize(&mut sum);
+            (name.to_string(), sum)
+        })
+        .collect()
+}
+
+fn add(sum: &mut Vec<f32>, v: &[f32]) {
+    if sum.is_empty() {
+        sum.extend_from_slice(v);
+    } else {
+        sum.iter_mut().zip(v).for_each(|(a, b)| *a += b);
+    }
+}
+
 /// Suggests names for the unconfirmed clusters of `id` from the voices of other recordings, and
-/// of its other clusters and named lines.
+/// of its other clusters and named lines, `pool`ed.
 /// A mixed cluster, or one without a clear match, stays unknown, and no name is suggested twice within a
 /// track or for a track where it is already confirmed; the most similar cluster gets it.
 pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
@@ -129,23 +155,25 @@ pub(crate) fn suggest(db: &Connection, id: &str, m: &Matching) -> Result<()> {
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mixed = mixed_labels(db, id)?;
-    let mut candidates: Vec<(f32, &str, &str)> = clusters
+    let mut candidates: Vec<(f32, &str, String)> = clusters
         .iter()
         .filter(|(label, _)| !confirmed.contains_key(label) && !mixed.contains(label))
         .filter_map(|(label, emb)| {
-            let others = voices
-                .iter()
-                .filter(|(r, l, _)| !(r == id && l == label))
-                .map(|(_, _, v)| v);
-            best(emb, others, m).map(|(name, c)| (c, label.as_str(), name))
+            let others = pool(
+                voices
+                    .iter()
+                    .filter(|(r, l, _)| !(r == id && l == label))
+                    .map(|(r, _, v)| (r.as_str(), v)),
+            );
+            best(emb, &others, m).map(|(name, c)| (c, label.as_str(), name.to_string()))
         })
         .collect();
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let mut taken: HashSet<(&str, &str)> = confirmed.iter().map(|(l, n)| (track(l), n.as_str())).collect();
+    let mut taken: HashSet<(&str, String)> = confirmed.iter().map(|(l, n)| (track(l), n.clone())).collect();
     let suggested: Names = candidates
         .into_iter()
-        .filter(|(_, label, name)| taken.insert((track(label), name)))
-        .map(|(_, label, name)| (label.to_string(), name.to_string()))
+        .filter(|(_, label, name)| taken.insert((track(label), name.clone())))
+        .map(|(_, label, name)| (label.to_string(), name))
         .collect();
     db.execute(
         "UPDATE recordings SET suggested = ?2 WHERE id = ?1",
@@ -502,13 +530,6 @@ fn splits<'a>(
     label_name: impl Fn(&str) -> Option<&'a str>,
     core_of: impl Fn(&str, &str) -> Option<Vec<f32>>,
 ) -> HashMap<&'a str, Vec<(String, Vec<f32>)>> {
-    fn add(sum: &mut Vec<f32>, v: &[f32]) {
-        if sum.is_empty() {
-            sum.extend_from_slice(v);
-        } else {
-            sum.iter_mut().zip(v).for_each(|(a, b)| *a += b);
-        }
-    }
     // label -> name -> (lines taught with a line voice, sum of seed voices)
     let mut seeds: HashMap<&str, HashMap<&str, (usize, Vec<f32>)>> = HashMap::new();
     for e in ev {
@@ -612,6 +633,8 @@ pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
     let core = |label: &str, name: &str| clean_core(label, name, &ev, &turns).or_else(|| cores.get(label).cloned());
     let splits = splits(&ev, &turns, label_name, core);
     let (m, sm) = (Matching::lines_from_env(), Matching::splits_from_env());
+    // A line is guessed only when it taught no voice, so none needs leaving out.
+    let pooled = pool(voices.iter().map(|v| (v.0.as_str(), &v.3)));
     Ok(ev
         .iter()
         .map(|e| {
@@ -622,10 +645,7 @@ pub(crate) fn named(db: &Connection, id: &str) -> Result<Vec<Named>> {
                 _ => {
                     let guessed = match label.and_then(|l| splits.get(l)) {
                         Some(cs) => e.voice.and_then(|v| best(v, cs, &sm)).map(|b| b.0),
-                        None => {
-                            let others = voices.iter().filter(|v| !own(e.line, v)).map(|v| &v.3);
-                            guess(label.and_then(label_name), e.voice, others, &m)
-                        }
+                        None => guess(label.and_then(label_name), e.voice, &pooled, &m),
                     };
                     match guessed {
                         Some(n) => (State::Guessed, Some(n.to_string())),
@@ -1148,6 +1168,21 @@ mod tests {
         threshold: 0.55,
         margin: 0.1,
     };
+
+    #[test]
+    fn a_name_counts_once_per_recording() {
+        let v = |r: &'static str, n: &str, e: &[f32]| (r, (n.to_string(), e.to_vec()));
+        // Max taught five lines in one meeting, one of them wrongly Eva's; Eva taught one.
+        let mut voices = vec![v("a", "Max", &[1.0, 0.0]); 4];
+        voices.push(v("a", "Max", &[0.0, 1.0]));
+        voices.push(v("b", "Eva", &[0.1, 1.0]));
+        let pooled = pool(voices.iter().map(|(r, v)| (*r, v)));
+        assert_eq!(pooled.len(), 2);
+        let all: Vec<_> = voices.iter().map(|v| v.1.clone()).collect();
+        assert_eq!(best(&[0.0, 1.0], &all, &M), None, "the wrong voice ties with Eva");
+        assert_eq!(best(&[0.0, 1.0], &pooled, &M).map(|b| b.0), Some("Eva"));
+        assert_eq!(best(&[1.0, 0.0], &pooled, &M).map(|b| b.0), Some("Max"));
+    }
 
     #[test]
     fn guesses_from_the_label_and_the_line_s_own_voice() {
