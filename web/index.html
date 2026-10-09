@@ -70,6 +70,8 @@
   .chip { font-size: .85em; border: 1px solid var(--line); border-radius: 999px; padding: 0 .65rem; line-height: 1.7; background: var(--surface); }
   .chip:hover { border-color: var(--accent); color: var(--accent); }
   .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--surface); font-style: normal; }
+  .every { display: block; margin-top: .5rem; font-size: .8em; color: var(--muted); cursor: pointer; }
+  .every input { accent-color: var(--accent); margin: 0 .2rem 0 0; vertical-align: -.1em; }
   .chip.new { width: 5.5rem; outline: none; }
   .chip.new:focus { border-color: var(--accent); }
   .chip.new::placeholder { color: var(--muted); }
@@ -131,6 +133,7 @@ let playingSeg = null;
 let follow = false;
 let cur = null;     // what the recording page draws from, see show()
 let pick = {};      // label -> the name chosen on its card, not saved yet
+let all = null;     // the track the card names every unconfirmed speaker of at once
 let menu = null;
 let focus = null;   // the line whose menu is open: {seg, card}
 let known = null;
@@ -275,13 +278,18 @@ function fail(err) { cur.err.textContent = err.message; }
 async function nameLine(seg, name) {
   const card = focus && same(focus.seg, seg) ? focus.card : null;
   closeMenu();
-  const clear = seg.line_name === name;
+  // Picking the name a line taught by naming its whole speaker again unconfirms that speaker.
+  const undo = seg.speaker && !seg.line_name && seg.state === "taught" && seg.name === name;
+  const clear = seg.line_name === name || undo;
   // In the transcript, naming a line of a speaker without a name names the whole speaker, so
   // all their lines fill in; the card's samples, or a speaker already named, get the line only.
   const whole = !card && seg.speaker && nameless(seg.speaker) && !seg.line_name && name !== "?";
   const id = encodeURIComponent(cur.id);
   try {
-    if (whole) {
+    if (undo) {
+      await put(`/recordings/${id}/speakers`, { [seg.speaker]: { name: "" } });
+      known = null;
+    } else if (whole) {
       await put(`/recordings/${id}/speakers`,
         { [seg.speaker]: { name, heard: [{ start_ms: seg.start_ms, end_ms: seg.end_ms, correct: true }] } });
       delete pick[seg.speaker];
@@ -331,6 +339,8 @@ function newName(done) {
   return input;
 }
 
+const taughtAs = seg => seg.line_name ?? (seg.state === "taught" ? seg.name : null);
+
 function openMenu(host, seg, card) {
   closeMenu();
   if (!cur.r.editable) return;
@@ -338,7 +348,7 @@ function openMenu(host, seg, card) {
   const input = newName(n => nameLine(seg, n));
   input.onchange = () => input.value.trim() && nameLine(seg, input.value.trim());
   menu = h("div", { className: "menu", onclick: e => e.stopPropagation() },
-    choices().map((c, k) => h("button", { className: "chip", ariaPressed: String(seg.line_name === c),
+    choices().map((c, k) => h("button", { className: "chip", ariaPressed: String(taughtAs(seg) === c),
       title: c === "?" ? "Mixed or unsure" : c, onclick: () => nameLine(seg, c) }, c, k < 9 ? h("kbd", {}, String(k + 1)) : null)),
     input);
   host.append(menu);
@@ -363,6 +373,8 @@ function drawAsk() {
   const own = segs.every(x => x.line_name) && new Set(segs.map(x => x.line_name));
   const group = pick[l] ?? (own && (own.size === 1 ? [...own][0] : "?"));
   const choose = n => { pick[l] = n; paint(); };
+  const track = l.split("/")[0];
+  const every = h("input", { type: "checkbox", checked: all === track, onchange: () => { all = every.checked ? track : null; } });
   const input = newName(choose);
   input.onchange = () => input.value.trim() && choose(input.value.trim());
   if (pick[l] && pick[l] !== "?" && !people().includes(pick[l])) input.value = pick[l];
@@ -380,9 +392,11 @@ function drawAsk() {
   });
   const ok = async () => {
     const heard = segs.filter(x => !x.line_name).map(x => ({ start_ms: x.start_ms, end_ms: x.end_ms, correct: true }));
+    const body = { [l]: group === "?" ? { name: "?" } : { name: group, heard } };
+    if (all === track)
+      for (const x of cur.labels) if (x !== l && x.startsWith(track + "/") && !cur.sp(x).name) body[x] = { name: group };
     try {
-      await put(`/recordings/${encodeURIComponent(cur.id)}/speakers`,
-        { [l]: group === "?" ? { name: "?" } : { name: group, heard } });
+      await put(`/recordings/${encodeURIComponent(cur.id)}/speakers`, body);
       delete pick[l];
       known = null;
       await show(cur.id);
@@ -392,7 +406,9 @@ function drawAsk() {
     h("h3", {}, "Who is this?", h("span", {}, queue.length > 1 ? `1 of ${queue.length}` : "")),
     h("ul", {}, rows.map(x => x.el)),
     h("div", { className: "answers" }, chips, input,
-      h("button", { className: "ok", title: "Save", disabled: !group, onclick: ok }, "✓")));
+      h("button", { className: "ok", title: "Save", disabled: !group, onclick: ok }, "✓")),
+    h("label", { className: "every", title: `Name every ${track} speaker not confirmed yet, e.g. in a one-on-one` },
+      every, ` all of ${track}`));
   return rows;
 }
 
@@ -438,6 +454,7 @@ async function show(id) {
     player.src = audio ? `/r/${encodeURIComponent(id)}/audio.ogg` : "";
     player.dataset.id = id;
     pick = {};
+    all = null;
   }
   bar.hidden = !audio;
   if (r.editable && !known) {

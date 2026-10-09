@@ -293,7 +293,8 @@ fn snippet(db: &Connection, id: &str, track: &str, start_ms: i64, end_ms: i64) -
 }
 
 /// Sets the line name of `id`'s line on `track` spanning `[start_ms, end_ms)`, replacing
-/// any line name it overlaps (either holds the other's midpoint) and its voice; None or `""`
+/// any line name it overlaps (either holds the other's midpoint) and the voice any line or heard
+/// snippet there taught; None or `""`
 /// clears it. A name other than `?` learns a voice (see `line_voice`), stored under the track
 /// as label; returns how many (none without a line voice once the turns expired).
 pub(crate) fn name_line(
@@ -304,22 +305,18 @@ pub(crate) fn name_line(
     end_ms: i64,
     name: Option<&str>,
 ) -> Result<usize> {
+    const OVERLAPS: &str = "((start_ms + end_ms) / 2 >= ?3 AND (start_ms + end_ms) / 2 < ?4
+        OR (?3 + ?4) / 2 >= start_ms AND (?3 + ?4) / 2 < end_ms)";
     let tx = db.unchecked_transaction()?;
-    let replaced: Vec<(i64, i64)> = tx
-        .prepare(
-            "DELETE FROM line_names WHERE recording = ?1 AND track = ?2
-             AND ((start_ms + end_ms) / 2 >= ?3 AND (start_ms + end_ms) / 2 < ?4
-                  OR (?3 + ?4) / 2 >= start_ms AND (?3 + ?4) / 2 < end_ms)
-             RETURNING start_ms, end_ms",
-        )?
-        .query_map(params![id, track, start_ms, end_ms], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for (s, e) in replaced {
-        tx.execute(
-            "DELETE FROM voices WHERE recording = ?1 AND label = ?2 AND start_ms = ?3 AND end_ms = ?4",
-            params![id, track, s, e],
-        )?;
-    }
+    tx.execute(
+        &format!("DELETE FROM line_names WHERE recording = ?1 AND track = ?2 AND {OVERLAPS}"),
+        params![id, track, start_ms, end_ms],
+    )?;
+    // Line names' voices are stored under the track, heard snippets' under their label.
+    tx.execute(
+        &format!("DELETE FROM voices WHERE recording = ?1 AND (label = ?2 OR label LIKE ?2 || '/%') AND {OVERLAPS}"),
+        params![id, track, start_ms, end_ms],
+    )?;
     let mut learned = 0;
     if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
         tx.execute(
@@ -1109,6 +1106,11 @@ mod tests {
         confirm(&db, "r1", named(&[("room/S1", "Max")])).unwrap();
         confirm(&db, "r1", named(&[("room/S1", "")])).unwrap();
         assert_eq!(voices(&db), [v("Jan", 4_000)]);
+        // A heard snippet named otherwise unlearns its voice.
+        confirm(&db, "r1", heard("Max", &[(0, 4_000, true)])).unwrap();
+        name_line(&db, "r1", "room", 0, 4_000, Some("Eva")).unwrap();
+        assert_eq!(voices(&db), [v("Jan", 4_000), v("Eva", 0)]);
+        name_line(&db, "r1", "room", 0, 4_000, None).unwrap();
         // Once the turns expired the name is still kept.
         db.execute("DELETE FROM turns", []).unwrap();
         assert!(!teachable(&db, "r1").unwrap());
