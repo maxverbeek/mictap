@@ -166,15 +166,15 @@ pub async fn write(app: &App, id: &str) -> Result<()> {
         [id],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    let segs = crate::names::named(&db, id)?;
-    let attendees = crate::names::attendees(&crate::names::confirmed(&db, id)?, &segs);
+    let library = crate::names::library(&db)?;
+    let r = crate::names::resolve(&crate::names::load(&db, id, &library)?, &crate::names::Rules::from_env());
     drop(db);
     let target = locate(&app.vault, id, cached.as_deref())?;
-    if segs.is_empty() || (target.is_none() && cached.is_some()) {
+    if r.lines.is_empty() || (target.is_none() && cached.is_some()) {
         return Ok(());
     }
     let start = Timestamp::from_millisecond(started_ms)?.to_zoned(app.tz.clone());
-    let content = render(id, &start.strftime("%Y-%m-%d %H:%M").to_string(), &segs, &attendees);
+    let content = render(id, &start.strftime("%Y-%m-%d %H:%M").to_string(), &r.lines, &r.attendees);
     let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
     let name = put(&app.vault, id, target.as_deref(), &base, &content)?;
     app.db
@@ -242,7 +242,7 @@ mod tests {
             seg("room", 3_726_000, "Hm.", None),
             seg("room", 3_727_000, "Ok.", Some("room/S2")),
         ];
-        let names: crate::names::Names = [("remote/S1", "Jan"), ("room/S1", "Max"), ("room/S2", "Max")]
+        let names: crate::names::Names = [("remote/S1", "Bob"), ("room/S1", "Max"), ("room/S2", "Max")]
             .map(|(l, n)| (l.to_string(), n.to_string()))
             .into();
         let lines: Vec<Named> = segs
@@ -261,10 +261,10 @@ mod tests {
         let attendees = crate::names::attendees(&names, &lines);
         assert_eq!(
             render("r1", "2026-09-24 14:00", &lines, &attendees),
-            "---\nid: r1\ndate: 2026-09-24 14:00\nattendees: [\"[[Max]]\", \"[[Jan]]\"]\n\
+            "---\nid: r1\ndate: 2026-09-24 14:00\nattendees: [\"[[Max]]\", \"[[Bob]]\"]\n\
              link: http://localhost:8765/#r1\n---\n\n\
              **Max** (room, [00:14:02](http://localhost:8765/r/r1/audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?\n\
-             **Jan** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
+             **Bob** (remote, [00:14:05](http://localhost:8765/r/r1/audio.ogg#t=845)): Hallo? Zijn jullie er nog?\n\
              **?** (room, [01:02:05](http://localhost:8765/r/r1/audio.ogg#t=3725)): Ja, prima.\n\
              **?** (room, [01:02:06](http://localhost:8765/r/r1/audio.ogg#t=3726)): Hm.\n\
              **Max** (room, [01:02:07](http://localhost:8765/r/r1/audio.ogg#t=3727)): Ok.\n"
@@ -306,8 +306,10 @@ mod tests {
             .lock()
             .await
             .execute_batch(
-                r#"INSERT INTO recordings (id, source, started_ms, status, speakers)
-                     VALUES ('r1', 'laptop', 1790431200000, 'diarized', '{"room/S1":"Max"}');
+                r#"INSERT INTO recordings (id, source, started_ms, status)
+                     VALUES ('r1', 'laptop', 1790431200000, 'diarized');
+                   INSERT INTO events (recording, at_ms, event)
+                     VALUES ('r1', 0, '{"kind":"confirmed","label":"room/S1","answer":"Max"}');
                    INSERT INTO windows (id, recording, file, track, offset_ms, start_ms, end_ms, done) VALUES
                      (1, 'r1', '00-mic.oga', 'room', 0, 0, 30000, 1),
                      (2, 'r1', '01-app-7.oga', 'remote', 60000, 0, 30000, 1);
@@ -342,23 +344,32 @@ mod tests {
         app.db
             .lock()
             .await
-            .execute(r#"UPDATE recordings SET speakers = '{"remote/S1":"Jan"}'"#, [])
+            .execute_batch(
+                r#"INSERT INTO events (recording, at_ms, event) VALUES
+                     ('r1', 0, '{"kind":"confirmed","label":"room/S1","answer":""}'),
+                     ('r1', 0, '{"kind":"confirmed","label":"remote/S1","answer":"Bob"}');"#,
+            )
             .unwrap();
         write(&app, "r1").await.unwrap();
         let text = std::fs::read_to_string(app.vault.join("Kickoff.md")).unwrap();
-        assert!(text.contains("attendees: [\"[[Jan]]\"]\n"), "{text}");
-        assert!(text.contains("**Jan** (remote, [00:01:01]"), "{text}");
+        assert!(text.contains("attendees: [\"[[Bob]]\"]\n"), "{text}");
+        assert!(text.contains("**Bob** (remote, [00:01:01]"), "{text}");
 
-        // A suggestion is written as a guess.
+        // A suggestion (room/S1 sounds like Alice, known from another recording) is written as
+        // a guess.
         app.db
             .lock()
             .await
-            .execute(r#"UPDATE recordings SET suggested = '{"room/S1":"Eva"}'"#, [])
+            .execute_batch(
+                "INSERT INTO recordings (id, source, status) VALUES ('old', 'laptop', 'done');
+                 INSERT INTO clusters (recording, label, embedding) VALUES ('r1', 'room/S1', x'0000803f');
+                 INSERT INTO voices (name, embedding, recording, label) VALUES ('Alice', x'0000803f', 'old', 'room/S1');",
+            )
             .unwrap();
         write(&app, "r1").await.unwrap();
         let text = std::fs::read_to_string(app.vault.join("Kickoff.md")).unwrap();
-        assert!(text.contains("attendees: [\"[[Jan]]\", \"[[Eva]]\"]\n"), "{text}");
-        assert!(text.contains("**Eva** (room, [00:00:01]"), "{text}");
+        assert!(text.contains("attendees: [\"[[Bob]]\", \"[[Alice]]\"]\n"), "{text}");
+        assert!(text.contains("**Alice** (room, [00:00:01]"), "{text}");
 
         // Moved out: left alone, not recreated.
         std::fs::remove_file(app.vault.join("Kickoff.md")).unwrap();

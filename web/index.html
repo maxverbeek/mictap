@@ -398,7 +398,7 @@ function drawAsk() {
     const heard = segs.filter(x => !x.line_name).map(x => ({ start_ms: x.start_ms, end_ms: x.end_ms, correct: true }));
     const body = { [l]: group === "?" ? { name: "?" } : { name: group, heard } };
     if (all === track)
-      for (const x of cur.labels) if (x !== l && x.startsWith(track + "/") && !cur.sp(x).name) body[x] = { name: group };
+      for (const x of cur.labels) if (x !== l && x.startsWith(track + "/") && !cur.sp(x).name) body[x] = { name: group, scope: "track" };
     try {
       await put(`/recordings/${encodeURIComponent(cur.id)}/speakers`, body);
       delete pick[l];

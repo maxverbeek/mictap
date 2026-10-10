@@ -45,8 +45,8 @@ Domain terms used across the code and docs.
   has at least five.
 - **Suggestion**: a name proposed for a cluster by matching it against every voice except the
   ones it taught itself (so other recordings, and other clusters and named lines of its own);
-  recomputed whenever a voice is learned; only when one name clearly wins, else the cluster stays unknown. Part of
-  name storage, not of assembly. Never learned; its lines show it as a guess, in the transcript too.
+  recomputed on every read; only when one name clearly wins, else the cluster stays unknown. Part of
+  name resolution, not of assembly. Never learned nor stored; its lines show it as a guess, in the transcript too.
 - **Confirmed name**: a name typed, or a suggestion accepted. Only confirmed names teach
   voices. A label can also be answered `?` (several people,
   or unsure): confirmed, so never asked or suggested again, but no name and no voice.
@@ -67,4 +67,19 @@ Domain terms used across the code and docs.
     agree. In a split cluster instead the centroid its line voice is clearly nearest to.
     Light on the page.
   - **Unknown**: neither, the two disagree (the ones to check), or a line name `?`. Shows `?`.
+- **Event**: one thing done to a recording's names: a label confirmed (with the snippets
+  heard, and whether its whole track was named at once), a line named or cleared, a line
+  seen, a rediarize. Appended to the recording's log in order and never edited: the only
+  truth about names. Voices are a cache of what the log teaches, rebuilt at startup.
+- **Known**: everything name resolution reads for one recording: its events, lines,
+  clusters, turns and line voices, plus the voices of every recording. Exported as JSON to
+  replay resolution on a real meeting.
+- **Seen line**: a guessed line played on the page under the name it showed, and not renamed.
+  An event, raw: what it is worth is decided at resolution, never stored as a voice. Nothing
+  weighs it yet.
+- **Name resolution**: folds a recording's log: teaches its voices (what a sample is, which
+  snippets count, the core or clean core) and derives line states, suggestions and
+  attendees from them and the other recordings' voices. Pure, like assembly; the thresholds
+  and the split and mixed rules live in it and nowhere else, and a change to them applies
+  to what was taught before.
 - **Transcript**: the note written to the vault; derived, never read back.

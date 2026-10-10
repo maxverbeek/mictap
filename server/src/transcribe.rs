@@ -229,8 +229,8 @@ mod tests {
 
     #[test]
     fn vocabulary_prompt() {
-        let v = "# Vocabulary\n\nAcme\n- homeserver\n  * Jan \n\n";
-        assert_eq!(prompt(v), "Acme, homeserver, Jan");
+        let v = "# Vocabulary\n\nAcme\n- homeserver\n  * Bob \n\n";
+        assert_eq!(prompt(v), "Acme, homeserver, Bob");
         assert_eq!(prompt(""), "");
     }
 

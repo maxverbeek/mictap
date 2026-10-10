@@ -42,7 +42,7 @@ pub struct Turn {
 }
 
 /// A segment, or part of one, attributed to a label (`room/S1`) once diarized.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Line {
     pub track: String,
     pub start_ms: i64,
@@ -76,7 +76,7 @@ pub struct Assembled {
     pub clusters: Vec<Cluster>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Cluster {
     pub label: String,
     pub mean: Vec<f32>,
@@ -92,9 +92,9 @@ pub struct Cluster {
 const MIXED_SHARE: f32 = 0.2;
 
 /// Whether a cluster's `halves` sound like two speakers (or a room): both carry real speech
-/// and they are less alike than clusters assembly would merge.
-pub fn mixed(halves: Option<(f32, f32)>, tuning: &Tuning) -> bool {
-    halves.is_some_and(|(alike, share)| share >= MIXED_SHARE && alike < tuning.merge_threshold)
+/// and they are less alike than `merge_threshold`, below which assembly would merge them.
+pub fn mixed(halves: Option<(f32, f32)>, merge_threshold: f32) -> bool {
+    halves.is_some_and(|(alike, share)| share >= MIXED_SHARE && alike < merge_threshold)
 }
 
 /// Per track, folds and merges sherpa's clusters into speakers and splits each segment into
@@ -918,7 +918,7 @@ mod tests {
             [1.0, 0.02],
         ]);
         let h = halves(&one.iter().collect::<Vec<_>>()).unwrap();
-        assert!(h.0 > 0.99 && !mixed(Some(h), &tuning), "{h:?}");
+        assert!(h.0 > 0.99 && !mixed(Some(h), tuning.merge_threshold), "{h:?}");
         // Two voices sherpa put in one cluster: two halves, half the speech each, 0.3 alike.
         let two = turns(&[
             [1.0, 0.0],
@@ -930,7 +930,7 @@ mod tests {
         ]);
         let h = halves(&two.iter().collect::<Vec<_>>()).unwrap();
         assert!(
-            h.0 < 0.5 && (h.1 - 0.5).abs() < 1e-6 && mixed(Some(h), &tuning),
+            h.0 < 0.5 && (h.1 - 0.5).abs() < 1e-6 && mixed(Some(h), tuning.merge_threshold),
             "{h:?}"
         );
         // One stray turn of someone else: an outlier, not a second speaker.
@@ -943,7 +943,7 @@ mod tests {
             [0.0, 1.0],
         ]);
         let h = halves(&stray.iter().collect::<Vec<_>>()).unwrap();
-        assert!(h.1 < 0.2 && !mixed(Some(h), &tuning), "{h:?}");
+        assert!(h.1 < 0.2 && !mixed(Some(h), tuning.merge_threshold), "{h:?}");
         assert_eq!(
             halves(&one[..3].iter().collect::<Vec<_>>()),
             None,

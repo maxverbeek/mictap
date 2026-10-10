@@ -295,11 +295,13 @@ async fn diarized(app: &App, id: &str) -> Result<()> {
             store_turns(&tx, id, track, turns)?;
         }
         derive(&tx, id)?;
-        crate::names::suggest(&tx, id, &crate::names::Matching::from_env())?;
         tx.commit()?;
     }
     line_voices(app, id, tracks.into_iter().map(|(t, (_, s))| (t, s)).collect()).await?;
-    app.db.lock().await.execute(
+    let db = app.db.lock().await;
+    // The structure its log teaches over changed: its voices anew.
+    crate::names::project(&db, id)?;
+    db.execute(
         "UPDATE recordings SET status = 'diarized', attempts = 0 WHERE id = ?1",
         [id],
     )?;

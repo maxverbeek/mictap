@@ -109,12 +109,12 @@ any other folder, once a recording is done (transcribed and diarized).
 ---
 id: 01J8X...
 date: 2026-09-24 14:00
-attendees: ["[[Max]]", "[[Jan]]", "[[Eva]]"]
+attendees: ["[[Max]]", "[[Bob]]", "[[Alice]]"]
 link: http://homeserver:8765/#01J8X...
 ---
 
 **Max** (room, [00:14:02](http://homeserver:8765/r/01J8X.../audio.ogg#t=842)): Zullen we zeggen dat het volgende sprint wordt?
-**Eva** (room, [00:14:05](http://homeserver:8765/r/01J8X.../audio.ogg#t=845)): Ja, prima.
+**Alice** (room, [00:14:05](http://homeserver:8765/r/01J8X.../audio.ogg#t=845)): Ja, prima.
 **?** (remote, [00:14:20](http://homeserver:8765/r/01J8X.../audio.ogg#t=860)): Hallo? Zijn jullie er nog?
 ```
 
@@ -132,6 +132,14 @@ link: http://homeserver:8765/#01J8X...
   keeps getting wrong (names, clients, jargon), one per line.
 
 ## Learning names
+
+Everything done to a recording's names is kept as a log of **events**: a label
+confirmed, with the samples heard and whether its whole track was named at
+once; a line named or cleared; a rediarize. Appended, never edited. The voices
+it teaches and the names shown are derived from it anew (the voices cached per
+recording and rebuilt at startup), so a change to the rules below applies to
+what was taught before. `GET /recordings/{id}/known` exports what resolution
+reads, to replay it offline.
 
 A name you type, or a suggestion you confirm, stores **voices**: embeddings of
 that speaker to recognize them by later. Lines you listened to before
@@ -154,9 +162,9 @@ diarized before line voices existed get them computed in the background, one
 at a time while nothing waits to be diarized, as long as their audio is kept
 (one log line each), and their transcript is rewritten.
 
-After diarizing a new recording, and in every recording whenever a voice is
-learned, each cluster's core is matched against all voices except the ones it
-taught itself (cosine, per name its most similar voice), and the
+On every read, each cluster's core is matched against all voices (its own
+recording's other clusters and named lines included; cosine, per name its most
+similar voice), and the
 best name is **suggested** only when it is at least `MICTAP_MATCH_THRESHOLD`
 (0.75) alike and more than `MICTAP_MATCH_MARGIN` (0.05) ahead of every other
 name. Otherwise the cluster stays unknown, as a guest should. No name is
@@ -213,10 +221,10 @@ finished recording's audio and state from the server, including the voices
 learned from its named speakers, leaving the transcript.
 `mictap rediarize <id>` runs sherpa and CAM++ on a finished recording again
 while its audio is kept (after a diarization change), and whisper too once its
-segments have expired: its turns, speaker names and their voices are dropped,
-the lines are derived anew and embedded again, names are pre-filled anew from
-other recordings, and the transcript is rewritten. Line names and their voices
-are kept.
+segments have expired: its turns and speaker names are dropped, the lines are
+derived anew and embedded again, its voices are taught anew from its line
+names (which are kept), names are pre-filled anew from other recordings, and
+the transcript is rewritten.
 
 ## Web page
 
@@ -279,15 +287,20 @@ Plain HTTP, tailnet only. No login, so cross-site browser requests (by
   "end_ms": 4000, "correct": true}]}}`. `name: ""` leaves the label unnamed
   and rejects its suggestion, `"?"` answers several people or unsure; `heard`
   (optional) lists the lines listened to, `correct` when only that speaker is
-  in it (see Learning names). Answers with the voices each label learned:
+  in it (see Learning names); `scope: "track"` (optional) marks a label named
+  along with every other unconfirmed one of its track. Answers with the voices
+  each label learned:
   `{"room/S1": {"voices": 2}}`.
 - `PUT /recordings/{id}/lines`: names one line,
-  `{"track": "room", "start_ms": 1000, "end_ms": 4000, "name": "Eva"}`
+  `{"track": "room", "start_ms": 1000, "end_ms": 4000, "name": "Alice"}`
   (`"?"` for mixed or unsure, `null` or `""` clears it), learns its voice and
   rewrites the transcript. 404 for an unknown recording, 409 until done.
   Answers `{"voices": 1}`, or 0 without a line voice once the turns expired.
 - `GET /recordings/{id}/outputs`: its model outputs per track (whisper
   segments, sherpa turns with their embeddings), until they expire.
+- `GET /recordings/{id}/known`: everything name resolution reads for it (its
+  events, lines, clusters, turns and line voices, and every recording's
+  voices), to replay resolution offline.
 - `DELETE /recordings/{id}`: audio and state of a finished recording (409
   while transcribing). The transcript stays.
 - `GET /r/{id}/audio.ogg`: mixdown.

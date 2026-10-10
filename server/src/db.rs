@@ -16,10 +16,6 @@ CREATE TABLE IF NOT EXISTS recordings (
     attempts INTEGER NOT NULL DEFAULT 0,
     -- Unix ms before which workers leave a failing recording alone.
     retry_at INTEGER NOT NULL DEFAULT 0,
-    -- Confirmed names (label -> name, JSON): typed, or suggestions accepted.
-    speakers TEXT,
-    -- Names suggested from known voices for unconfirmed labels (label -> name, JSON).
-    suggested TEXT,
     -- audio.ogg: NULL until mixed down, then 'ready', 'failed' or 'expired'.
     audio TEXT,
     -- Unix ms it became done; whisper's segments expire MICTAP_OUTPUTS_DAYS later.
@@ -89,8 +85,17 @@ CREATE TABLE IF NOT EXISTS clusters (
     minor_share REAL,
     PRIMARY KEY (recording, label)
 );
--- An embedding learned for a confirmed name: from the cluster (start_ms/end_ms NULL), or
--- from a snippet of it that was heard.
+-- What was done to a recording's names, in order, never changed (names::Event as JSON).
+-- The only truth about names: what they show and teach is derived from it.
+CREATE TABLE IF NOT EXISTS events (
+    seq INTEGER PRIMARY KEY,
+    recording TEXT NOT NULL REFERENCES recordings(id),
+    at_ms INTEGER NOT NULL,
+    event TEXT NOT NULL
+);
+-- A cache of names::teach per recording: the voices its events taught over its structure.
+-- label is the cluster label (start_ms/end_ms NULL for its core, set for a heard snippet)
+-- or the track (a named line); seq is the event that taught it. Rebuilt at startup.
 CREATE TABLE IF NOT EXISTS voices (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -98,16 +103,8 @@ CREATE TABLE IF NOT EXISTS voices (
     recording TEXT NOT NULL REFERENCES recordings(id),
     label TEXT NOT NULL,
     start_ms INTEGER,
-    end_ms INTEGER
-);
--- A name set for one line, kept by time since lines are derived anew; '?' when mixed or
--- unsure. A line takes the name whose span holds its midpoint on its track.
-CREATE TABLE IF NOT EXISTS line_names (
-    recording TEXT NOT NULL REFERENCES recordings(id),
-    track TEXT NOT NULL,
-    start_ms INTEGER NOT NULL,
-    end_ms INTEGER NOT NULL,
-    name TEXT NOT NULL
+    end_ms INTEGER,
+    seq INTEGER
 );
 -- CAM++'s embedding of one line's own audio (L2-normalized f32 little-endian), kept by time
 -- like line_names. Not a model output: kept to guess names anew as voices are learned.
@@ -120,7 +117,7 @@ CREATE TABLE IF NOT EXISTS line_voices (
 );
 ";
 
-pub fn open(path: &Path) -> rusqlite::Result<Connection> {
+pub fn open(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
     if conn.prepare("SELECT retry_at FROM recordings").is_err() {
@@ -154,8 +151,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         )?;
         tx.commit()?;
     }
-    if conn.prepare("SELECT suggested FROM recordings").is_err() {
-        conn.execute_batch("ALTER TABLE recordings ADD COLUMN suggested TEXT")?;
+    if conn.prepare("SELECT seq FROM voices").is_err() {
+        conn.execute_batch("ALTER TABLE voices ADD COLUMN seq INTEGER")?;
     }
     if conn.prepare("SELECT done_ms FROM recordings").is_err() {
         conn.execute_batch("ALTER TABLE recordings ADD COLUMN done_ms INTEGER")?;
@@ -164,7 +161,101 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if conn.prepare("SELECT speaker FROM segments").is_ok() {
         lines_from_labeled_segments(&conn)?;
     }
+    if conn.prepare("SELECT speakers FROM recordings").is_ok() {
+        events_from_names(&conn)?;
+    }
     Ok(conn)
+}
+
+/// Before the log, names were kept as their effects: `recordings.speakers`, `line_names` and
+/// the voices they taught. Writes the log they imply (per speaker one Confirmed, its heard
+/// snippets the spanned voices under its label; then one LineNamed per line name) and
+/// projects it, logging each recording whose voices came out different.
+/// ponytail: lossy; wrong verdicts and the order of naming were never kept.
+fn events_from_names(conn: &Connection) -> anyhow::Result<()> {
+    use crate::names::{Answer, Event, Heard, Scope, Span};
+    let tx = conn.unchecked_transaction()?;
+    let rows: Vec<(String, Option<String>)> = tx
+        .prepare("SELECT id, speakers FROM recordings ORDER BY id")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let count = |id: &str| -> rusqlite::Result<i64> {
+        conn.query_row("SELECT COUNT(*) FROM voices WHERE recording = ?1", [id], |r| r.get(0))
+    };
+    let before: Vec<i64> = rows.iter().map(|(id, _)| count(id)).collect::<rusqlite::Result<_>>()?;
+    let at_ms = now_ms();
+    for (id, speakers) in &rows {
+        let names: crate::names::Names = speakers.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        let mut events = vec![];
+        for (label, name) in &names {
+            let spans: Vec<(i64, i64)> = tx
+                .prepare(
+                    "SELECT start_ms, end_ms FROM voices
+                     WHERE recording = ?1 AND label = ?2 AND start_ms IS NOT NULL ORDER BY id",
+                )?
+                .query_map(params![id, label], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let any: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM voices WHERE recording = ?1 AND label = ?2)",
+                params![id, label],
+                |r| r.get(0),
+            )?;
+            let heard = if spans.is_empty() && !any && name != "?" {
+                // Confirmed yet voiceless: every snippet heard was wrong, or the cluster is
+                // mixed. A wrong snippet keeps its core untaught either way.
+                vec![Heard {
+                    start_ms: 0,
+                    end_ms: 0,
+                    correct: false,
+                }]
+            } else {
+                spans
+                    .into_iter()
+                    .map(|(start_ms, end_ms)| Heard {
+                        start_ms,
+                        end_ms,
+                        correct: true,
+                    })
+                    .collect()
+            };
+            events.push(Event::Confirmed {
+                label: label.clone(),
+                answer: Answer::parse(Some(name)),
+                heard,
+                scope: Scope::Label,
+            });
+        }
+        let line_names: Vec<(String, i64, i64, String)> = tx
+            .prepare("SELECT track, start_ms, end_ms, name FROM line_names WHERE recording = ?1 ORDER BY rowid")?
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (track, start_ms, end_ms, name) in line_names {
+            events.push(Event::LineNamed {
+                track,
+                span: Span { start_ms, end_ms },
+                answer: Answer::parse(Some(&name)),
+            });
+        }
+        for e in &events {
+            tx.execute(
+                "INSERT INTO events (recording, at_ms, event) VALUES (?1, ?2, ?3)",
+                params![id, at_ms, serde_json::to_string(e)?],
+            )?;
+        }
+    }
+    tx.execute_batch("DROP TABLE line_names; ALTER TABLE recordings DROP COLUMN speakers;")?;
+    if tx.prepare("SELECT suggested FROM recordings").is_ok() {
+        tx.execute_batch("ALTER TABLE recordings DROP COLUMN suggested")?;
+    }
+    tx.commit()?;
+    for ((id, _), was) in rows.iter().zip(before) {
+        crate::names::project(conn, id)?;
+        let now = count(id)?;
+        if now != was {
+            eprintln!("{id}: {was} voices before the log, {now} from it");
+        }
+    }
+    Ok(())
 }
 
 /// Before model outputs were kept, diarization split and labeled the segments in place:
@@ -373,6 +464,61 @@ mod tests {
         )
         .unwrap();
         assert!(conn.prepare("SELECT core FROM clusters").is_ok());
+        super::open(&path).unwrap();
+    }
+
+    #[test]
+    fn writes_the_log_an_old_db_s_names_imply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("old.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE recordings (id TEXT PRIMARY KEY, source TEXT NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'receiving', speakers TEXT, suggested TEXT);
+                 INSERT INTO recordings (id, source, status, speakers, suggested) VALUES
+                   ('r1', 'laptop', 'done', '{\"room/S1\":\"Max\",\"room/S2\":\"Carol\",\"room/S3\":\"?\"}', '{\"room/S4\":\"Alice\"}'),
+                   ('r2', 'laptop', 'done', NULL, NULL);
+                 CREATE TABLE clusters (recording TEXT NOT NULL, label TEXT NOT NULL,
+                   embedding BLOB NOT NULL, PRIMARY KEY (recording, label));
+                 INSERT INTO clusters VALUES ('r1', 'room/S1', x'0000803f00000000'), ('r1', 'room/S2', x'000000000000803f');
+                 CREATE TABLE voices (id INTEGER PRIMARY KEY, name TEXT NOT NULL, embedding BLOB NOT NULL,
+                   recording TEXT NOT NULL, label TEXT NOT NULL, start_ms INTEGER, end_ms INTEGER);
+                 INSERT INTO voices (name, embedding, recording, label, start_ms, end_ms) VALUES
+                   ('Max', x'0000803f00000000', 'r1', 'room/S1', NULL, NULL),
+                   ('Bob', x'000000000000803f', 'r1', 'room', 2000, 4000);
+                 CREATE TABLE line_names (recording TEXT NOT NULL, track TEXT NOT NULL,
+                   start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, name TEXT NOT NULL);
+                 INSERT INTO line_names VALUES ('r1', 'room', 2000, 4000, 'Bob');
+                 CREATE TABLE line_voices (recording TEXT NOT NULL, track TEXT NOT NULL,
+                   start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, embedding BLOB NOT NULL);
+                 INSERT INTO line_voices VALUES ('r1', 'room', 2000, 4000, x'000000000000803f');",
+            )
+            .unwrap();
+        let conn = super::open(&path).unwrap();
+        let events: Vec<String> = conn
+            .prepare("SELECT recording || ' ' || event FROM events ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            events,
+            [
+                r#"r1 {"kind":"confirmed","label":"room/S1","answer":"Max","heard":[],"scope":"label"}"#,
+                // Confirmed without a voice: taught nothing then, teaches nothing now.
+                r#"r1 {"kind":"confirmed","label":"room/S2","answer":"Carol","heard":[{"start_ms":0,"end_ms":0,"correct":false}],"scope":"label"}"#,
+                r#"r1 {"kind":"confirmed","label":"room/S3","answer":"?","heard":[],"scope":"label"}"#,
+                r#"r1 {"kind":"line_named","track":"room","span":{"start_ms":2000,"end_ms":4000},"answer":"Bob"}"#,
+            ]
+        );
+        let voices: String = conn
+            .query_row("SELECT group_concat(name || '/' || label || '/' || seq) FROM voices ORDER BY id", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(voices, "Max/room/S1/1,Bob/room/4");
+        assert!(conn.prepare("SELECT speakers FROM recordings").is_err());
+        assert!(conn.prepare("SELECT 1 FROM line_names").is_err());
         super::open(&path).unwrap();
     }
 
