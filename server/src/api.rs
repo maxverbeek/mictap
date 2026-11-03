@@ -958,7 +958,11 @@ mod tests {
         drop(db);
         let (_, b) = send(&app, "GET", "/recordings/r1", b"").await;
         let r: Value = serde_json::from_slice(&b).unwrap();
-        assert_eq!(r["speakers"]["room/S1"]["name"], Value::Null, "the label's name is gone");
+        assert_eq!(
+            r["speakers"]["room/S1"]["name"],
+            Value::Null,
+            "the label's name is gone"
+        );
         assert_eq!(r["lines"][0]["line_name"], "Alice", "the line's stays");
     }
 
@@ -1081,7 +1085,10 @@ mod tests {
             .iter()
             .map(|l| (&l["name"], &l["line_name"]))
             .collect();
-        assert_eq!(names, [(&json!("Max"), &Value::Null), (&json!("Alice"), &json!("Alice"))]);
+        assert_eq!(
+            names,
+            [(&json!("Max"), &Value::Null), (&json!("Alice"), &json!("Alice"))]
+        );
         let states: Vec<&Value> = r["lines"].as_array().unwrap().iter().map(|l| &l["state"]).collect();
         assert_eq!(states, [&json!("guessed"), &json!("taught")]);
         assert_eq!(r["counts"], json!({"taught": 1, "guessed": 1, "unknown": 0}));
@@ -1089,7 +1096,10 @@ mod tests {
         let (_, b) = send(&app, "GET", "/recordings", b"").await;
         let list: Value = serde_json::from_slice(&b).unwrap();
         let r1 = list.as_array().unwrap().iter().find(|r| r["id"] == "r1").unwrap();
-        assert_eq!((&r1["attendees"], &r1["unnamed"]), (&json!(["Max", "Alice"]), &json!(0)));
+        assert_eq!(
+            (&r1["attendees"], &r1["unnamed"]),
+            (&json!(["Max", "Alice"]), &json!(0))
+        );
         let note = std::fs::read_dir(&app.vault).unwrap().next().unwrap().unwrap().path();
         let text = std::fs::read_to_string(note).unwrap();
         assert!(text.contains("attendees: [\"[[Max]]\", \"[[Alice]]\"]\n"), "{text}");

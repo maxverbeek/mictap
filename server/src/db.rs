@@ -185,7 +185,11 @@ fn events_from_names(conn: &Connection) -> anyhow::Result<()> {
     let before: Vec<i64> = rows.iter().map(|(id, _)| count(id)).collect::<rusqlite::Result<_>>()?;
     let at_ms = now_ms();
     for (id, speakers) in &rows {
-        let names: crate::names::Names = speakers.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        let names: crate::names::Names = speakers
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default();
         let mut events = vec![];
         for (label, name) in &names {
             let spans: Vec<(i64, i64)> = tx
@@ -514,7 +518,11 @@ mod tests {
             ]
         );
         let voices: String = conn
-            .query_row("SELECT group_concat(name || '/' || label || '/' || seq) FROM voices ORDER BY id", [], |r| r.get(0))
+            .query_row(
+                "SELECT group_concat(name || '/' || label || '/' || seq) FROM voices ORDER BY id",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(voices, "Max/room/S1/1,Bob/room/4");
         assert!(conn.prepare("SELECT speakers FROM recordings").is_err());

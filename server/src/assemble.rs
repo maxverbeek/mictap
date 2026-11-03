@@ -464,7 +464,13 @@ fn core(turns: &[&Turn], mean: &[f32]) -> Option<Vec<f32>> {
 
 /// The core of `turns` taken as one cluster.
 pub(crate) fn core_of(turns: &[&Turn]) -> Option<Vec<f32>> {
-    let one: Vec<Turn> = turns.iter().map(|t| Turn { speaker: 0, ..(*t).clone() }).collect();
+    let one: Vec<Turn> = turns
+        .iter()
+        .map(|t| Turn {
+            speaker: 0,
+            ..(*t).clone()
+        })
+        .collect();
     core(turns, &means(&one).into_iter().next().flatten()?)
 }
 

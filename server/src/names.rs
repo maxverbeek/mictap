@@ -198,7 +198,8 @@ impl Source {
 
     /// Whether this voice was taught from the line on `track` with midpoint `ms`.
     fn at(&self, track: &str, ms: i64) -> bool {
-        self.span().is_some_and(|s| self::track(self.label()) == track && s.holds(ms))
+        self.span()
+            .is_some_and(|s| self::track(self.label()) == track && s.holds(ms))
     }
 }
 
@@ -325,7 +326,14 @@ fn fold(events: &[Logged]) -> Folded<'_> {
                         voided: false,
                     })
                     .collect();
-                f.labels.insert(label, Confirm { answer, heard, from: l.seq });
+                f.labels.insert(
+                    label,
+                    Confirm {
+                        answer,
+                        heard,
+                        from: l.seq,
+                    },
+                );
             }
             Event::LineNamed { track, span, answer } => {
                 for (_, c) in f.labels.iter_mut().filter(|(l, _)| self::track(l) == track) {
@@ -368,7 +376,11 @@ fn mixed_labels<'a>(s: &'a Structure, rules: &Rules) -> HashSet<&'a str> {
 /// A line's own voice: its line voice (by midpoint), else the normalized mean of the turns
 /// under it weighted by overlap; None without either.
 fn sample(s: &Structure, track: &str, span: Span) -> Option<Vec<f32>> {
-    if let Some((_, _, v)) = s.line_voices.iter().find(|(t, ls, _)| t == track && ls.holds(span.mid())) {
+    if let Some((_, _, v)) = s
+        .line_voices
+        .iter()
+        .find(|(t, ls, _)| t == track && ls.holds(span.mid()))
+    {
         return Some(v.clone());
     }
     let mut sum: Option<Vec<f32>> = None;
@@ -393,7 +405,13 @@ fn sample(s: &Structure, track: &str, span: Span) -> Option<Vec<f32>> {
 /// The core of `label`'s turns but those holding one of its lines named other than `name`
 /// (`?` included): what the cluster teaches once naming lines showed it holds other people
 /// too. None when no turn is left out, or none is kept.
-fn clean_core(label: &str, name: &str, lines: &[Line], names: &[LineName], turns: &[(String, Turn)]) -> Option<Vec<f32>> {
+fn clean_core(
+    label: &str,
+    name: &str,
+    lines: &[Line],
+    names: &[LineName],
+    turns: &[(String, Turn)],
+) -> Option<Vec<f32>> {
     let mut left_out = false;
     let kept: Vec<&Turn> = turns
         .iter()
@@ -436,7 +454,9 @@ pub(crate) fn teach(id: &str, events: &[Logged], s: &Structure, rules: &Rules) -
         if !c.heard.is_empty() {
             let mut sampled = false;
             for h in c.heard.iter().filter(|h| h.correct) {
-                let Some(v) = sample(s, track(label), h.span) else { continue };
+                let Some(v) = sample(s, track(label), h.span) else {
+                    continue;
+                };
                 sampled = true;
                 if !h.voided {
                     let source = Source::Heard {
@@ -453,11 +473,20 @@ pub(crate) fn teach(id: &str, events: &[Logged], s: &Structure, rules: &Rules) -
         if mixed.contains(label) {
             continue;
         }
-        let Some(cluster) = s.clusters.iter().find(|c| c.label == *label) else { continue };
+        let Some(cluster) = s.clusters.iter().find(|c| c.label == *label) else {
+            continue;
+        };
         let emb = clean_core(label, name, &s.lines, &f.line_names, &s.turns)
             .or_else(|| cluster.core.clone())
             .unwrap_or_else(|| cluster.mean.clone());
-        out.push(voice(name, c.from, Source::Core { label: label.to_string() }, emb));
+        out.push(voice(
+            name,
+            c.from,
+            Source::Core {
+                label: label.to_string(),
+            },
+            emb,
+        ));
     }
     for n in &f.line_names {
         if n.name == "?" {
@@ -719,7 +748,9 @@ pub(crate) fn resolve(k: &Known, rules: &Rules) -> Resolved {
             Evidence {
                 line,
                 line_name,
-                taught: line_name.filter(|n| *n != "?").or(heard.filter(|_| line_name.is_none())),
+                taught: line_name
+                    .filter(|n| *n != "?")
+                    .or(heard.filter(|_| line_name.is_none())),
                 voice: s
                     .line_voices
                     .iter()
@@ -809,7 +840,9 @@ pub(crate) fn attendees(names: &Names, lines: &[Named]) -> Vec<String> {
 /// Every recording's cached voices.
 pub(crate) fn library(db: &Connection) -> Result<Vec<Voice>> {
     Ok(db
-        .prepare("SELECT recording, name, COALESCE(seq, 0), label, start_ms, end_ms, embedding FROM voices ORDER BY id")?
+        .prepare(
+            "SELECT recording, name, COALESCE(seq, 0), label, start_ms, end_ms, embedding FROM voices ORDER BY id",
+        )?
         .query_map([], |r| {
             let label: String = r.get(3)?;
             let span = r.get::<_, Option<i64>>(4)?.zip(r.get::<_, Option<i64>>(5)?);
@@ -837,7 +870,9 @@ pub(crate) fn library(db: &Connection) -> Result<Vec<Voice>> {
 
 fn events(db: &Connection, id: &str) -> Result<Vec<Logged>> {
     db.prepare("SELECT seq, at_ms, event FROM events WHERE recording = ?1 ORDER BY seq")?
-        .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))?
+        .query_map([id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        })?
         .map(|r| {
             let (seq, at_ms, json) = r?;
             // A variant this build cannot read is an error, never skipped: evidence is not
@@ -1151,17 +1186,26 @@ mod tests {
             scope: Scope::Track,
         };
         let json = serde_json::to_string(&e).unwrap();
-        assert_eq!(json, r#"{"kind":"confirmed","label":"room/S1","answer":"?","heard":[],"scope":"track"}"#);
+        assert_eq!(
+            json,
+            r#"{"kind":"confirmed","label":"room/S1","answer":"?","heard":[],"scope":"track"}"#
+        );
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), e);
         // Old events without the fields added since still read.
         let old: Event = serde_json::from_str(r#"{"kind":"confirmed","label":"room/S1","answer":""}"#).unwrap();
         assert_eq!(old, confirm("room/S1", ""));
-        assert_eq!(serde_json::to_string(&Event::Rediarized).unwrap(), r#"{"kind":"rediarized"}"#);
+        assert_eq!(
+            serde_json::to_string(&Event::Rediarized).unwrap(),
+            r#"{"kind":"rediarized"}"#
+        );
     }
 
     #[test]
     fn suggests_from_the_library_and_the_recording_s_own_named_lines() {
-        let clusters = vec![cluster("room/S1", &[1.0, 0.0, 0.0]), cluster("room/S2", &[0.0, 1.0, 0.0])];
+        let clusters = vec![
+            cluster("room/S1", &[1.0, 0.0, 0.0]),
+            cluster("room/S2", &[0.0, 1.0, 0.0]),
+        ];
         let s = Structure {
             lines: lines_of(&clusters),
             clusters,
@@ -1177,8 +1221,14 @@ mod tests {
         };
         let library = [lib("Alice", "remote/S1", &[0.0, 1.0, 0.0]), stale];
         let s = Structure {
-            lines: lines_of(&[cluster("room/S1", &[1.0, 0.0, 0.0]), cluster("room/S2", &[0.0, 1.0, 0.0])]),
-            clusters: vec![cluster("room/S1", &[1.0, 0.0, 0.0]), cluster("room/S2", &[0.0, 1.0, 0.0])],
+            lines: lines_of(&[
+                cluster("room/S1", &[1.0, 0.0, 0.0]),
+                cluster("room/S2", &[0.0, 1.0, 0.0]),
+            ]),
+            clusters: vec![
+                cluster("room/S1", &[1.0, 0.0, 0.0]),
+                cluster("room/S2", &[0.0, 1.0, 0.0]),
+            ],
             line_voices: vec![lv(0, 1_000, &[1.0, 0.0, 0.0])],
             ..Default::default()
         };
@@ -1198,11 +1248,11 @@ mod tests {
         ];
         let mut clusters = vec![
             cluster("room/S1", &[0.9, 0.1, 0.0]),
-            cluster("room/S2", &[0.99, 0.0, 0.1]),  // Max too, more alike: gets it
-            cluster("room/S3", &[0.0, 0.2, 1.0]),   // Bob: confirmed on the remote track only
+            cluster("room/S2", &[0.99, 0.0, 0.1]),   // Max too, more alike: gets it
+            cluster("room/S3", &[0.0, 0.2, 1.0]),    // Bob: confirmed on the remote track only
             cluster("remote/S1", &[1.0, 0.05, 0.0]), // Max on another track: fine
-            cluster("remote/S2", &[0.0, 0.0, 1.0]), // Bob, confirmed for remote/S3
-            cluster("remote/S4", &[0.0, 1.0, 0.0]), // Alice, but mixed
+            cluster("remote/S2", &[0.0, 0.0, 1.0]),  // Bob, confirmed for remote/S3
+            cluster("remote/S4", &[0.0, 1.0, 0.0]),  // Alice, but mixed
         ];
         clusters[5].halves = Some((0.2, 0.5));
         let s = Structure {
@@ -1279,7 +1329,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(learned(&teach(&[confirm("room/S1", "Max")], &s)), [(None, vec![0.99, 0.1])]);
+        assert_eq!(
+            learned(&teach(&[confirm("room/S1", "Max")], &s)),
+            [(None, vec![0.99, 0.1])]
+        );
     }
 
     #[test]
@@ -1401,8 +1454,15 @@ mod tests {
         events.push(name_line(2_500, 4_800, Some("Carol")));
         events.push(name_line(4_800, 6_200, None));
         let r = resolve(&known(&events, s, &[]), &R);
-        assert_eq!(shown(&r), [(Some("Max"), Guessed), (Some("Carol"), Taught), (None, Unknown)]);
-        assert_eq!(fold(&log(&events)).line_names.len(), 2, "Carol, and Bob on the remote track");
+        assert_eq!(
+            shown(&r),
+            [(Some("Max"), Guessed), (Some("Carol"), Taught), (None, Unknown)]
+        );
+        assert_eq!(
+            fold(&log(&events)).line_names.len(),
+            2,
+            "Carol, and Bob on the remote track"
+        );
         assert_eq!(r.attendees, ["Max", "Carol"]);
     }
 
@@ -1424,7 +1484,13 @@ mod tests {
         let voices = |events: &[Event], s: &Structure| -> Vec<(String, String, i64)> {
             teach(events, s)
                 .iter()
-                .map(|v| (v.name.clone(), v.source.label().to_string(), v.source.span().unwrap().start_ms))
+                .map(|v| {
+                    (
+                        v.name.clone(),
+                        v.source.label().to_string(),
+                        v.source.span().unwrap().start_ms,
+                    )
+                })
                 .collect()
         };
         // How many voices the last event taught: what the API answers.
@@ -1508,13 +1574,20 @@ mod tests {
 
     #[test]
     fn guesses_from_the_label_and_the_line_s_own_voice() {
-        let voices = [("Max".to_string(), vec![1.0, 0.0]), ("Alice".to_string(), vec![0.0, 1.0])];
+        let voices = [
+            ("Max".to_string(), vec![1.0, 0.0]),
+            ("Alice".to_string(), vec![0.0, 1.0]),
+        ];
         let max = Some(&[0.9, 0.1][..]);
         let unclear = Some(&[0.7, 0.7][..]);
         assert_eq!(guess(None, max, &voices, &L), Some("Max"), "own alone");
         assert_eq!(guess(Some("Max"), max, &voices, &L), Some("Max"), "both agree");
         assert_eq!(guess(Some("Alice"), max, &voices, &L), None, "they disagree");
-        assert_eq!(guess(Some("Alice"), unclear, &voices, &L), Some("Alice"), "own not sure");
+        assert_eq!(
+            guess(Some("Alice"), unclear, &voices, &L),
+            Some("Alice"),
+            "own not sure"
+        );
         assert_eq!(guess(Some("Alice"), None, &voices, &L), Some("Alice"), "no line voice");
         assert_eq!(guess(None, unclear, &voices, &L), None);
         assert_eq!(guess(None, None, &voices, &L), None);
@@ -1523,7 +1596,10 @@ mod tests {
 
     #[test]
     fn a_line_is_taught_guessed_or_unknown() {
-        let mut library = vec![lib("Max", "room/S1", &[1.0, 0.0, 0.0]), lib("Alice", "room/S2", &[0.0, 1.0, 0.0])];
+        let mut library = vec![
+            lib("Max", "room/S1", &[1.0, 0.0, 0.0]),
+            lib("Alice", "room/S2", &[0.0, 1.0, 0.0]),
+        ];
         let clusters = || {
             vec![
                 cluster("room/S1", &[1.0, 0.0, 0.0]),
@@ -1581,7 +1657,10 @@ mod tests {
         );
         // Heard before its label was confirmed: taught, whatever its own voice says.
         events.push(heard("room/S1", "Max", &[(1_000, 2_000, true)]));
-        assert_eq!(shown(&resolve(&known(&events, s(), &library), &R))[1], (Some("Max"), Taught));
+        assert_eq!(
+            shown(&resolve(&known(&events, s(), &library), &R))[1],
+            (Some("Max"), Taught)
+        );
         // Guessed anew on every read: a voice learned later that the line's own voice matches
         // better than its label's name makes it one to check.
         library.push(lib("Bob", "remote/S9", &[0.6, 0.6, 0.5]));
@@ -1650,7 +1729,10 @@ mod tests {
         };
         let states = |events: &[Event]| -> Vec<(Option<String>, State)> {
             let r = resolve(&known(events, s(), &[]), &R);
-            shown(&r)[4..].iter().map(|(n, st)| (n.map(String::from), *st)).collect()
+            shown(&r)[4..]
+                .iter()
+                .map(|(n, st)| (n.map(String::from), *st))
+                .collect()
         };
         let st = |n: Option<&str>, state| (n.map(String::from), state);
         // Erin taught twice: lines sounding like him only disagree with the label.
@@ -1747,7 +1829,16 @@ mod tests {
         };
         assert_eq!(
             got,
-            [("Max", &Source::Core { label: "room/S1".into() }, 1), ("Alice", &eva, 2)]
+            [
+                (
+                    "Max",
+                    &Source::Core {
+                        label: "room/S1".into()
+                    },
+                    1
+                ),
+                ("Alice", &eva, 2)
+            ]
         );
         let k = load(&db, "r1", &library).unwrap();
         let logged: Vec<&Event> = k.events.iter().map(|l| &l.event).collect();

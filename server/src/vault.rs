@@ -167,14 +167,22 @@ pub async fn write(app: &App, id: &str) -> Result<()> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let library = crate::names::library(&db)?;
-    let r = crate::names::resolve(&crate::names::load(&db, id, &library)?, &crate::names::Rules::from_env());
+    let r = crate::names::resolve(
+        &crate::names::load(&db, id, &library)?,
+        &crate::names::Rules::from_env(),
+    );
     drop(db);
     let target = locate(&app.vault, id, cached.as_deref())?;
     if r.lines.is_empty() || (target.is_none() && cached.is_some()) {
         return Ok(());
     }
     let start = Timestamp::from_millisecond(started_ms)?.to_zoned(app.tz.clone());
-    let content = render(id, &start.strftime("%Y-%m-%d %H:%M").to_string(), &r.lines, &r.attendees);
+    let content = render(
+        id,
+        &start.strftime("%Y-%m-%d %H:%M").to_string(),
+        &r.lines,
+        &r.attendees,
+    );
     let base = start.strftime("%Y-%m-%d %H%M Meeting").to_string();
     let name = put(&app.vault, id, target.as_deref(), &base, &content)?;
     app.db
