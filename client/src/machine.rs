@@ -122,7 +122,12 @@ impl Machine {
             })
             .into_iter()
             .collect();
-        if let Some(target) = meeting.as_ref().filter(|_| settled).and_then(|m| g.sink(m)) {
+        let sink = match &meeting {
+            Some(m) => settled.then(|| g.sink(m)).flatten(),
+            None if s.mode == Mode::Manual => g.default_sink.clone(),
+            None => None,
+        };
+        if let Some(target) = sink {
             tracks.push(Track {
                 key: "app-monitor".into(),
                 target,
@@ -146,6 +151,7 @@ mod tests {
             description: String::new(),
             app: app.into(),
             binary: app.to_lowercase(),
+            serial: id.into(),
         }
     }
 
@@ -234,10 +240,14 @@ mod tests {
     fn manual_starts_at_once_and_never_times_out() {
         let (mut m, t0) = (Machine::default(), Instant::now());
         m.start(None);
-        assert_eq!(keys(m.tick(&quiet(), t0)), ["mic=mic1"]);
+        assert_eq!(keys(m.tick(&quiet(), t0)), ["mic=mic1", "app-monitor=speaker"]);
         assert_eq!(m.mode(), Some(Mode::Manual));
         m.start(Some("headset".into()));
-        assert_eq!(keys(m.tick(&meeting("mic1"), t0)), ["mic=headset"]);
+        assert_eq!(
+            keys(m.tick(&meeting("mic1"), t0)),
+            ["mic=headset"],
+            "a meeting's sink waits to settle"
+        );
         assert_eq!(
             keys(m.tick(&meeting("mic1"), t0 + SETTLE)),
             ["mic=headset", "app-monitor=speaker"]

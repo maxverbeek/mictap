@@ -266,6 +266,7 @@ mod tests {
             description: description.into(),
             app: String::new(),
             binary: String::new(),
+            serial: 0,
         };
         let g = Graph {
             nodes: vec![node("mic1", "Digital Microphone"), node("speaker", "Speaker")],

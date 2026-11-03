@@ -3,7 +3,7 @@ use serde_json::Value;
 
 /// Matched case-insensitively against application.name and .process.binary.
 /// MICTAP_ALLOWLIST (comma-separated) replaces it.
-const ALLOWLIST: &str = "zen,chromium,chrome,zoom,slack";
+const ALLOWLIST: &str = "zen,firefox,chromium,chrome,zoom,slack";
 
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -13,6 +13,8 @@ pub struct Node {
     pub description: String,
     pub app: String,
     pub binary: String,
+    /// object.serial: unlike ids, never reused, so a higher one is a newer node.
+    pub serial: u64,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +58,7 @@ pub fn parse(json: &str) -> Result<Graph> {
                     description: s(&p["node.description"]),
                     app: s(&p["application.name"]),
                     binary: s(&p["application.process.binary"]),
+                    serial: p["object.serial"].as_u64().unwrap_or(0),
                 });
             }
             Some("PipeWire:Interface:Link") => {
@@ -91,7 +94,8 @@ impl Graph {
         let n = self
             .nodes
             .iter()
-            .find(|n| n.class == "Stream/Input/Audio" && allowed(n))?;
+            .filter(|n| n.class == "Stream/Input/Audio" && allowed(n))
+            .max_by_key(|n| n.serial)?;
         let source = self
             .links
             .iter()
@@ -106,7 +110,8 @@ impl Graph {
         })
     }
 
-    /// node.name of the sink the app plays to, else the default sink. Its monitor is
+    /// node.name of the sink the app's newest stream plays to, else the default sink. Switching
+    /// speakers inside Meet opens a new stream and may leave the old one linked. Its monitor is
     /// recorded rather than the app's own streams: linking a recorder to a pipewire-pulse
     /// stream while it renegotiates fails its format and stalls the app's audio.
     pub fn sink(&self, m: &Meeting) -> Option<String> {
@@ -120,9 +125,13 @@ impl Graph {
         };
         self.links
             .iter()
-            .filter(|(out, _)| self.nodes.iter().any(|n| n.id == *out && ours(n)))
-            .find_map(|(_, input)| self.nodes.iter().find(|n| n.id == *input && n.class == "Audio/Sink"))
-            .map(|n| n.name.clone())
+            .filter_map(|(out, input)| {
+                let stream = self.nodes.iter().find(|n| n.id == *out && ours(n))?;
+                let sink = self.nodes.iter().find(|n| n.id == *input && n.class == "Audio/Sink")?;
+                Some((stream.serial, sink))
+            })
+            .max_by_key(|(serial, _)| *serial)
+            .map(|(_, n)| n.name.clone())
             .or_else(|| self.default_sink.clone())
     }
 
@@ -176,6 +185,23 @@ mod tests {
     fn sink_falls_back_to_the_default_before_the_app_plays() {
         let g = parse(&DUMP.replace(r#""output-node-id": 99"#, r#""output-node-id": 1"#)).unwrap();
         assert_eq!(g.sink(&g.meeting().unwrap()).as_deref(), Some("speaker"));
+    }
+
+    #[test]
+    fn follows_the_newest_stream_after_switching_devices_in_the_app() {
+        let dump = DUMP.trim_end().trim_end_matches(']').to_string()
+            + r#",
+      {"id": 103, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Sink", "node.name": "jabra", "object.serial": 62}}},
+      {"id": 104, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Audio/Source", "node.name": "jabra-mic", "object.serial": 63}}},
+      {"id": 105, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Stream/Output/Audio", "application.name": "Zen", "application.process.binary": "zen", "object.serial": 430}}},
+      {"id": 106, "type": "PipeWire:Interface:Node", "info": {"props": {"media.class": "Stream/Input/Audio", "application.name": "Zen", "application.process.binary": "zen", "object.serial": 431}}},
+      {"id": 124, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 105, "input-node-id": 103}},
+      {"id": 125, "type": "PipeWire:Interface:Link", "info": {"output-node-id": 104, "input-node-id": 106}}
+    ]"#;
+        let g = parse(&dump).unwrap();
+        let m = g.meeting().unwrap();
+        assert_eq!((m.stream, m.source.as_deref()), (106, Some("jabra-mic")));
+        assert_eq!(g.sink(&m).as_deref(), Some("jabra"));
     }
 
     #[test]

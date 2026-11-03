@@ -20,8 +20,9 @@ laptop (mictap daemon) --byte ranges over tailnet--> homeserver (mictap server)
 `mictap daemon` is a Rust systemd user service. It survives barbell restarts,
 so reloading the bar never kills a recording.
 
-- **Auto-start.** When an allowlisted app (`Zen`, `chromium`, `zoom`, `slack`,
-  ...) opens a mic capture stream in PipeWire, recording starts immediately.
+- **Auto-start.** When an allowlisted app (`Zen`, `firefox`, `chromium`,
+  `zoom`, `slack`, ...) opens a mic capture stream in PipeWire, recording
+  starts immediately.
   Non-allowlisted apps (clankertyper, voice notes) never trigger it.
 - **Right mic.** It records the source the meeting app is actually capturing
   from, not the default. Switching mics in Meet is followed.
@@ -33,8 +34,9 @@ so reloading the bar never kills a recording.
   the stream open while muted (verified in Zen), so muting doesn't split a
   meeting.
 - **Manual.** Start/stop from barbell or the CLI, for physical meetings.
-  Uses the default source unless another mic is picked. Manual starts only
-  stop manually.
+  Uses the default source unless another mic is picked, and always records
+  the default sink's monitor as the remote track (the meeting app's sink once
+  one is detected). Manual starts only stop manually.
 - **Discard.** A notification offers Discard. Nothing is uploaded during the
   first 60 s, so a discarded recording never reaches the VPS. A discard
   after that only deletes the laptop's copy; the server keeps what it got.
