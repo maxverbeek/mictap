@@ -23,7 +23,10 @@
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
-          buildInputs = [ pkgs.sherpa-onnx ];
+          buildInputs = [
+            pkgs.sherpa-onnx
+            pkgs.sqlite
+          ];
           postInstall = "mkdir -p $out/share && cp -r web $out/share/mictap-web";
         };
       });
